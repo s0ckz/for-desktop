@@ -10,10 +10,52 @@
 // Everything here degrades quietly: if the native module is missing, the OS is
 // too old, or activation fails, we report failure and the caller falls back to
 // the previous `"loopback"` behaviour.
-import { BrowserWindow, ipcMain } from "electron";
+import { BrowserWindow, app, ipcMain, shell } from "electron";
+import { appendFileSync, mkdirSync, statSync, unlinkSync } from "node:fs";
+import { release } from "node:os";
+import { join } from "node:path";
 
 export const APP_AUDIO_CHUNK = "appAudio:chunk";
 export const APP_AUDIO_STATE = "appAudio:state";
+
+// A packaged Electron app on Windows has no console attached, so anything we
+// print is lost. Diagnostics go to a file the user can actually find.
+let logPath: string | null = null;
+
+export function appAudioLogPath() {
+  if (logPath) return logPath;
+  try {
+    const dir = join(app.getPath("userData"), "logs");
+    mkdirSync(dir, { recursive: true });
+    logPath = join(dir, "app-audio.log");
+  } catch {
+    logPath = null;
+  }
+  return logPath;
+}
+
+export function log(...parts: unknown[]) {
+  const line =
+    new Date().toISOString() +
+    " " +
+    parts
+      .map((p) => (typeof p === "string" ? p : JSON.stringify(p)))
+      .join(" ");
+  console.log("[appAudio]", line);
+  const file = appAudioLogPath();
+  if (!file) return;
+  try {
+    // Keep it small; this is a diagnostic aid, not an audit trail.
+    try {
+      if (statSync(file).size > 512 * 1024) unlinkSync(file);
+    } catch {
+      /* first run */
+    }
+    appendFileSync(file, line + "\n", "utf8");
+  } catch {
+    /* logging must never break screen sharing */
+  }
+}
 
 type NativeModule = typeof import("win-app-audio");
 
@@ -31,7 +73,7 @@ function loadNative(): NativeModule | null {
     native = require("win-app-audio") as NativeModule;
   } catch (err) {
     nativeLoadError = String((err as Error)?.message ?? err);
-    console.warn("[appAudio] native module unavailable:", nativeLoadError);
+    log("native module unavailable:", nativeLoadError);
   }
   return native;
 }
@@ -60,14 +102,24 @@ export function windowHandleFromSourceId(sourceId: string): string | null {
  */
 export function startForSource(sourceId: string): boolean {
   const mod = loadNative();
-  if (!mod || !mod.isSupported()) return false;
+  if (!mod) {
+    log("falling back to system audio: native module not loaded:", nativeLoadError);
+    return false;
+  }
+  if (!mod.isSupported()) {
+    log("falling back to system audio: OS reports process loopback unsupported");
+    return false;
+  }
 
   const handle = windowHandleFromSourceId(sourceId);
-  if (!handle) return false; // whole-screen share: nothing app-specific to target
+  if (!handle) {
+    log("falling back to system audio: whole-screen share", sourceId);
+    return false; // nothing app-specific to target
+  }
 
   const pid = mod.pidFromWindowHandle(handle);
   if (!pid) {
-    console.warn("[appAudio] could not resolve a process for window", handle);
+    log("could not resolve a process for window", handle);
     return false;
   }
 
@@ -82,12 +134,12 @@ export function startForSource(sourceId: string): boolean {
       win.webContents.send(APP_AUDIO_CHUNK, chunk);
     });
   } catch (err) {
-    console.warn("[appAudio] capture failed to start:", err, mod.lastError());
+    log("capture failed to start:", String(err), "lastError:", mod.lastError());
     return false;
   }
 
   active = { pid, sourceId };
-  console.log(`[appAudio] capturing pid ${pid} for ${sourceId}`);
+  log(`capturing pid ${pid} for ${sourceId}`);
   broadcastState();
   return true;
 }
@@ -100,7 +152,7 @@ export function stop() {
   } catch {
     /* nothing to do */
   }
-  console.log(`[appAudio] stopped capturing pid ${active.pid}`);
+  log(`stopped capturing pid ${active.pid}`);
   active = null;
   broadcastState();
 }
@@ -125,6 +177,20 @@ function buildState() {
 }
 
 export function initAppAudio() {
+  const mod = loadNative();
+  log("--- session start ---");
+  log("app version:", app.getVersion());
+  log("platform:", process.platform, "os release:", release());
+  log("native module loaded:", Boolean(mod), nativeLoadError ? `(${nativeLoadError})` : "");
+  log("per-process capture supported:", Boolean(mod?.isSupported()));
+  log("log file:", appAudioLogPath() ?? "(unavailable)");
+
+  ipcMain.handle("appAudio:getLogPath", () => appAudioLogPath());
+  ipcMain.on("appAudio:openLogs", () => {
+    const file = appAudioLogPath();
+    if (file) shell.showItemInFolder(file);
+  });
+
   // The renderer asks for this right after getDisplayMedia resolves, so it can
   // decide whether to swap in our track. Answering from the main process avoids
   // any race with the IPC notification.

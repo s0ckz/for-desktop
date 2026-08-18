@@ -13,7 +13,7 @@ import {
 
 import windowIconAsset from "../../assets/desktop/icon.png?asset";
 
-import { startForSource, stop as stopAppAudio } from "./appAudio";
+import { log as appAudioLog, startForSource, stop as stopAppAudio } from "./appAudio";
 import { APP_AUDIO_PATCH } from "./appAudioPatch";
 import { config } from "./config";
 import { updateTrayMenu } from "./tray";
@@ -207,11 +207,19 @@ export function createMainWindow() {
   // Create display media request handler
   session.defaultSession.setDisplayMediaRequestHandler(
     (request, callback) => {
+      // If this never appears in the log, the OS picker handled the request and
+      // we never got the chance to pick per-app audio.
+      appAudioLog(
+        "display media request received; audioRequested =",
+        String(request.audioRequested),
+      );
+
       desktopCapturer
         .getSources({ types: ["screen", "window"], fetchWindowIcons: true })
         .then((sources) => {
           // Any previous share is over by the time a new one is requested.
           stopAppAudio();
+          appAudioLog("sources offered:", String(sources.length));
 
           /**
            * Answer the request, preferring audio from just the shared
@@ -240,6 +248,13 @@ export function createMainWindow() {
           ipcMain.once(
             "screenPickerCallback",
             (_, idx: number, audio: boolean) => {
+              appAudioLog(
+                "picker chose index",
+                String(idx),
+                "audio =",
+                String(audio),
+                idx >= 0 && idx < sources.length ? sources[idx].id : "(out of range)",
+              );
               if (idx < 0 || idx > sources.length) {
                 callback({});
               } else {

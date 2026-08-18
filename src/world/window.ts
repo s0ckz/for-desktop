@@ -39,6 +39,8 @@ contextBridge.exposeInMainWorld("native", {
   // patch uses this to turn captured PCM back into a MediaStreamTrack.
   appAudio: {
     getState: () => ipcRenderer.invoke("appAudio:getState"),
+    getLogPath: () => ipcRenderer.invoke("appAudio:getLogPath"),
+    openLogs: () => ipcRenderer.send("appAudio:openLogs"),
     stop: () => ipcRenderer.send("appAudio:stop"),
     onChunk: (handler: (chunk: Uint8Array) => void) => {
       const listener = (_: unknown, chunk: Uint8Array) => handler(chunk);
