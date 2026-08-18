@@ -78,6 +78,21 @@ const store = new Store({
  * Shim for `electron-store` because typings are broken
  */
 class Config {
+  /** Current configuration as a plain object */
+  snapshot(): DesktopConfig {
+    return {
+      firstLaunch: this.firstLaunch,
+      customFrame: this.customFrame,
+      minimiseToTray: this.minimiseToTray,
+      startMinimisedToTray: this.startMinimisedToTray,
+      spellchecker: this.spellchecker,
+      hardwareAcceleration: this.hardwareAcceleration,
+      discordRpc: this.discordRpc,
+      lastServer: this.lastServer,
+      windowState: this.windowState,
+    } as DesktopConfig;
+  }
+
   sync() {
     mainWindow.webContents.send("config", {
       firstLaunch: this.firstLaunch,
@@ -225,6 +240,14 @@ class Config {
 }
 
 export const config = new Config();
+
+// The renderer needs configuration before its first paint. Pushing it on
+// did-finish-load races the page's own scripts, and the client dereferences
+// windowState without a guard -- losing that race throws during startup and
+// leaves a blank window. Answer synchronously at preload time instead.
+ipcMain.on("config:getSync", (event) => {
+  event.returnValue = config.snapshot();
+});
 
 ipcMain.on("config", (_, newConfig: Partial<DesktopConfig>) => {
   console.info("Received new configuration", newConfig);
