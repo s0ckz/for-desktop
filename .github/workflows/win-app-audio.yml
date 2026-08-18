@@ -12,7 +12,9 @@ on:
 jobs:
   build:
     name: Build Windows app
-    runs-on: windows-latest
+    # windows-latest ships Visual Studio 18, which node-gyp cannot detect yet,
+    # breaking every native module build. VS2022 is present on windows-2022.
+    runs-on: windows-2022
 
     steps:
       - name: Checkout
