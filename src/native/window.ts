@@ -103,9 +103,29 @@ export function createMainWindow() {
       .catch((err) => console.warn("[appAudio] could not inject patch:", err));
   });
 
+  // The web client registers a service worker that serves the whole app from
+  // cache. Pointing the desktop at a different server (or upgrading a
+  // self-hosted one) can therefore leave a stale client running against a new
+  // backend, which shows up as a grey window. Drop those caches whenever the
+  // origin changes.
+  const purgeIfServerChanged = async () => {
+    if (config.lastServer === BUILD_URL.origin) return;
+    try {
+      await session.defaultSession.clearStorageData({
+        storages: ["serviceworkers", "cachestorage"],
+      });
+      console.log(
+        `[window] server changed to ${BUILD_URL.origin}, cleared cached client`,
+      );
+    } catch (err) {
+      console.warn("[window] could not clear cached client:", err);
+    }
+    config.lastServer = BUILD_URL.origin;
+  };
+
   // load the entrypoint
-  mainWindow
-    .loadURL(BUILD_URL.toString())
+  purgeIfServerChanged()
+    .then(() => mainWindow.loadURL(BUILD_URL.toString()))
     .then(() => mainWindow.webContents.reload());
 
   // minimise window to tray

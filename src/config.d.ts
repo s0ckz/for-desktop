@@ -5,6 +5,8 @@ declare type DesktopConfig = {
   spellchecker: boolean;
   hardwareAcceleration: boolean;
   discordRpc: boolean;
+  /** Origin the client last loaded, used to drop stale caches on a server change */
+  lastServer: string;
   windowState: {
     x: number;
     y: number;

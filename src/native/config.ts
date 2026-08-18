@@ -28,6 +28,9 @@ const schema = {
   discordRpc: {
     type: "boolean",
   } as JSONSchema.Boolean,
+  lastServer: {
+    type: "string",
+  } as JSONSchema.String,
   windowState: {
     type: "object",
     properties: {
@@ -60,6 +63,7 @@ const store = new Store({
     spellchecker: true,
     hardwareAcceleration: true,
     discordRpc: true,
+    lastServer: "",
     windowState: {
       x: 0,
       y: 0,
@@ -98,6 +102,17 @@ class Config {
     );
 
     this.sync();
+  }
+
+  get lastServer() {
+    return (store as never as { get(k: string): string }).get("lastServer");
+  }
+
+  set lastServer(value: string) {
+    (store as never as { set(k: string, value: string): void }).set(
+      "lastServer",
+      value,
+    );
   }
 
   get customFrame() {
