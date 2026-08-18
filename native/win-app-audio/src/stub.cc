@@ -21,9 +21,18 @@ Napi::Value EmptyString(const Napi::CallbackInfo& info) {
   return Napi::String::New(info.Env(), "unsupported platform");
 }
 
+Napi::Value NoWindow(const Napi::CallbackInfo& info) {
+  Napi::Object state = Napi::Object::New(info.Env());
+  state.Set("exists", Napi::Boolean::New(info.Env(), false));
+  state.Set("visible", Napi::Boolean::New(info.Env(), false));
+  state.Set("iconic", Napi::Boolean::New(info.Env(), false));
+  return state;
+}
+
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("isSupported", Napi::Function::New(env, NotSupported));
   exports.Set("pidFromWindowHandle", Napi::Function::New(env, Zero));
+  exports.Set("windowState", Napi::Function::New(env, NoWindow));
   exports.Set("start", Napi::Function::New(env, Noop));
   exports.Set("stop", Napi::Function::New(env, Noop));
   exports.Set("lastError", Napi::Function::New(env, EmptyString));

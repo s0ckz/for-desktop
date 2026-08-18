@@ -334,20 +334,24 @@ bool IsApplicationFrameHost(DWORD pid) {
   return isFrameHost;
 }
 
+// desktopCapturer hands window ids out as strings; accept either form.
+HWND HwndFromValue(const Napi::Value& value) {
+  unsigned long long raw = 0;
+  if (value.IsString()) {
+    raw = strtoull(value.As<Napi::String>().Utf8Value().c_str(), nullptr, 10);
+  } else if (value.IsNumber()) {
+    raw = static_cast<unsigned long long>(value.As<Napi::Number>().Int64Value());
+  }
+  if (!raw) return nullptr;
+  return reinterpret_cast<HWND>(static_cast<uintptr_t>(raw));
+}
+
 Napi::Value PidFromWindowHandle(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   if (info.Length() < 1) return Napi::Number::New(env, 0);
 
-  unsigned long long raw = 0;
-  if (info[0].IsString()) {
-    raw = strtoull(info[0].As<Napi::String>().Utf8Value().c_str(), nullptr, 10);
-  } else if (info[0].IsNumber()) {
-    raw = static_cast<unsigned long long>(info[0].As<Napi::Number>().Int64Value());
-  }
-  if (!raw) return Napi::Number::New(env, 0);
-
-  HWND hwnd = reinterpret_cast<HWND>(static_cast<uintptr_t>(raw));
-  if (!IsWindow(hwnd)) return Napi::Number::New(env, 0);
+  HWND hwnd = HwndFromValue(info[0]);
+  if (!hwnd || !IsWindow(hwnd)) return Napi::Number::New(env, 0);
 
   DWORD pid = 0;
   GetWindowThreadProcessId(hwnd, &pid);
@@ -359,6 +363,31 @@ Napi::Value PidFromWindowHandle(const Napi::CallbackInfo& info) {
   }
 
   return Napi::Number::New(env, static_cast<double>(pid));
+}
+
+// Whether a window can be captured again after a share died. Windows Graphics
+// Capture refuses minimised windows, so re-acquiring has to wait for the user
+// to restore the application rather than grabbing a dead handle.
+Napi::Value WindowState(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  Napi::Object state = Napi::Object::New(env);
+  bool exists = false;
+  bool visible = false;
+  bool iconic = false;
+
+  if (info.Length() >= 1) {
+    HWND hwnd = HwndFromValue(info[0]);
+    if (hwnd && IsWindow(hwnd)) {
+      exists = true;
+      visible = IsWindowVisible(hwnd) != FALSE;
+      iconic = IsIconic(hwnd) != FALSE;
+    }
+  }
+
+  state.Set("exists", Napi::Boolean::New(env, exists));
+  state.Set("visible", Napi::Boolean::New(env, visible));
+  state.Set("iconic", Napi::Boolean::New(env, iconic));
+  return state;
 }
 
 Napi::Value Start(const Napi::CallbackInfo& info) {
@@ -406,6 +435,7 @@ Napi::Value LastError(const Napi::CallbackInfo& info) {
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("isSupported", Napi::Function::New(env, IsSupported));
   exports.Set("pidFromWindowHandle", Napi::Function::New(env, PidFromWindowHandle));
+  exports.Set("windowState", Napi::Function::New(env, WindowState));
   exports.Set("start", Napi::Function::New(env, Start));
   exports.Set("stop", Napi::Function::New(env, Stop));
   exports.Set("lastError", Napi::Function::New(env, LastError));

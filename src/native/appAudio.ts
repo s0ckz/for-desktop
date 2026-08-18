@@ -100,9 +100,38 @@ export function windowHandleFromSourceId(sourceId: string): string | null {
 }
 
 /**
- * Try to start per-application capture for a desktopCapturer source.
- * Returns true only when audio is actually flowing from that process.
+ * The process owning a desktopCapturer window source, or 0 when it has none
+ * (a screen source) or the native module is unavailable.
  */
+export function pidForSourceId(sourceId: string): number {
+  const mod = loadNative();
+  const handle = windowHandleFromSourceId(sourceId);
+  if (!mod || !handle) return 0;
+  try {
+    return mod.pidFromWindowHandle(handle);
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Whether a window source still names a window we could capture. Windows
+ * Graphics Capture refuses minimised windows, so re-acquiring a share has to
+ * wait for the user to restore the application. Null means "cannot tell".
+ */
+export function windowStateForSourceId(
+  sourceId: string,
+): { exists: boolean; visible: boolean; iconic: boolean } | null {
+  const mod = loadNative();
+  const handle = windowHandleFromSourceId(sourceId);
+  if (!mod || !handle) return null;
+  try {
+    return mod.windowState(handle);
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Begin capture in one of two modes:
  *   include - only the shared application's process tree

@@ -13,7 +13,13 @@ import {
 
 import windowIconAsset from "../../assets/desktop/icon.png?asset";
 
-import { log as appAudioLog, startForSource, stop as stopAppAudio } from "./appAudio";
+import {
+  log as appAudioLog,
+  pidForSourceId,
+  startForSource,
+  stop as stopAppAudio,
+  windowStateForSourceId,
+} from "./appAudio";
 import { APP_AUDIO_PATCH } from "./appAudioPatch";
 import { config } from "./config";
 import { updateTrayMenu } from "./tray";
@@ -40,6 +46,174 @@ let shouldQuit = false;
 const windowIcon = nativeImage.createFromDataURL(windowIconAsset);
 
 // windowIcon.setTemplateImage(true);
+
+type DisplayMediaCallback = (streams: Electron.Streams) => void;
+
+/** The share the user last agreed to, so a dead one can be picked up again. */
+let lastShare: {
+  sourceId: string;
+  pid: number;
+  name: string;
+  audio: boolean;
+} | null = null;
+
+/**
+ * A window found by `screenShare:reacquire`, waiting for the renderer to ask
+ * for it. The next display media request is answered with it directly instead
+ * of showing the picker again.
+ */
+let armedShare: {
+  source: Electron.DesktopCapturerSource;
+  audio: boolean;
+  at: number;
+} | null = null;
+
+/** Bumped to abandon an in-flight re-acquire; only the newest one counts. */
+let reacquireGeneration = 0;
+
+const REACQUIRE_POLL_MS = 1000;
+const REACQUIRE_TIMEOUT_MS = 5 * 60 * 1000;
+/** How long a found window stays armed before the picker comes back. */
+const ARMED_TTL_MS = 10_000;
+
+/**
+ * Answer a display media request, preferring audio from just the shared
+ * application.
+ *
+ * A *window* share that cannot get per-app audio is answered with video only:
+ * Chromium's `"loopback"` is the entire system mix, including the voice call
+ * itself, which is exactly the leak this whole module exists to avoid. Only
+ * whole-screen shares -- where the system mix is what the user asked for
+ * anyway -- fall back to it.
+ */
+function respondToDisplayMedia(
+  source: Electron.DesktopCapturerSource,
+  audio: boolean,
+  callback: DisplayMediaCallback,
+) {
+  const isWindow = source.id.startsWith("window:");
+  lastShare = {
+    sourceId: source.id,
+    pid: pidForSourceId(source.id),
+    name: source.name,
+    audio,
+  };
+
+  if (!audio) {
+    appAudioLog("sharing", source.id, "without audio");
+    callback({ video: source });
+    return;
+  }
+  if (startForSource(source.id)) {
+    // Audio arrives out-of-band and is stitched in by the renderer; asking
+    // Chromium for loopback too would double up the sound.
+    appAudioLog("sharing", source.id, "with per-app audio");
+    callback({ video: source });
+    return;
+  }
+  if (isWindow) {
+    appAudioLog(
+      "no per-app audio for window",
+      source.id,
+      "- sharing video only rather than the whole system mix",
+    );
+    callback({ video: source });
+    return;
+  }
+  appAudioLog(
+    "screen share falling back to Chromium loopback (whole system mix)",
+  );
+  callback({ video: source, audio: "loopback" });
+}
+
+/**
+ * Look for the remembered window among the sources on offer: same id first,
+ * then any window of the same process, preferring an identical title. WGC
+ * refuses minimised windows, so an iconic match does not count as found.
+ */
+async function findRememberedWindow(target: {
+  sourceId: string;
+  pid: number;
+  name: string;
+}): Promise<Electron.DesktopCapturerSource | null> {
+  const sources = await desktopCapturer.getSources({ types: ["window"] });
+
+  const capturable = (source: Electron.DesktopCapturerSource) => {
+    const state = windowStateForSourceId(source.id);
+    // No native module means no way to tell; take the source at face value.
+    if (!state) return true;
+    return state.exists && state.visible && !state.iconic;
+  };
+
+  const sameId = sources.find((source) => source.id === target.sourceId);
+  if (sameId && capturable(sameId)) return sameId;
+
+  // Toggling fullscreen usually destroys and recreates the window, so the
+  // handle in the id changes while the process stays put.
+  if (!target.pid) return null;
+  const samePid = sources.filter(
+    (source) => pidForSourceId(source.id) === target.pid && capturable(source),
+  );
+  return (
+    samePid.find((source) => source.name === target.name) ?? samePid[0] ?? null
+  );
+}
+
+/**
+ * Wait for the last shared window to come back.
+ *
+ * Chromium ends the capture track when the shared window is destroyed (an app
+ * toggling fullscreen recreates its window) or minimised, and the web client
+ * tears the share down. It calls this, and on `true` re-requests
+ * getDisplayMedia -- which we then answer with the window we found.
+ *
+ * Resolves false on timeout, if there is nothing to re-acquire, or if another
+ * call supersedes this one.
+ */
+ipcMain.handle("screenShare:reacquire", async () => {
+  const target = lastShare;
+  if (!target) {
+    appAudioLog("reacquire: no remembered share");
+    return false;
+  }
+  if (!target.sourceId.startsWith("window:")) {
+    appAudioLog("reacquire: last share was a screen, not re-acquiring");
+    return false;
+  }
+
+  const generation = ++reacquireGeneration;
+  const deadline = Date.now() + REACQUIRE_TIMEOUT_MS;
+  appAudioLog(
+    "reacquire: waiting for window",
+    target.name,
+    `(${target.sourceId}, pid ${target.pid})`,
+  );
+
+  while (Date.now() < deadline) {
+    if (generation !== reacquireGeneration || lastShare !== target) {
+      appAudioLog("reacquire: superseded, giving up");
+      return false;
+    }
+
+    let match: Electron.DesktopCapturerSource | null = null;
+    try {
+      match = await findRememberedWindow(target);
+    } catch (err) {
+      appAudioLog("reacquire: could not list sources:", String(err));
+    }
+
+    if (match) {
+      appAudioLog("reacquire: found", match.id, match.name);
+      armedShare = { source: match, audio: target.audio, at: Date.now() };
+      return true;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, REACQUIRE_POLL_MS));
+  }
+
+  appAudioLog("reacquire: window never came back");
+  return false;
+});
 
 /**
  * Create the main application window
@@ -68,6 +242,10 @@ export function createMainWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       spellcheck: true,
+      // A fullscreen game covering Stoat would otherwise have Chromium throttle
+      // our timers, which stalls the per-app audio pump and the share recovery
+      // polling exactly when they are needed.
+      backgroundThrottling: false,
     },
   });
 
@@ -282,6 +460,27 @@ export function createMainWindow() {
         String(request.audioRequested),
       );
 
+      // A re-acquire that already found the window answers straight away, so
+      // the recovered share does not make the user pick it again.
+      const armed = armedShare;
+      armedShare = null;
+      if (armed && Date.now() - armed.at < ARMED_TTL_MS) {
+        appAudioLog("answering with re-acquired source", armed.source.id);
+        stopAppAudio();
+        respondToDisplayMedia(
+          armed.source,
+          armed.audio && request.audioRequested,
+          callback,
+        );
+        return;
+      }
+      if (armed) {
+        appAudioLog("re-acquired source went stale; showing the picker");
+      }
+
+      // Anything the user starts by hand ends whatever we were waiting for.
+      reacquireGeneration++;
+
       desktopCapturer
         .getSources({ types: ["screen", "window"], fetchWindowIcons: true })
         .then((sources) => {
@@ -289,49 +488,13 @@ export function createMainWindow() {
           stopAppAudio();
           appAudioLog("sources offered:", String(sources.length));
 
-          /**
-           * Answer the request, preferring audio from just the shared
-           * application.
-           *
-           * A *window* share that cannot get per-app audio is answered with
-           * video only: Chromium's `"loopback"` is the entire system mix,
-           * including the voice call itself, which is exactly the leak this
-           * whole module exists to avoid. Only whole-screen shares -- where
-           * the system mix is what the user asked for anyway -- fall back to
-           * it.
-           */
-          const respond = (source: Electron.DesktopCapturerSource, audio: boolean) => {
-            const isWindow = source.id.startsWith("window:");
-            if (!audio) {
-              appAudioLog("sharing", source.id, "without audio");
-              callback({ video: source });
-              return;
-            }
-            if (startForSource(source.id)) {
-              // Audio arrives out-of-band and is stitched in by the renderer;
-              // asking Chromium for loopback too would double up the sound.
-              appAudioLog("sharing", source.id, "with per-app audio");
-              callback({ video: source });
-              return;
-            }
-            if (isWindow) {
-              appAudioLog(
-                "no per-app audio for window",
-                source.id,
-                "- sharing video only rather than the whole system mix",
-              );
-              callback({ video: source });
-              return;
-            }
-            appAudioLog(
-              "screen share falling back to Chromium loopback (whole system mix)",
-            );
-            callback({ video: source, audio: "loopback" });
-          };
-
           // Shortcut for linux wayland.
           if (sources.length == 1) {
-            respond(sources[0], request.audioRequested);
+            respondToDisplayMedia(
+              sources[0],
+              request.audioRequested,
+              callback,
+            );
             return;
           }
           ipcMain.once(
@@ -349,9 +512,10 @@ export function createMainWindow() {
                 // way to cancel is calling back with none: that is what turns
                 // into a clean NotAllowedError in the renderer instead of an
                 // unexpected rejection.
+                lastShare = null;
                 (callback as unknown as () => void)();
               } else {
-                respond(sources[idx], audio);
+                respondToDisplayMedia(sources[idx], audio, callback);
               }
             },
           );

@@ -35,6 +35,13 @@ contextBridge.exposeInMainWorld("native", {
 
   isWayland: () => ipcRenderer.invoke("getIsWayland"),
 
+  // Wait for a screen share that Chromium ended -- a window that toggled
+  // fullscreen or was minimised -- to become shareable again. Resolves true
+  // once the main process has the window lined up, at which point re-requesting
+  // getDisplayMedia is answered with it and no picker appears.
+  reacquireScreenShare: (): Promise<boolean> =>
+    ipcRenderer.invoke("screenShare:reacquire"),
+
   // Per-application screen share audio (Windows). The injected main-world
   // patch uses this to turn captured PCM back into a MediaStreamTrack.
   appAudio: {
