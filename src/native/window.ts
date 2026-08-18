@@ -95,12 +95,54 @@ export function createMainWindow() {
     mainWindow.maximize();
   }
 
+  // Whatever goes wrong loading the remote client should end up in the log file
+  // rather than a console nobody can see. A blank or grey window is almost
+  // always one of these.
+  mainWindow.webContents.on(
+    "did-fail-load",
+    (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+      appAudioLog(
+        `page failed to load (${isMainFrame ? "main frame" : "subframe"}):`,
+        `${errorCode} ${errorDescription}`,
+        validatedURL,
+      );
+    },
+  );
+
+  mainWindow.webContents.on("render-process-gone", (_event, details) => {
+    appAudioLog(
+      "renderer process gone:",
+      details.reason,
+      `exitCode=${details.exitCode}`,
+    );
+  });
+
+  mainWindow.webContents.on("unresponsive", () =>
+    appAudioLog("renderer became unresponsive"),
+  );
+
+  mainWindow.webContents.on("preload-error", (_event, preloadPath, error) =>
+    appAudioLog("preload failed:", preloadPath, String(error)),
+  );
+
+  // Errors the page itself reports. This is what would have caught the missing
+  // VITE_HOST, and any future client-side breakage.
+  mainWindow.webContents.on(
+    "console-message",
+    (_event, level, message, line, sourceId) => {
+      if (level < 3) return; // 3 = error
+      appAudioLog(`page error: ${message} (${sourceId}:${line})`);
+    },
+  );
+
   // The web app is remote, so the getDisplayMedia override has to be injected
   // into its main world on every load (contextIsolation keeps the preload out).
   mainWindow.webContents.on("did-finish-load", () => {
+    appAudioLog("page loaded:", mainWindow.webContents.getURL());
     mainWindow.webContents
       .executeJavaScript(APP_AUDIO_PATCH)
-      .catch((err) => console.warn("[appAudio] could not inject patch:", err));
+      .then(() => appAudioLog("screen share patch injected"))
+      .catch((err) => appAudioLog("could not inject patch:", String(err)));
   });
 
   // The web client registers a service worker that serves the whole app from
