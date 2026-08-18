@@ -1,4 +1,5 @@
 allowBuilds:
+  win-app-audio: true
   bufferutil: true
   electron: true
   electron-winstaller: true

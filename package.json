@@ -59,7 +59,8 @@
     "electron-squirrel-startup": "^1.0.1",
     "electron-store": "^10.1.0",
     "update-electron-app": "^3.1.1",
-    "utf-8-validate": "^6.0.5"
+    "utf-8-validate": "^6.0.5",
+    "win-app-audio": "file:native/win-app-audio"
   },
   "optionalDependencies": {
     "node-pipewire": "1.1.0"

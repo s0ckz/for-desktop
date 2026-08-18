@@ -1,0 +1,12 @@
+{
+  "name": "win-app-audio",
+  "version": "1.0.0",
+  "description": "Per-process audio loopback capture for Windows (WASAPI process loopback).",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "gypfile": true,
+  "license": "MIT",
+  "dependencies": {
+    "node-addon-api": "^8.3.0"
+  }
+}

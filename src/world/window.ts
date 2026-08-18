@@ -34,4 +34,16 @@ contextBridge.exposeInMainWorld("native", {
     ipcRenderer.send("screenPickerCallback", idx, audio),
 
   isWayland: () => ipcRenderer.invoke("getIsWayland"),
+
+  // Per-application screen share audio (Windows). The injected main-world
+  // patch uses this to turn captured PCM back into a MediaStreamTrack.
+  appAudio: {
+    getState: () => ipcRenderer.invoke("appAudio:getState"),
+    stop: () => ipcRenderer.send("appAudio:stop"),
+    onChunk: (handler: (chunk: Uint8Array) => void) => {
+      const listener = (_: unknown, chunk: Uint8Array) => handler(chunk);
+      ipcRenderer.on("appAudio:chunk", listener);
+      return () => ipcRenderer.removeListener("appAudio:chunk", listener);
+    },
+  },
 });

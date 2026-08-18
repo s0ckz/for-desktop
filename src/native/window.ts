@@ -13,6 +13,8 @@ import {
 
 import windowIconAsset from "../../assets/desktop/icon.png?asset";
 
+import { startForSource, stop as stopAppAudio } from "./appAudio";
+import { APP_AUDIO_PATCH } from "./appAudioPatch";
 import { config } from "./config";
 import { updateTrayMenu } from "./tray";
 
@@ -87,6 +89,14 @@ export function createMainWindow() {
   if (config.windowState.isMaximised && !startHidden) {
     mainWindow.maximize();
   }
+
+  // The web app is remote, so the getDisplayMedia override has to be injected
+  // into its main world on every load (contextIsolation keeps the preload out).
+  mainWindow.webContents.on("did-finish-load", () => {
+    mainWindow.webContents
+      .executeJavaScript(APP_AUDIO_PATCH)
+      .catch((err) => console.warn("[appAudio] could not inject patch:", err));
+  });
 
   // load the entrypoint
   mainWindow
@@ -200,16 +210,31 @@ export function createMainWindow() {
       desktopCapturer
         .getSources({ types: ["screen", "window"], fetchWindowIcons: true })
         .then((sources) => {
+          // Any previous share is over by the time a new one is requested.
+          stopAppAudio();
+
+          /**
+           * Answer the request, preferring audio from just the shared
+           * application. Falls back to the system mix whenever per-app capture
+           * is unavailable, so behaviour never gets worse than before.
+           */
+          const respond = (source: Electron.DesktopCapturerSource, audio: boolean) => {
+            if (!audio) {
+              callback({ video: source });
+              return;
+            }
+            if (startForSource(source.id)) {
+              // Audio arrives out-of-band and is stitched in by the renderer;
+              // asking Chromium for loopback too would double up the sound.
+              callback({ video: source });
+              return;
+            }
+            callback({ video: source, audio: "loopback" });
+          };
+
           // Shortcut for linux wayland.
           if (sources.length == 1) {
-            request.audioRequested
-              ? callback({
-                  video: sources[0],
-                  audio: "loopback",
-                })
-              : callback({
-                  video: sources[0],
-                });
+            respond(sources[0], request.audioRequested);
             return;
           }
           ipcMain.once(
@@ -218,14 +243,7 @@ export function createMainWindow() {
               if (idx < 0 || idx > sources.length) {
                 callback({});
               } else {
-                audio
-                  ? callback({
-                      video: sources[idx],
-                      audio: "loopback",
-                    })
-                  : callback({
-                      video: sources[idx],
-                    });
+                respond(sources[idx], audio);
               }
             },
           );

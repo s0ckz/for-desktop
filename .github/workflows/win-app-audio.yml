@@ -1,0 +1,72 @@
+name: Windows per-app audio build
+
+# Builds the Windows app with the native per-process audio capture module and
+# uploads the installer, so the addon never has to be compiled by hand.
+
+on:
+  push:
+    branches:
+      - feat/windows-per-app-audio
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Windows app
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Checkout assets
+        run: git -c submodule."assets".update=checkout submodule update --init assets
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      # Fails loudly here rather than silently falling back at runtime.
+      - name: Verify native module compiled
+        shell: bash
+        run: |
+          set -e
+          find node_modules/win-app-audio -name '*.node' -print
+          test -f node_modules/win-app-audio/build/Release/win_app_audio.node
+
+      - name: Lint
+        run: pnpm lint
+        continue-on-error: true
+
+      - name: Package
+        run: pnpm package
+
+      - name: Confirm addon shipped in the package
+        shell: bash
+        run: |
+          set -e
+          find out -name 'win_app_audio.node' -print
+          test -n "$(find out -name 'win_app_audio.node' -print -quit)"
+
+      - name: Make installer
+        run: pnpm make
+        continue-on-error: true
+
+      - name: Upload packaged app
+        uses: actions/upload-artifact@v4
+        with:
+          name: stoat-windows-per-app-audio
+          path: |
+            out/make/**/*
+            out/*-win32-*/**
+          if-no-files-found: warn
+          retention-days: 14
