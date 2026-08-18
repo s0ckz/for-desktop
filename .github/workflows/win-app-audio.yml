@@ -55,9 +55,19 @@ jobs:
       - name: Confirm addon shipped in the package
         shell: bash
         run: |
-          set -e
-          find out -name 'win_app_audio.node' -print
-          test -n "$(find out -name 'win_app_audio.node' -print -quit)"
+          echo "--- resources dir ---"
+          find out -maxdepth 4 -name 'resources' -type d -exec ls -la {} \;
+          echo "--- any win-app-audio on disk ---"
+          find out -path '*win-app-audio*' -maxdepth 8 | head -20
+          echo "--- unpacked natives ---"
+          find out -name '*.node' | head -20
+          echo "--- asar contents ---"
+          ASAR=$(find out -name 'app.asar' -print -quit)
+          if [ -n "$ASAR" ]; then
+            npx --yes @electron/asar list "$ASAR" | grep -i -E 'win-app-audio|\.node' | head -20 || echo "(no matches inside asar)"
+          fi
+          echo "--- verdict ---"
+          test -n "$(find out -name 'win_app_audio.node' -print -quit)"             && echo "OK: addon present"             || { echo "MISSING: addon not packaged"; exit 1; }
 
       - name: Make installer
         run: pnpm make
