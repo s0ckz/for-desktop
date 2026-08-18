@@ -104,19 +104,20 @@ export function createMainWindow() {
   });
 
   // The web client registers a service worker that serves the whole app from
-  // cache. Pointing the desktop at a different server (or upgrading a
-  // self-hosted one) can therefore leave a stale client running against a new
-  // backend, which shows up as a grey window. Drop those caches whenever the
-  // origin changes.
-  const purgeIfServerChanged = async () => {
-    if (config.lastServer === BUILD_URL.origin) return;
+  // cache, offline-first. That is useful in a browser and actively harmful
+  // here: after the server deploys a new client, the cached one keeps running
+  // against the new backend and the window comes up grey.
+  //
+  // Purging only when the server *origin* changed was not enough, because the
+  // usual case is the same origin serving a newer build. A desktop app has no
+  // use for offline caching, so drop it on every launch: the cost is
+  // re-fetching a few MB of assets, and it removes the failure mode entirely.
+  const purgeCachedClient = async () => {
     try {
       await session.defaultSession.clearStorageData({
         storages: ["serviceworkers", "cachestorage"],
       });
-      console.log(
-        `[window] server changed to ${BUILD_URL.origin}, cleared cached client`,
-      );
+      console.log("[window] cleared cached web client");
     } catch (err) {
       console.warn("[window] could not clear cached client:", err);
     }
@@ -124,7 +125,7 @@ export function createMainWindow() {
   };
 
   // load the entrypoint
-  purgeIfServerChanged()
+  purgeCachedClient()
     .then(() => mainWindow.loadURL(BUILD_URL.toString()))
     .then(() => mainWindow.webContents.reload());
 
