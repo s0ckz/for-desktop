@@ -22,10 +22,15 @@ import { updateTrayMenu } from "./tray";
 export let mainWindow: BrowserWindow;
 
 // currently in-use build
+// Defaults to our self-hosted instance. Note there is no /app path here: the
+// self-hosted web client is served at the root, unlike stoat.chat.
+// Override at launch with --force-server=https://example.com
+export const DEFAULT_SERVER = "https://stoat.lrl.com.br";
+
 export const BUILD_URL = new URL(
   app.commandLine.hasSwitch("force-server")
     ? app.commandLine.getSwitchValue("force-server")
-    : /*MAIN_WINDOW_VITE_DEV_SERVER_URL ??*/ "https://stoat.chat/app",
+    : DEFAULT_SERVER,
 );
 
 // internal window state
