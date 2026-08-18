@@ -79,7 +79,35 @@ function loadNative(): NativeModule | null {
 }
 
 /** Capture state for the session currently being shared, if any. */
-let active: { pid: number; sourceId: string } | null = null;
+let active: { pid: number; sourceId: string; mode: "include" | "exclude" } | null =
+  null;
+
+// A captured process tree can turn out to render no audio at all -- plenty of
+// apps play through a helper process outside their own tree. Sending silence
+// would be worse than the old behaviour, so watch for real samples and fall
+// back if none arrive.
+const SILENCE_GRACE_MS = 3000;
+let sawAudio = false;
+let watchdog: NodeJS.Timeout | null = null;
+
+function noteSamples(chunk: Buffer) {
+  if (sawAudio) return;
+  // Sampling every 16th frame is plenty to spot non-silence and keeps this off
+  // the hot path.
+  for (let i = 0; i + 1 < chunk.length; i += 64) {
+    if (Math.abs(chunk.readInt16LE(i)) > 64) {
+      sawAudio = true;
+      return;
+    }
+  }
+}
+
+function clearWatchdog() {
+  if (watchdog) {
+    clearTimeout(watchdog);
+    watchdog = null;
+  }
+}
 
 export function isAppAudioActive() {
   return active !== null;
@@ -100,6 +128,51 @@ export function windowHandleFromSourceId(sourceId: string): string | null {
  * Try to start per-application capture for a desktopCapturer source.
  * Returns true only when audio is actually flowing from that process.
  */
+/**
+ * Begin capture in one of two modes:
+ *   include - only the shared application's process tree
+ *   exclude - everything except our own tree, i.e. system audio minus the
+ *             voice chat we are playing, which is how Discord avoids echoing
+ *             other people's microphones back into a screen share
+ */
+function beginCapture(
+  pid: number,
+  mode: "include" | "exclude",
+  sourceId: string,
+): boolean {
+  const mod = loadNative();
+  if (!mod) return false;
+
+  stop();
+  sawAudio = false;
+
+  try {
+    mod.start(pid, mode === "include", (chunk: Buffer) => {
+      noteSamples(chunk);
+      const win = BrowserWindow.getAllWindows()[0];
+      if (!win || win.isDestroyed()) return;
+      win.webContents.send(APP_AUDIO_CHUNK, chunk);
+    });
+  } catch (err) {
+    log(`capture failed to start (${mode} ${pid}):`, String(err), "lastError:", mod.lastError());
+    return false;
+  }
+
+  active = { pid, sourceId, mode };
+  log(`capturing ${mode} pid ${pid} for ${sourceId}`);
+  broadcastState();
+  return true;
+}
+
+/** Everything except us: keeps the shared machine's audio, drops our own call. */
+function captureSystemMinusSelf(sourceId: string): boolean {
+  return beginCapture(process.pid, "exclude", sourceId);
+}
+
+/**
+ * Try to start per-application capture for a desktopCapturer source.
+ * Returns true only when audio is actually flowing from that process.
+ */
 export function startForSource(sourceId: string): boolean {
   const mod = loadNative();
   if (!mod) {
@@ -112,39 +185,44 @@ export function startForSource(sourceId: string): boolean {
   }
 
   const handle = windowHandleFromSourceId(sourceId);
+
+  // Whole-screen share: there is no single app to capture, but we can still
+  // subtract our own audio so other people's microphones never leak back out.
   if (!handle) {
-    log("falling back to system audio: whole-screen share", sourceId);
-    return false; // nothing app-specific to target
+    log("whole-screen share: capturing system audio minus our own process tree");
+    return captureSystemMinusSelf(sourceId);
   }
 
   const pid = mod.pidFromWindowHandle(handle);
   if (!pid) {
-    log("could not resolve a process for window", handle);
-    return false;
+    log("could not resolve a process for window", handle, "- using system audio minus self");
+    return captureSystemMinusSelf(sourceId);
   }
 
-  stop();
-
-  try {
-    // Include the process *tree*: browsers and Electron apps render audio from
-    // a child process, so targeting the visible window's pid alone is silent.
-    mod.start(pid, true, (chunk: Buffer) => {
-      const win = BrowserWindow.getAllWindows()[0];
-      if (!win || win.isDestroyed()) return;
-      win.webContents.send(APP_AUDIO_CHUNK, chunk);
-    });
-  } catch (err) {
-    log("capture failed to start:", String(err), "lastError:", mod.lastError());
-    return false;
+  // Include the process *tree*: browsers and Electron apps render audio from
+  // a child process, so targeting the visible window's pid alone is silent.
+  if (!beginCapture(pid, "include", sourceId)) {
+    return captureSystemMinusSelf(sourceId);
   }
 
-  active = { pid, sourceId };
-  log(`capturing pid ${pid} for ${sourceId}`);
-  broadcastState();
+  // Some apps render through a helper outside their own tree, which would leave
+  // viewers in silence. Give it a moment, then widen rather than send nothing.
+  clearWatchdog();
+  watchdog = setTimeout(() => {
+    watchdog = null;
+    if (sawAudio || !active || active.mode !== "include") return;
+    log(
+      `no audio from pid ${pid} after ${SILENCE_GRACE_MS}ms;` +
+        " switching to system audio minus our own process tree",
+    );
+    captureSystemMinusSelf(sourceId);
+  }, SILENCE_GRACE_MS);
+
   return true;
 }
 
 export function stop() {
+  clearWatchdog();
   if (!active) return;
   const mod = loadNative();
   try {
@@ -152,7 +230,7 @@ export function stop() {
   } catch {
     /* nothing to do */
   }
-  log(`stopped capturing pid ${active.pid}`);
+  log(`stopped capturing ${active.mode} pid ${active.pid} (audio seen: ${sawAudio})`);
   active = null;
   broadcastState();
 }
