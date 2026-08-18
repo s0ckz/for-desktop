@@ -15,6 +15,7 @@
 #include <mmdeviceapi.h>
 
 #include <atomic>
+#include <cwctype>
 #include <string>
 #include <thread>
 #include <vector>
@@ -291,6 +292,48 @@ Napi::Value IsSupported(const Napi::CallbackInfo& info) {
   return Napi::Boolean::New(env, vi.dwBuildNumber >= 19041);
 }
 
+// UWP/Store apps (Calculator, Store games, anything packaged) do not own their
+// top-level window: it belongs to ApplicationFrameHost.exe, whose process tree
+// renders no audio at all. The real application lives in a child window owned
+// by a different process, so for a frame host we hand back the child's pid.
+// Normal windows are left exactly as they were -- an app that embeds another
+// process' window (WebView2 and friends) must keep resolving to its own pid.
+
+struct ChildPidSearch {
+  DWORD hostPid;
+  DWORD found;
+};
+
+BOOL CALLBACK FindForeignChildPid(HWND child, LPARAM param) {
+  auto* search = reinterpret_cast<ChildPidSearch*>(param);
+  DWORD childPid = 0;
+  GetWindowThreadProcessId(child, &childPid);
+  if (childPid && childPid != search->hostPid) {
+    search->found = childPid;
+    return FALSE;  // stop enumerating
+  }
+  return TRUE;
+}
+
+bool IsApplicationFrameHost(DWORD pid) {
+  HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (!process) return false;
+
+  wchar_t path[MAX_PATH] = {};
+  DWORD length = MAX_PATH;
+  bool isFrameHost = false;
+  if (QueryFullProcessImageNameW(process, 0, path, &length) && length) {
+    std::wstring full(path, length);
+    const size_t slash = full.find_last_of(L"\\/");
+    std::wstring name =
+        slash == std::wstring::npos ? full : full.substr(slash + 1);
+    for (auto& ch : name) ch = static_cast<wchar_t>(towlower(ch));
+    isFrameHost = name == L"applicationframehost.exe";
+  }
+  CloseHandle(process);
+  return isFrameHost;
+}
+
 Napi::Value PidFromWindowHandle(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   if (info.Length() < 1) return Napi::Number::New(env, 0);
@@ -308,6 +351,13 @@ Napi::Value PidFromWindowHandle(const Napi::CallbackInfo& info) {
 
   DWORD pid = 0;
   GetWindowThreadProcessId(hwnd, &pid);
+
+  if (pid && IsApplicationFrameHost(pid)) {
+    ChildPidSearch search{pid, 0};
+    EnumChildWindows(hwnd, FindForeignChildPid, reinterpret_cast<LPARAM>(&search));
+    if (search.found) pid = search.found;
+  }
+
   return Napi::Number::New(env, static_cast<double>(pid));
 }
 

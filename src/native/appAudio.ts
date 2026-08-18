@@ -8,8 +8,10 @@
 // renderer, which turns it back into a MediaStreamTrack.
 //
 // Everything here degrades quietly: if the native module is missing, the OS is
-// too old, or activation fails, we report failure and the caller falls back to
-// the previous `"loopback"` behaviour.
+// too old, or activation fails, we report failure and the caller decides what
+// to do. For a *window* that means sharing video with no audio at all -- it
+// must never widen to Chromium's `"loopback"`, which is the whole system mix
+// including the voice call. Only whole-screen shares fall back to it.
 import { BrowserWindow, app, ipcMain, shell } from "electron";
 import { appendFileSync, mkdirSync, statSync, unlinkSync } from "node:fs";
 import { release } from "node:os";
@@ -82,33 +84,6 @@ function loadNative(): NativeModule | null {
 let active: { pid: number; sourceId: string; mode: "include" | "exclude" } | null =
   null;
 
-// A captured process tree can turn out to render no audio at all -- plenty of
-// apps play through a helper process outside their own tree. Sending silence
-// would be worse than the old behaviour, so watch for real samples and fall
-// back if none arrive.
-const SILENCE_GRACE_MS = 3000;
-let sawAudio = false;
-let watchdog: NodeJS.Timeout | null = null;
-
-function noteSamples(chunk: Buffer) {
-  if (sawAudio) return;
-  // Sampling every 16th frame is plenty to spot non-silence and keeps this off
-  // the hot path.
-  for (let i = 0; i + 1 < chunk.length; i += 64) {
-    if (Math.abs(chunk.readInt16LE(i)) > 64) {
-      sawAudio = true;
-      return;
-    }
-  }
-}
-
-function clearWatchdog() {
-  if (watchdog) {
-    clearTimeout(watchdog);
-    watchdog = null;
-  }
-}
-
 export function isAppAudioActive() {
   return active !== null;
 }
@@ -144,11 +119,9 @@ function beginCapture(
   if (!mod) return false;
 
   stop();
-  sawAudio = false;
 
   try {
     mod.start(pid, mode === "include", (chunk: Buffer) => {
-      noteSamples(chunk);
       const win = BrowserWindow.getAllWindows()[0];
       if (!win || win.isDestroyed()) return;
       win.webContents.send(APP_AUDIO_CHUNK, chunk);
@@ -176,11 +149,11 @@ function captureSystemMinusSelf(sourceId: string): boolean {
 export function startForSource(sourceId: string): boolean {
   const mod = loadNative();
   if (!mod) {
-    log("falling back to system audio: native module not loaded:", nativeLoadError);
+    log("no per-app capture: native module not loaded:", nativeLoadError);
     return false;
   }
   if (!mod.isSupported()) {
-    log("falling back to system audio: OS reports process loopback unsupported");
+    log("no per-app capture: OS reports process loopback unsupported");
     return false;
   }
 
@@ -193,36 +166,26 @@ export function startForSource(sourceId: string): boolean {
     return captureSystemMinusSelf(sourceId);
   }
 
+  // A window share must never be widened to the system mix: that is how the
+  // voice call, and every other app, ended up inside people's window shares.
+  // If we cannot capture just this application, the caller shares video only.
   const pid = mod.pidFromWindowHandle(handle);
   if (!pid) {
-    log("could not resolve a process for window", handle, "- using system audio minus self");
-    return captureSystemMinusSelf(sourceId);
+    log("window share: no process behind window", handle, "- no audio for this share");
+    return false;
   }
 
   // Include the process *tree*: browsers and Electron apps render audio from
   // a child process, so targeting the visible window's pid alone is silent.
   if (!beginCapture(pid, "include", sourceId)) {
-    return captureSystemMinusSelf(sourceId);
+    log(`window share: include capture failed for pid ${pid} - no audio for this share`);
+    return false;
   }
-
-  // Some apps render through a helper outside their own tree, which would leave
-  // viewers in silence. Give it a moment, then widen rather than send nothing.
-  clearWatchdog();
-  watchdog = setTimeout(() => {
-    watchdog = null;
-    if (sawAudio || !active || active.mode !== "include") return;
-    log(
-      `no audio from pid ${pid} after ${SILENCE_GRACE_MS}ms;` +
-        " switching to system audio minus our own process tree",
-    );
-    captureSystemMinusSelf(sourceId);
-  }, SILENCE_GRACE_MS);
 
   return true;
 }
 
 export function stop() {
-  clearWatchdog();
   if (!active) return;
   const mod = loadNative();
   try {
@@ -230,7 +193,7 @@ export function stop() {
   } catch {
     /* nothing to do */
   }
-  log(`stopped capturing ${active.mode} pid ${active.pid} (audio seen: ${sawAudio})`);
+  log(`stopped capturing ${active.mode} pid ${active.pid}`);
   active = null;
   broadcastState();
 }
@@ -248,6 +211,8 @@ function buildState() {
   return {
     active: active !== null,
     pid: active?.pid ?? 0,
+    // "include" = just the shared app, "exclude" = system minus our own tree.
+    mode: active?.mode ?? null,
     supported: Boolean(mod?.isSupported()),
     sampleRate: mod?.sampleRate ?? 48000,
     channels: mod?.channels ?? 2,

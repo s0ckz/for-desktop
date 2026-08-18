@@ -291,20 +291,41 @@ export function createMainWindow() {
 
           /**
            * Answer the request, preferring audio from just the shared
-           * application. Falls back to the system mix whenever per-app capture
-           * is unavailable, so behaviour never gets worse than before.
+           * application.
+           *
+           * A *window* share that cannot get per-app audio is answered with
+           * video only: Chromium's `"loopback"` is the entire system mix,
+           * including the voice call itself, which is exactly the leak this
+           * whole module exists to avoid. Only whole-screen shares -- where
+           * the system mix is what the user asked for anyway -- fall back to
+           * it.
            */
           const respond = (source: Electron.DesktopCapturerSource, audio: boolean) => {
+            const isWindow = source.id.startsWith("window:");
             if (!audio) {
+              appAudioLog("sharing", source.id, "without audio");
               callback({ video: source });
               return;
             }
             if (startForSource(source.id)) {
               // Audio arrives out-of-band and is stitched in by the renderer;
               // asking Chromium for loopback too would double up the sound.
+              appAudioLog("sharing", source.id, "with per-app audio");
               callback({ video: source });
               return;
             }
+            if (isWindow) {
+              appAudioLog(
+                "no per-app audio for window",
+                source.id,
+                "- sharing video only rather than the whole system mix",
+              );
+              callback({ video: source });
+              return;
+            }
+            appAudioLog(
+              "screen share falling back to Chromium loopback (whole system mix)",
+            );
             callback({ video: source, audio: "loopback" });
           };
 
@@ -323,8 +344,12 @@ export function createMainWindow() {
                 String(audio),
                 idx >= 0 && idx < sources.length ? sources[idx].id : "(out of range)",
               );
-              if (idx < 0 || idx > sources.length) {
-                callback({});
+              if (idx < 0 || idx >= sources.length) {
+                // Electron's typings insist on an argument, but the documented
+                // way to cancel is calling back with none: that is what turns
+                // into a clean NotAllowedError in the renderer instead of an
+                // unexpected rejection.
+                (callback as unknown as () => void)();
               } else {
                 respond(sources[idx], audio);
               }
