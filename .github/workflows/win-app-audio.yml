@@ -15,6 +15,12 @@ jobs:
     # windows-latest ships Visual Studio 18, which node-gyp cannot detect yet,
     # breaking every native module build. VS2022 is present on windows-2022.
     runs-on: windows-2022
+    timeout-minutes: 45
+
+    # forge.config.ts only skips the AppX and Deb makers when PLATFORM is set;
+    # its own comment warns that the AppX maker freezes CI.
+    env:
+      PLATFORM: win32
 
     steps:
       - name: Checkout
