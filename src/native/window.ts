@@ -15,7 +15,6 @@ import windowIconAsset from "../../assets/desktop/icon.png?asset";
 
 import { config } from "./config";
 import { updateTrayMenu } from "./tray";
-import { VOICE_PATCH } from "./voicePatch";
 
 // global reference to main window
 export let mainWindow: BrowserWindow;
@@ -152,22 +151,9 @@ export function createMainWindow() {
   // send the config
   mainWindow.webContents.on("did-finish-load", () => config.sync());
 
-  // inject voice channel click-to-join patch
-  mainWindow.webContents.on("did-finish-load", () => {
-    mainWindow.webContents
-      .executeJavaScript(VOICE_PATCH)
-      .then(() => console.log("voice channel patch injected"))
-      .catch((err) =>
-        console.error("could not inject voice channel patch:", err),
-      );
-  });
-
   // Log renderer crashes to terminal
   mainWindow.webContents.on("render-process-gone", (_, details) => {
     console.error("RENDERER CRASHED:", details.reason, details.exitCode);
-    if (details.crashReporter) {
-      console.error("Crash report:", details.crashReporter);
-    }
   });
 
   // Log unresponsive events
