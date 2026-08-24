@@ -206,7 +206,7 @@ const config: ForgeConfig = {
   publishers: [
     new PublisherGithub({
       repository: {
-        owner: "stoatchat",
+        owner: "s0ckz",
         name: "for-desktop",
       },
     }),
