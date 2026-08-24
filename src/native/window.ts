@@ -189,6 +189,16 @@ export function createMainWindow() {
   // send the config
   mainWindow.webContents.on("did-finish-load", () => config.sync());
 
+  // Log renderer crashes to terminal
+  mainWindow.webContents.on("render-process-gone", (_, details) => {
+    console.error("RENDERER CRASHED:", details.reason, details.exitCode);
+  });
+
+  // Log unresponsive events
+  mainWindow.on("unresponsive", () => {
+    console.error("WINDOW UNRESPONSIVE");
+  });
+
   // configure spellchecker context menu
   mainWindow.webContents.on("context-menu", (_, params) => {
     const menu = new Menu();
