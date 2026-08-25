@@ -26,6 +26,32 @@ if (!config.hardwareAcceleration) {
   app.disableHardwareAcceleration();
 }
 
+// Every Windows.Graphics.Capture session is brokered by the CaptureService
+// service (`svchost -k LocalService -s CaptureService`). Measured on Windows 10
+// 22H2 during a share: that service sat at 85-100% of a core for the entire
+// duration, its threadpool threads parked in EventPairLow -- drowning in RPC
+// rather than computing -- while alt-tab and the Start menu stopped responding.
+// Discord captures through DXGI desktop duplication, never loads
+// GraphicsCapture.dll, and does not do this on the same machine.
+//
+// Dropping WGC for screens selects ScreenCapturerWinDirectx (DXGI), falling
+// back to ScreenCapturerWinGdi; both are compiled into Electron already.
+//
+// This is deliberately only half a fix: `AllowWgcScreenCapturer` is the only
+// switch that exists. `CreateWindowCapturer` is hard-coded to WgcCapturerWin
+// with no feature flag or field trial behind it, so *window* shares are
+// unaffected and still drive CaptureService. Whether a screen share stays flat
+// is the measurement that says if WGC is the culprit at all.
+//
+// `--keep-wgc-screen` restores stock behaviour, so the two can be compared
+// without a rebuild.
+if (
+  process.platform === "win32" &&
+  !app.commandLine.hasSwitch("keep-wgc-screen")
+) {
+  app.commandLine.appendSwitch("disable-features", "AllowWgcScreenCapturer");
+}
+
 // ensure only one copy of the application can run
 const acquiredLock = app.requestSingleInstanceLock();
 

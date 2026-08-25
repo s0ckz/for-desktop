@@ -303,6 +303,16 @@ export function createMainWindow() {
   // hide the options
   mainWindow.setMenu(null);
 
+  // So the log says which capture stack this run actually used.
+  if (process.platform === "win32") {
+    appAudioLog(
+      "wgc screen capturer:",
+      app.commandLine.hasSwitch("keep-wgc-screen")
+        ? "enabled (stock)"
+        : "disabled -> DXGI, falling back to GDI",
+    );
+  }
+
   // restore last position if it was moved previously
   if (config.windowState.x > 0 || config.windowState.y > 0) {
     mainWindow.setPosition(
