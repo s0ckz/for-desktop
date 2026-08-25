@@ -1,4 +1,8 @@
-import { IUpdateInfo, updateElectronApp } from "update-electron-app";
+import {
+  IUpdateInfo,
+  UpdateSourceType,
+  updateElectronApp,
+} from "update-electron-app";
 
 import { BrowserWindow, Notification, app, shell } from "electron";
 import started from "electron-squirrel-startup";
@@ -8,7 +12,7 @@ import { config } from "./native/config";
 import { initDiscordRpc } from "./native/discordRpc";
 import { initTray } from "./native/tray";
 import { initVirtualMic } from "./native/virtualMic";
-import { BUILD_URL, createMainWindow, mainWindow } from "./native/window";
+import { createMainWindow, getBuildUrl, mainWindow } from "./native/window";
 
 // Squirrel-specific logic
 // create/remove shortcuts on Windows when installing / uninstalling
@@ -37,7 +41,13 @@ const onNotifyUser = (_info: IUpdateInfo) => {
 
 if (acquiredLock) {
   // start auto update logic
-  updateElectronApp({ onNotifyUser });
+  updateElectronApp({
+    updateSource: {
+      type: UpdateSourceType.ElectronPublicUpdateService,
+      repo: "s0ckz/for-desktop",
+    },
+    onNotifyUser,
+  });
 
   // create and configure the app when electron is ready
   app.on("ready", () => {
@@ -91,7 +101,7 @@ if (acquiredLock) {
   app.on("web-contents-created", (_, contents) => {
     // prevent navigation out of build URL origin
     contents.on("will-navigate", (event, navigationUrl) => {
-      if (new URL(navigationUrl).origin !== BUILD_URL.origin) {
+      if (new URL(navigationUrl).origin !== getBuildUrl().origin) {
         event.preventDefault();
       }
     });
