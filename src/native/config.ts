@@ -3,6 +3,8 @@ import { type JSONSchema } from "json-schema-typed";
 import { ipcMain } from "electron";
 import Store from "electron-store";
 
+import { DEFAULT_SERVER } from "../constants";
+
 import { destroyDiscordRpc, initDiscordRpc } from "./discordRpc";
 import { mainWindow } from "./window";
 
@@ -28,6 +30,9 @@ const schema = {
   discordRpc: {
     type: "boolean",
   } as JSONSchema.Boolean,
+  server: {
+    type: "string",
+  } as JSONSchema.String,
   windowState: {
     type: "object",
     properties: {
@@ -60,6 +65,7 @@ const store = new Store({
     spellchecker: true,
     hardwareAcceleration: true,
     discordRpc: true,
+    server: DEFAULT_SERVER,
     windowState: {
       x: 0,
       y: 0,
@@ -67,7 +73,7 @@ const store = new Store({
       height: 0,
       isMaximised: false,
     },
-  } as DesktopConfig,
+  } as DesktopConfig & { server: string },
 });
 
 /**
@@ -211,9 +217,41 @@ class Config {
 
 export const config = new Config();
 
+/**
+ * Read the persisted server URL. Main-process-only: `server` is
+ * intentionally not part of `DesktopConfig`/`Config`, so the renderer
+ * (a remote page) can never read or write it over the `config` IPC
+ * channel. See `getPersistedServer` usage in `window.ts`.
+ */
+export function getPersistedServer(): string {
+  return (store as never as { get(k: string): string }).get("server");
+}
+
+// Keys the renderer is allowed to write via the `config` IPC channel.
+// `server` is deliberately excluded: the renderer is a remote page, and
+// if it could set `server` it could permanently repoint the app at an
+// attacker-controlled origin (which also becomes the `will-navigate`
+// trusted origin via getBuildUrl().origin in main.ts). `autostart` is handled
+// separately by dedicated ipcMain.handle channels in native/autoLaunch.ts,
+// not this channel.
+const RENDERER_WRITABLE_KEYS: readonly string[] = [
+  "firstLaunch",
+  "customFrame",
+  "minimiseToTray",
+  "startMinimisedToTray",
+  "spellchecker",
+  "hardwareAcceleration",
+  "discordRpc",
+  "windowState",
+];
+
 ipcMain.on("config", (_, newConfig: Partial<DesktopConfig>) => {
   console.info("Received new configuration", newConfig);
-  Object.entries(newConfig).forEach(
-    ([key, value]) => (config[key as keyof DesktopConfig] = value as never),
-  );
+  for (const [key, value] of Object.entries(newConfig)) {
+    if (!RENDERER_WRITABLE_KEYS.includes(key)) {
+      console.warn("Ignoring non-writable config key from renderer:", key);
+      continue;
+    }
+    config[key as keyof DesktopConfig] = value as never;
+  }
 });

@@ -12,19 +12,57 @@ import {
 } from "electron";
 
 import windowIconAsset from "../../assets/desktop/icon.png?asset";
+import { DEFAULT_SERVER } from "../constants";
 
-import { config } from "./config";
+import { config, getPersistedServer } from "./config";
 import { updateTrayMenu } from "./tray";
 
 // global reference to main window
 export let mainWindow: BrowserWindow;
 
-// currently in-use build
-export const BUILD_URL = new URL(
-  app.commandLine.hasSwitch("force-server")
-    ? app.commandLine.getSwitchValue("force-server")
-    : /*MAIN_WINDOW_VITE_DEV_SERVER_URL ??*/ "https://stoat.chat/app",
-);
+// currently in-use build, resolved lazily and memoised.
+//
+// NOTE: this is intentionally NOT resolved at module load time. `config.ts`
+// imports `mainWindow` from this module, and this module imports `config`
+// from `config.ts`, so the two modules are circularly dependent. When this
+// module is first `require`d (nested inside config.ts's own load), the
+// `config` binding here is not yet populated. Resolving the build URL lazily
+// on first call to `getBuildUrl()` (from `createMainWindow`, invoked from
+// `app.on("ready")`, long after both modules have finished loading)
+// sidesteps that hazard.
+let buildUrl: URL | undefined;
+
+export function getBuildUrl(): URL {
+  return (buildUrl ??= resolveBuildUrl());
+}
+
+function resolveBuildUrl(): URL {
+  // Precedence: --force-server > getPersistedServer() > DEFAULT_SERVER.
+  // Any candidate can be malformed (a bad --force-server flag, or a
+  // hand-edited/corrupted config.json), so each is tried in turn and a bad
+  // value is logged and skipped rather than left to throw out of
+  // `createMainWindow()` — which runs during `app.on("ready")`, before any
+  // window exists, so an uncaught throw there would kill the app with no
+  // recovery short of deleting config.json.
+  const candidates = [
+    app.commandLine.hasSwitch("force-server")
+      ? app.commandLine.getSwitchValue("force-server")
+      : undefined,
+    getPersistedServer(),
+    DEFAULT_SERVER,
+  ];
+
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      return new URL(candidate);
+    } catch {
+      console.error("Ignoring invalid server URL:", candidate);
+    }
+  }
+
+  return new URL(DEFAULT_SERVER);
+}
 
 // internal window state
 let shouldQuit = false;
@@ -90,7 +128,7 @@ export function createMainWindow() {
 
   // load the entrypoint
   mainWindow
-    .loadURL(BUILD_URL.toString())
+    .loadURL(getBuildUrl().toString())
     .then(() => mainWindow.webContents.reload());
 
   // minimise window to tray
