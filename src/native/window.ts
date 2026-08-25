@@ -105,6 +105,12 @@ let armedShare: {
 let reacquireGeneration = 0;
 
 const REACQUIRE_POLL_MS = 1000;
+/**
+ * Enumerating every window is cheap now that we ask for no thumbnails, but a
+ * window left minimised for minutes should not be polled at the same rate as
+ * one that is about to come straight back.
+ */
+const REACQUIRE_POLL_MAX_MS = 5000;
 const REACQUIRE_TIMEOUT_MS = 5 * 60 * 1000;
 /** How long a found window stays armed before the picker comes back. */
 const ARMED_TTL_MS = 10_000;
@@ -169,7 +175,17 @@ async function findRememberedWindow(target: {
   pid: number;
   name: string;
 }): Promise<Electron.DesktopCapturerSource | null> {
-  const sources = await desktopCapturer.getSources({ types: ["window"] });
+  // `thumbnailSize` defaults to 150x150, which makes Electron capture a live
+  // frame of *every* window on the system. Chromium 150 does that through the
+  // Windows Graphics Capture window capturer, so each call builds and tears
+  // down a WGC item plus a D3D11 frame pool per window -- once a second, for
+  // as long as this poll runs. That is enough to wedge dwm.exe and take the
+  // shell (alt-tab, Start menu) down with it. We only read ids, names and
+  // pids, so ask for no thumbnails at all.
+  const sources = await desktopCapturer.getSources({
+    types: ["window"],
+    thumbnailSize: { width: 0, height: 0 },
+  });
 
   const capturable = (source: Electron.DesktopCapturerSource) => {
     const state = windowStateForSourceId(source.id);
@@ -216,6 +232,7 @@ ipcMain.handle("screenShare:reacquire", async () => {
 
   const generation = ++reacquireGeneration;
   const deadline = Date.now() + REACQUIRE_TIMEOUT_MS;
+  let pollMs = REACQUIRE_POLL_MS;
   appAudioLog(
     "reacquire: waiting for window",
     target.name,
@@ -241,7 +258,8 @@ ipcMain.handle("screenShare:reacquire", async () => {
       return true;
     }
 
-    await new Promise((resolve) => setTimeout(resolve, REACQUIRE_POLL_MS));
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+    pollMs = Math.min(Math.round(pollMs * 1.5), REACQUIRE_POLL_MAX_MS);
   }
 
   appAudioLog("reacquire: window never came back");
@@ -525,7 +543,14 @@ export function createMainWindow() {
       reacquireGeneration++;
 
       desktopCapturer
-        .getSources({ types: ["screen", "window"], fetchWindowIcons: true })
+        .getSources({
+          types: ["screen", "window"],
+          fetchWindowIcons: true,
+          // The picker shows app icons, never window thumbnails; capturing one
+          // per window is pure cost -- and a visible stall while the picker
+          // opens. See the note in `findRememberedWindow`.
+          thumbnailSize: { width: 0, height: 0 },
+        })
         .then((sources) => {
           // Any previous share is over by the time a new one is requested.
           stopAppAudio();
