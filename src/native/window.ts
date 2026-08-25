@@ -111,7 +111,11 @@ const REACQUIRE_POLL_MS = 1000;
  * one that is about to come straight back.
  */
 const REACQUIRE_POLL_MAX_MS = 5000;
-const REACQUIRE_TIMEOUT_MS = 5 * 60 * 1000;
+// Five minutes of polling outlived every share it was meant to rescue: nothing
+// cancelled it when the user simply stopped sharing or left the call, so it
+// ground on regardless. Ninety seconds covers an app recreating its window
+// without leaving a poll running long after anyone cares.
+const REACQUIRE_TIMEOUT_MS = 90 * 1000;
 /** How long a found window stays armed before the picker comes back. */
 const ARMED_TTL_MS = 10_000;
 
@@ -125,7 +129,7 @@ const ARMED_TTL_MS = 10_000;
  * whole-screen shares -- where the system mix is what the user asked for
  * anyway -- fall back to it.
  */
-function respondToDisplayMedia(
+async function respondToDisplayMedia(
   source: Electron.DesktopCapturerSource,
   audio: boolean,
   callback: DisplayMediaCallback,
@@ -138,16 +142,38 @@ function respondToDisplayMedia(
     audio,
   };
 
-  if (!audio) {
-    appAudioLog("sharing", source.id, "without audio");
-    callback({ video: source });
+  // Window capture is hard-wired to WGC and WGC is brokered by CaptureService,
+  // which is what pins a core and takes the shell down with it. Capturing the
+  // whole screen instead goes through DXGI desktop duplication -- the stack
+  // Discord uses -- while per-app audio still follows the window's process, so
+  // the sound stays correct even though the framing does not. Everything on the
+  // screen becomes visible: strictly a trade, hence opt-in.
+  let videoSource = source;
+  if (isWindow && app.commandLine.hasSwitch("window-shares-as-screen")) {
+    const screen = await primaryScreenSource();
+    if (screen) {
+      appAudioLog(
+        "window-shares-as-screen: sending",
+        screen.id,
+        "in place of",
+        source.id,
+      );
+      videoSource = screen;
+    } else {
+      appAudioLog("window-shares-as-screen: no screen source; keeping window");
+    }
+  }
+
+  if (!audio || app.commandLine.hasSwitch("no-per-app-audio")) {
+    appAudioLog("sharing", videoSource.id, "without audio");
+    callback({ video: videoSource });
     return;
   }
   if (startForSource(source.id)) {
     // Audio arrives out-of-band and is stitched in by the renderer; asking
     // Chromium for loopback too would double up the sound.
-    appAudioLog("sharing", source.id, "with per-app audio");
-    callback({ video: source });
+    appAudioLog("sharing", videoSource.id, "with per-app audio");
+    callback({ video: videoSource });
     return;
   }
   if (isWindow) {
@@ -156,13 +182,13 @@ function respondToDisplayMedia(
       source.id,
       "- sharing video only rather than the whole system mix",
     );
-    callback({ video: source });
+    callback({ video: videoSource });
     return;
   }
   appAudioLog(
     "screen share falling back to Chromium loopback (whole system mix)",
   );
-  callback({ video: source, audio: "loopback" });
+  callback({ video: videoSource, audio: "loopback" });
 }
 
 /**
@@ -209,6 +235,22 @@ async function findRememberedWindow(target: {
 }
 
 /**
+ * The first whole-screen source, used to keep a window share off WGC.
+ */
+async function primaryScreenSource(): Promise<Electron.DesktopCapturerSource | null> {
+  try {
+    const screens = await desktopCapturer.getSources({
+      types: ["screen"],
+      thumbnailSize: { width: 0, height: 0 },
+    });
+    return screens[0] ?? null;
+  } catch (err) {
+    appAudioLog("could not list screens:", String(err));
+    return null;
+  }
+}
+
+/**
  * Wait for the last shared window to come back.
  *
  * Chromium ends the capture track when the shared window is destroyed (an app
@@ -219,6 +261,18 @@ async function findRememberedWindow(target: {
  * Resolves false on timeout, if there is nothing to re-acquire, or if another
  * call supersedes this one.
  */
+/**
+ * Abandon any in-flight re-acquire. The renderer calls this when the user stops
+ * sharing or leaves the call, so a poll cannot outlive the share it was started
+ * for.
+ */
+ipcMain.on("screenShare:cancelReacquire", () => {
+  if (lastShare) appAudioLog("reacquire: cancelled by renderer");
+  reacquireGeneration++;
+  lastShare = null;
+  armedShare = null;
+});
+
 ipcMain.handle("screenShare:reacquire", async () => {
   const target = lastShare;
   if (!target) {
@@ -296,14 +350,14 @@ export function createMainWindow() {
       // A fullscreen game covering Stoat would otherwise have Chromium throttle
       // our timers, which stalls the per-app audio pump and the share recovery
       // polling exactly when they are needed.
-      backgroundThrottling: false,
+      backgroundThrottling: app.commandLine.hasSwitch("background-throttling"),
     },
   });
 
   // hide the options
   mainWindow.setMenu(null);
 
-  // So the log says which capture stack this run actually used.
+  // So the log says exactly which knobs this run was started with.
   if (process.platform === "win32") {
     appAudioLog(
       "wgc screen capturer:",
@@ -311,6 +365,14 @@ export function createMainWindow() {
         ? "enabled (stock)"
         : "disabled -> DXGI, falling back to GDI",
     );
+    const flags = [
+      "no-wgc-zero-hz",
+      "window-shares-as-screen",
+      "no-per-app-audio",
+      "background-throttling",
+    ].filter((flag) => app.commandLine.hasSwitch(flag));
+    appAudioLog("capture flags:", flags.length ? flags.join(", ") : "(none)");
+    appAudioLog("capture fps cap:", String(captureFpsCap() ?? "none"));
   }
 
   // restore last position if it was moved previously
@@ -374,12 +436,26 @@ export function createMainWindow() {
     },
   );
 
+  /**
+   * `--capture-fps=N` caps the frame rate the page may ask for. WGC brokers each
+   * frame through CaptureService, so the rate is a direct lever on how hard that
+   * service is driven -- and this fork raised the requested rate when it removed
+   * an old 5fps clamp.
+   */
+  function captureFpsCap(): number | null {
+    if (!app.commandLine.hasSwitch("capture-fps")) return null;
+    const raw = Number(app.commandLine.getSwitchValue("capture-fps"));
+    return Number.isFinite(raw) && raw > 0 ? Math.round(raw) : null;
+  }
+
   // The web app is remote, so the getDisplayMedia override has to be injected
   // into its main world on every load (contextIsolation keeps the preload out).
   mainWindow.webContents.on("did-finish-load", () => {
     appAudioLog("page loaded:", mainWindow.webContents.getURL());
+    const prelude =
+      "window.__stoatCaptureFps = " + JSON.stringify(captureFpsCap()) + ";\n";
     mainWindow.webContents
-      .executeJavaScript(APP_AUDIO_PATCH)
+      .executeJavaScript(prelude + APP_AUDIO_PATCH)
       .then(() => appAudioLog("screen share patch injected"))
       .catch((err) => appAudioLog("could not inject patch:", String(err)));
   });
@@ -538,7 +614,7 @@ export function createMainWindow() {
       if (armed && Date.now() - armed.at < ARMED_TTL_MS) {
         appAudioLog("answering with re-acquired source", armed.source.id);
         stopAppAudio();
-        respondToDisplayMedia(
+        void respondToDisplayMedia(
           armed.source,
           armed.audio && request.audioRequested,
           callback,
@@ -568,7 +644,11 @@ export function createMainWindow() {
 
           // Shortcut for linux wayland.
           if (sources.length == 1) {
-            respondToDisplayMedia(sources[0], request.audioRequested, callback);
+            void respondToDisplayMedia(
+              sources[0],
+              request.audioRequested,
+              callback,
+            );
             return;
           }
           ipcMain.once(
@@ -591,7 +671,7 @@ export function createMainWindow() {
                 lastShare = null;
                 (callback as unknown as () => void)();
               } else {
-                respondToDisplayMedia(sources[idx], audio, callback);
+                void respondToDisplayMedia(sources[idx], audio, callback);
               }
             },
           );

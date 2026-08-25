@@ -37,19 +37,28 @@ if (!config.hardwareAcceleration) {
 // Dropping WGC for screens selects ScreenCapturerWinDirectx (DXGI), falling
 // back to ScreenCapturerWinGdi; both are compiled into Electron already.
 //
-// This is deliberately only half a fix: `AllowWgcScreenCapturer` is the only
-// switch that exists. `CreateWindowCapturer` is hard-coded to WgcCapturerWin
-// with no feature flag or field trial behind it, so *window* shares are
-// unaffected and still drive CaptureService. Whether a screen share stays flat
-// is the measurement that says if WGC is the culprit at all.
+// `AllowWgcScreenCapturer` is the only switch that exists. `CreateWindowCapturer`
+// is hard-coded to WgcCapturerWin with no feature flag or field trial behind it,
+// so a *window* share cannot be moved off WGC from here at all -- see
+// `--window-shares-as-screen` in native/window.ts for the one workaround we do
+// have.
 //
-// `--keep-wgc-screen` restores stock behaviour, so the two can be compared
-// without a rebuild.
-if (
-  process.platform === "win32" &&
-  !app.commandLine.hasSwitch("keep-wgc-screen")
-) {
-  app.commandLine.appendSwitch("disable-features", "AllowWgcScreenCapturer");
+// `--keep-wgc-screen` restores stock behaviour so the two can be compared
+// without a rebuild; `--no-wgc-zero-hz` additionally drops WGC's
+// deliver-nothing-when-idle path, which is a plausible source of retry churn.
+if (process.platform === "win32") {
+  const disabled: string[] = [];
+  if (!app.commandLine.hasSwitch("keep-wgc-screen")) {
+    disabled.push("AllowWgcScreenCapturer");
+  }
+  if (app.commandLine.hasSwitch("no-wgc-zero-hz")) {
+    disabled.push("AllowWgcScreenZeroHz");
+  }
+  // appendSwitch replaces rather than appends when the switch already exists,
+  // so the whole list has to go in one call.
+  if (disabled.length) {
+    app.commandLine.appendSwitch("disable-features", disabled.join(","));
+  }
 }
 
 // ensure only one copy of the application can run
@@ -65,6 +74,9 @@ const onNotifyUser = (_info: IUpdateInfo) => {
   notification.show();
 };
 
+/** Guards against this module being evaluated more than once. */
+let didInitialise = false;
+
 if (acquiredLock) {
   // start auto update logic
   updateElectronApp({
@@ -77,6 +89,18 @@ if (acquiredLock) {
 
   // create and configure the app when electron is ready
   app.on("ready", () => {
+    // app-audio.log shows every startup line twice -- two "session start"
+    // blocks, two "page loaded", two patch injections -- which means this
+    // module gets evaluated twice and registers two `ready` listeners. The
+    // second run built a second BrowserWindow and re-ran initAppAudio(), whose
+    // ipcMain.handle calls then threw for being registered twice. Only the
+    // first run may proceed.
+    if (didInitialise) {
+      console.warn("[main] ready fired twice; ignoring the second run");
+      return;
+    }
+    didInitialise = true;
+
     // create window and application contexts
     createMainWindow();
 
