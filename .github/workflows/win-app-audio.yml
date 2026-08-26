@@ -1,0 +1,159 @@
+name: Windows per-app audio build
+
+# Builds the Windows app with the native per-process audio capture module and
+# uploads the installer, so the addon never has to be compiled by hand.
+
+on:
+  push:
+    branches:
+      - feat/windows-per-app-audio
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Windows app
+    # windows-latest ships Visual Studio 18, which node-gyp cannot detect yet,
+    # breaking every native module build. VS2022 is present on windows-2022.
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    # forge.config.ts only skips the AppX and Deb makers when PLATFORM is set;
+    # its own comment warns that the AppX maker freezes CI.
+    env:
+      PLATFORM: win32
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Checkout assets
+        run: git -c submodule."assets".update=checkout submodule update --init assets
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      # Fails loudly here rather than silently falling back at runtime.
+      - name: Verify native module compiled
+        shell: bash
+        run: |
+          set -e
+          find node_modules/win-app-audio -name '*.node' -print
+          test -f node_modules/win-app-audio/build/Release/win_app_audio.node
+
+      - name: Lint
+        run: pnpm lint
+        continue-on-error: true
+
+      - name: Package
+        run: pnpm package
+
+      - name: Confirm addon shipped in the package
+        shell: bash
+        run: |
+          echo "--- resources dir ---"
+          find out -maxdepth 4 -name 'resources' -type d -exec ls -la {} \;
+          echo "--- any win-app-audio on disk ---"
+          find out -path '*win-app-audio*' -maxdepth 8 | head -20
+          echo "--- unpacked natives ---"
+          find out -name '*.node' | head -20
+          echo "--- asar contents ---"
+          ASAR=$(find out -name 'app.asar' -print -quit)
+          if [ -n "$ASAR" ]; then
+            npx --yes @electron/asar list "$ASAR" | grep -i -E 'win-app-audio|\.node' | head -20 || echo "(no matches inside asar)"
+          fi
+          echo "--- verdict ---"
+          test -n "$(find out -name 'win_app_audio.node' -print -quit)"             && echo "OK: addon present"             || { echo "MISSING: addon not packaged"; exit 1; }
+
+      - name: Make installer
+        run: pnpm make
+        continue-on-error: true
+
+      - name: Upload packaged app
+        uses: actions/upload-artifact@v4
+        with:
+          name: stoat-windows-per-app-audio
+          path: |
+            out/make/**/*
+            out/*-win32-*/**
+          if-no-files-found: warn
+          retention-days: 14
+
+      # Actions artifacts need a GitHub login to download, so publish the
+      # installer as a release asset instead -- that is a plain public link.
+      - name: Collect release assets
+        id: assets
+        shell: bash
+        run: |
+          mkdir -p release
+          echo "--- what make produced ---"
+          find out/make -type f | head -30
+
+          SETUP=$(find out/make -name '*.exe' -print -quit)
+          if [ -n "$SETUP" ]; then
+            cp "$SETUP" "release/Stoat-per-app-audio-Setup.exe"
+          fi
+
+          ZIP=$(find out/make -name '*.zip' -print -quit)
+          if [ -n "$ZIP" ]; then
+            cp "$ZIP" "release/Stoat-per-app-audio-portable.zip"
+          fi
+
+          # Fall back to zipping the packaged folder if no maker produced one.
+          if [ ! -f release/Stoat-per-app-audio-portable.zip ]; then
+            APPDIR=$(find out -maxdepth 1 -type d -name '*-win32-*' -print -quit)
+            if [ -n "$APPDIR" ]; then
+              powershell -Command "Compress-Archive -Path '$APPDIR/*' -DestinationPath 'release/Stoat-per-app-audio-portable.zip' -Force"
+            fi
+          fi
+
+          echo "--- release assets ---"
+          ls -la release
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          TAG="win-per-app-audio"
+          NOTES="Stoat for Desktop with per-application screen share audio on Windows.
+
+          Sharing a **window** now sends only that application's sound instead of
+          the entire system mix. Sharing a whole screen, or running a Windows
+          build without process loopback support, falls back to the previous
+          behaviour automatically.
+
+          Built from branch \`feat/windows-per-app-audio\` (commit \`${GITHUB_SHA:0:7}\`).
+
+          Diagnostics are written to \`%APPDATA%\Stoat\logs\app-audio.log\`.
+
+          Unofficial build -- not affiliated with the Stoat project."
+
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY"               --title "Stoat: per-app screen share audio (Windows)"               --notes "$NOTES" --prerelease
+          else
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes "$NOTES"
+          fi
+
+          shopt -s nullglob
+          FILES=(release/*)
+          if [ ${#FILES[@]} -gt 0 ]; then
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${FILES[@]}"
+          else
+            echo "no assets to upload"; exit 1
+          fi
+
+          echo "Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"

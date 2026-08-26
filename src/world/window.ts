@@ -34,4 +34,31 @@ contextBridge.exposeInMainWorld("native", {
     ipcRenderer.send("screenPickerCallback", idx, audio),
 
   isWayland: () => ipcRenderer.invoke("getIsWayland"),
+
+  // Wait for a screen share that Chromium ended -- a window that toggled
+  // fullscreen or was minimised -- to become shareable again. Resolves true
+  // once the main process has the window lined up, at which point re-requesting
+  // getDisplayMedia is answered with it and no picker appears.
+  reacquireScreenShare: (): Promise<boolean> =>
+    ipcRenderer.invoke("screenShare:reacquire"),
+  /**
+   * Abandon an in-flight re-acquire. Call this when the user stops sharing or
+   * leaves the call, otherwise the poll outlives the share it was started for.
+   */
+  cancelReacquireScreenShare: (): void =>
+    ipcRenderer.send("screenShare:cancelReacquire"),
+
+  // Per-application screen share audio (Windows). The injected main-world
+  // patch uses this to turn captured PCM back into a MediaStreamTrack.
+  appAudio: {
+    getState: () => ipcRenderer.invoke("appAudio:getState"),
+    getLogPath: () => ipcRenderer.invoke("appAudio:getLogPath"),
+    openLogs: () => ipcRenderer.send("appAudio:openLogs"),
+    stop: () => ipcRenderer.send("appAudio:stop"),
+    onChunk: (handler: (chunk: Uint8Array) => void) => {
+      const listener = (_: unknown, chunk: Uint8Array) => handler(chunk);
+      ipcRenderer.on("appAudio:chunk", listener);
+      return () => ipcRenderer.removeListener("appAudio:chunk", listener);
+    },
+  },
 });

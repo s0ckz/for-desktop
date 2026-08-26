@@ -30,6 +30,9 @@ const schema = {
   discordRpc: {
     type: "boolean",
   } as JSONSchema.Boolean,
+  lastServer: {
+    type: "string",
+  } as JSONSchema.String,
   server: {
     type: "string",
   } as JSONSchema.String,
@@ -65,6 +68,7 @@ const store = new Store({
     spellchecker: true,
     hardwareAcceleration: true,
     discordRpc: true,
+    lastServer: "",
     server: DEFAULT_SERVER,
     windowState: {
       x: 0,
@@ -80,6 +84,21 @@ const store = new Store({
  * Shim for `electron-store` because typings are broken
  */
 class Config {
+  /** Current configuration as a plain object */
+  snapshot(): DesktopConfig {
+    return {
+      firstLaunch: this.firstLaunch,
+      customFrame: this.customFrame,
+      minimiseToTray: this.minimiseToTray,
+      startMinimisedToTray: this.startMinimisedToTray,
+      spellchecker: this.spellchecker,
+      hardwareAcceleration: this.hardwareAcceleration,
+      discordRpc: this.discordRpc,
+      lastServer: this.lastServer,
+      windowState: this.windowState,
+    } as DesktopConfig;
+  }
+
   sync() {
     mainWindow.webContents.send("config", {
       firstLaunch: this.firstLaunch,
@@ -104,6 +123,17 @@ class Config {
     );
 
     this.sync();
+  }
+
+  get lastServer() {
+    return (store as never as { get(k: string): string }).get("lastServer");
+  }
+
+  set lastServer(value: string) {
+    (store as never as { set(k: string, value: string): void }).set(
+      "lastServer",
+      value,
+    );
   }
 
   get customFrame() {
@@ -216,6 +246,14 @@ class Config {
 }
 
 export const config = new Config();
+
+// The renderer needs configuration before its first paint. Pushing it on
+// did-finish-load races the page's own scripts, and the client dereferences
+// windowState without a guard -- losing that race throws during startup and
+// leaves a blank window. Answer synchronously at preload time instead.
+ipcMain.on("config:getSync", (event) => {
+  event.returnValue = config.snapshot();
+});
 
 /**
  * Read the persisted server URL. Main-process-only: `server` is

@@ -148,6 +148,23 @@ const config: ForgeConfig = {
   hooks: {
     // Copy the node-pipewire dist to the app on linux
     packageAfterCopy: async (_config, buildPath, _version, platform) => {
+      // Per-application screen share audio (Windows only). Ship the compiled
+      // addon plus its loader; node-addon-api is header-only and not needed at
+      // runtime, so node_modules is deliberately skipped.
+      if (platform === "win32") {
+        const from = "node_modules/win-app-audio";
+        const to = path.join(buildPath, "node_modules/win-app-audio");
+        fs.mkdirSync(path.join(to, "build/Release"), { recursive: true });
+        for (const entry of [
+          "package.json",
+          "index.js",
+          "index.d.ts",
+          "build/Release/win_app_audio.node",
+        ]) {
+          fs.cpSync(path.join(from, entry), path.join(to, entry));
+        }
+      }
+
       if (platform === "linux") {
         // Copy only the files we need to run the code, which is dist, LICENSE, and package.json
         fs.cpSync(
