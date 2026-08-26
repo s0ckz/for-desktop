@@ -35,6 +35,9 @@ importers:
       utf-8-validate:
         specifier: ^6.0.5
         version: 6.0.5
+      win-app-audio:
+        specifier: file:native/win-app-audio
+        version: file:native/win-app-audio
     devDependencies:
       '@electron-forge/cli':
         specifier: ^7.11.2
@@ -2795,6 +2798,10 @@ packages:
   node-addon-api@1.7.2:
     resolution: {integrity: sha512-ibPK3iA+vaY1eEjESkQkM0BbCqFOaZMiXRTtdB0u7b4djtY6JnsjvPdUHVMg6xQt3B8fpTTWHI9A+ADjM9frzg==}
 
+  node-addon-api@8.9.2:
+    resolution: {integrity: sha512-VijLXbi3UACN69I0JVXJsX4tjACjNoQDgv2gTF6sx2wWEi8tkSg2eX8p5gSIFi8z2+DL3oHmY6OyKce38SDolg==}
+    engines: {node: ^18 || ^20 || >= 21}
+
   node-api-version@0.2.1:
     resolution: {integrity: sha512-2xP/IGGMmmSQpI1+O/k72jF/ykvZ89JeuKX3TLJAYPDVLUalrshrLHkeVcCCZqG/eEa635cr8IBYzgnDvM2O8Q==}
 
@@ -3685,6 +3692,9 @@ packages:
     resolution: {integrity: sha512-BLI3Tl1TW3Pvl70l3yq3Y64i+awpwXqsGBYWkkqMtnbXgrMD+yj7rhW0kuEDxzJaYXGjEW5ogapKNMEKNMjibA==}
     engines: {node: '>= 8'}
     hasBin: true
+
+  win-app-audio@file:native/win-app-audio:
+    resolution: {directory: native/win-app-audio, type: directory}
 
   winreg@1.2.4:
     resolution: {integrity: sha512-IHpzORub7kYlb8A43Iig3reOvlcBJGX9gZ0WycHhghHtA65X0LYnMRuJs+aH1abVnMJztQkvQNlltnbPi5aGIA==}
@@ -6948,6 +6958,8 @@ snapshots:
   node-addon-api@1.7.2:
     optional: true
 
+  node-addon-api@8.9.2: {}
+
   node-api-version@0.2.1:
     dependencies:
       semver: 7.7.2
@@ -7924,6 +7936,10 @@ snapshots:
   which@2.0.2:
     dependencies:
       isexe: 2.0.0
+
+  win-app-audio@file:native/win-app-audio:
+    dependencies:
+      node-addon-api: 8.9.2
 
   winreg@1.2.4: {}
 
