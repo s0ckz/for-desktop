@@ -19,7 +19,11 @@ jobs:
 
     strategy:
       matrix:
-        os: [windows-latest, macos-latest]
+        # windows-latest ships Visual Studio 18, which node-gyp cannot detect,
+        # so every native module (win-app-audio, register-scheme) fails to
+        # build and takes the whole job with it. win-app-audio.yml already
+        # pins windows-2022 for exactly this reason.
+        os: [windows-2022, macos-latest]
 
     steps:
       - name: Checkout
