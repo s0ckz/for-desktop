@@ -6,6 +6,10 @@ name: Windows per-app audio build
 on:
   push:
     branches:
+      # main is the trunk now; the old feature branch is frozen but still
+      # builds so anything left on it is not silently dropped.
+      - main
+      - fix/capture-and-shell-stability
       - feat/windows-per-app-audio
   workflow_dispatch:
 
