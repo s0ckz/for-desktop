@@ -12,10 +12,11 @@
 // to do. For a *window* that means sharing video with no audio at all -- it
 // must never widen to Chromium's `"loopback"`, which is the whole system mix
 // including the voice call. Only whole-screen shares fall back to it.
-import { BrowserWindow, app, ipcMain, shell } from "electron";
 import { appendFileSync, mkdirSync, statSync, unlinkSync } from "node:fs";
 import { release } from "node:os";
 import { join } from "node:path";
+
+import { BrowserWindow, app, ipcMain, shell } from "electron";
 
 export const APP_AUDIO_CHUNK = "appAudio:chunk";
 export const APP_AUDIO_STATE = "appAudio:state";
@@ -40,9 +41,7 @@ export function log(...parts: unknown[]) {
   const line =
     new Date().toISOString() +
     " " +
-    parts
-      .map((p) => (typeof p === "string" ? p : JSON.stringify(p)))
-      .join(" ");
+    parts.map((p) => (typeof p === "string" ? p : JSON.stringify(p))).join(" ");
   console.log("[appAudio]", line);
   const file = appAudioLogPath();
   if (!file) return;
@@ -81,8 +80,11 @@ function loadNative(): NativeModule | null {
 }
 
 /** Capture state for the session currently being shared, if any. */
-let active: { pid: number; sourceId: string; mode: "include" | "exclude" } | null =
-  null;
+let active: {
+  pid: number;
+  sourceId: string;
+  mode: "include" | "exclude";
+} | null = null;
 
 export function isAppAudioActive() {
   return active !== null;
@@ -156,7 +158,12 @@ function beginCapture(
       win.webContents.send(APP_AUDIO_CHUNK, chunk);
     });
   } catch (err) {
-    log(`capture failed to start (${mode} ${pid}):`, String(err), "lastError:", mod.lastError());
+    log(
+      `capture failed to start (${mode} ${pid}):`,
+      String(err),
+      "lastError:",
+      mod.lastError(),
+    );
     return false;
   }
 
@@ -191,7 +198,9 @@ export function startForSource(sourceId: string): boolean {
   // Whole-screen share: there is no single app to capture, but we can still
   // subtract our own audio so other people's microphones never leak back out.
   if (!handle) {
-    log("whole-screen share: capturing system audio minus our own process tree");
+    log(
+      "whole-screen share: capturing system audio minus our own process tree",
+    );
     return captureSystemMinusSelf(sourceId);
   }
 
@@ -200,14 +209,20 @@ export function startForSource(sourceId: string): boolean {
   // If we cannot capture just this application, the caller shares video only.
   const pid = mod.pidFromWindowHandle(handle);
   if (!pid) {
-    log("window share: no process behind window", handle, "- no audio for this share");
+    log(
+      "window share: no process behind window",
+      handle,
+      "- no audio for this share",
+    );
     return false;
   }
 
   // Include the process *tree*: browsers and Electron apps render audio from
   // a child process, so targeting the visible window's pid alone is silent.
   if (!beginCapture(pid, "include", sourceId)) {
-    log(`window share: include capture failed for pid ${pid} - no audio for this share`);
+    log(
+      `window share: include capture failed for pid ${pid} - no audio for this share`,
+    );
     return false;
   }
 
@@ -253,7 +268,11 @@ export function initAppAudio() {
   log("--- session start ---");
   log("app version:", app.getVersion());
   log("platform:", process.platform, "os release:", release());
-  log("native module loaded:", Boolean(mod), nativeLoadError ? `(${nativeLoadError})` : "");
+  log(
+    "native module loaded:",
+    Boolean(mod),
+    nativeLoadError ? `(${nativeLoadError})` : "",
+  );
   log("per-process capture supported:", Boolean(mod?.isSupported()));
   log("log file:", appAudioLogPath() ?? "(unavailable)");
 
