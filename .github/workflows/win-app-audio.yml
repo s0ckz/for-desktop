@@ -13,6 +13,15 @@ on:
       - feat/windows-per-app-audio
   workflow_dispatch:
 
+# Every run publishes to the same fixed release tag, and the workflow now fires
+# from more than one branch. Without this, two pushes land on the same assets at
+# once and whichever finishes last wins -- possibly with the other's installer
+# half-uploaded. Queue instead of cancelling, so a run that is already uploading
+# is allowed to finish.
+concurrency:
+  group: win-app-audio-release
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
