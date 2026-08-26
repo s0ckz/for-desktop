@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import {
   IUpdateInfo,
   UpdateSourceType,
@@ -19,6 +21,33 @@ import { createMainWindow, getBuildUrl, mainWindow } from "./native/window";
 // we just need to close out of the app immediately
 if (started) {
   app.quit();
+}
+
+// Windows resolves a taskbar button's icon and grouping through the
+// AppUserModelID, by finding a Start Menu shortcut stamped with the same ID
+// and borrowing its icon and name. Squirrel writes that shortcut as
+// `com.squirrel.<name>.<execName>` -- "Stoat" and "stoat-desktop" from the
+// STRINGS block in forge.config.ts, which is build-time only and not
+// importable here, so the literal below has to be kept in sync by hand.
+//
+// A portable exe or a dev run has no shortcut at all. Setting an explicit
+// AUMID there resolves to nothing *and* suppresses the fallback where
+// Windows derives identity from the executable path -- which is what would
+// otherwise pick up the icon rcedit stamped into stoat-desktop.exe. That
+// suppressed fallback is the blank taskbar icon, so outside a Squirrel
+// install we deliberately set nothing. Notifications lose nothing by it: an
+// AUMID matching no shortcut never gave them a name or icon either.
+//
+// This has to run before any window exists -- it previously sat inside the
+// `ready` handler below, after createMainWindow() had already registered the
+// taskbar button under the old identity.
+if (process.platform === "win32") {
+  const isSquirrelInstall = fs.existsSync(
+    path.join(process.execPath, "..", "..", "Update.exe"),
+  );
+  if (isSquirrelInstall) {
+    app.setAppUserModelId("com.squirrel.Stoat.stoat-desktop");
+  }
 }
 
 // disable hw-accel if so requested
@@ -115,11 +144,6 @@ if (acquiredLock) {
     initDiscordRpc();
     initVirtualMic();
     initAppAudio();
-
-    // Windows specific fix for notifications
-    if (process.platform === "win32") {
-      app.setAppUserModelId("chat.stoat.notifications");
-    }
   });
 
   // focus the window if we try to launch again
