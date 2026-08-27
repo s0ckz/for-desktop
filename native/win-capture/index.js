@@ -16,6 +16,7 @@ const unavailable = {
     throw new Error("win-capture native module is not available");
   },
   stop: () => {},
+  setFps: () => false,
   lastError: () => (loadError ? String(loadError.message || loadError) : "not loaded"),
 };
 
@@ -43,6 +44,14 @@ module.exports = {
       api.stop();
     } catch {
       /* already stopped */
+    }
+  },
+  /** Change the delivery rate of a running capture. False if nothing is capturing. */
+  setFps: (fps) => {
+    try {
+      return api.setFps(fps);
+    } catch {
+      return false;
     }
   },
   lastError: () => {

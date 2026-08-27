@@ -384,6 +384,47 @@ function stopWatchdogs() {
   watchdogTimer = null;
 }
 
+/**
+ * Change the rate of the capture already running.
+ *
+ * for-web picks a screen-share quality *after* the share is live: the picker
+ * resolves once capture has started, and the choice then arrives as
+ * `applyConstraints({ frameRate })` on the track. Our generated track cannot
+ * honour that natively -- the page patch neutralises it so a rejection cannot
+ * break the share -- so without this the picked framerate never reached
+ * capture, and a share started from a 30fps saved default stayed at 30 however
+ * the user answered the picker.
+ *
+ * The caller is responsible for clamping to `--capture-fps`; this only guards
+ * against values that make no sense at all, since the argument crosses IPC
+ * from a remote page.
+ * @param fps Requested delivery rate
+ * @returns Whether the running capture accepted it
+ */
+export function setLiveFps(fps: number): boolean {
+  if (!active) return false;
+  if (!Number.isFinite(fps)) return false;
+  const wanted = Math.min(
+    MAX_REQUESTABLE_FPS,
+    Math.max(MIN_REQUESTABLE_FPS, Math.round(fps)),
+  );
+  if (wanted === active.fps) return true;
+
+  const mod = loadNative();
+  if (!mod?.setFps(wanted)) {
+    appAudioLog(
+      `screen capture: native refused a rate change to ${wanted}fps; staying at ${active.fps}fps`,
+    );
+    return false;
+  }
+  appAudioLog(
+    `screen capture: rate changed ${active.fps}fps -> ${wanted}fps for ${active.sourceId}`,
+  );
+  active.fps = wanted;
+  broadcastState();
+  return true;
+}
+
 export function stop() {
   stopWatchdogs();
   if (!active) return;

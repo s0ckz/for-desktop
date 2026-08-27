@@ -69,6 +69,8 @@ contextBridge.exposeInMainWorld("native", {
     // read-and-clear contract.
     setNextFps: (fps: number) =>
       ipcRenderer.send("screenCapture:setNextFps", fps),
+    /** Change the rate of a share already running (a mid-share quality change). */
+    setFps: (fps: number) => ipcRenderer.send("screenCapture:setFps", fps),
     // The page's console is filtered below error level (see window.ts's
     // console-message listener), so the injected patch reports which video
     // path a share took -- and, on fallback, why -- through here instead,
