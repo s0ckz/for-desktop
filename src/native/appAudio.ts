@@ -86,10 +86,6 @@ let active: {
   mode: "include" | "exclude";
 } | null = null;
 
-export function isAppAudioActive() {
-  return active !== null;
-}
-
 /**
  * desktopCapturer window ids look like `window:<hwnd>:<n>`, where the middle
  * field is the native window handle. Screens use `screen:<id>:<n>` and have no
