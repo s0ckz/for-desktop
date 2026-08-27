@@ -26,6 +26,7 @@ import { config, getPersistedServer } from "./config";
 import {
   startForSource as startScreenCapture,
   stop as stopScreenCapture,
+  takeNextRequestedFps,
 } from "./screenCapture";
 import { updateTrayMenu } from "./tray";
 
@@ -197,7 +198,15 @@ async function respondToDisplayMedia(
     isWindow &&
     videoSource.id === source.id
   ) {
-    const fps = captureFpsCap() ?? 30;
+    // The page announced what it asked getDisplayMedia for (see
+    // appAudioPatch.ts and takeNextRequestedFps's doc comment); 30 is what we
+    // fell back to before that handoff existed, so it stays the default when
+    // nothing was announced. --capture-fps is a cap, not a request, so it
+    // still wins over a higher ask -- a 60fps request under --capture-fps=30
+    // must still capture at 30.
+    const requestedFps = takeNextRequestedFps() ?? 30;
+    const fpsCap = captureFpsCap();
+    const fps = fpsCap !== null ? Math.min(requestedFps, fpsCap) : requestedFps;
     if (startScreenCapture(source.id, fps)) {
       appAudioLog(
         "video path: native GPU capture (WGC + VideoProcessorBlt) for",

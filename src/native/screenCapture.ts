@@ -92,6 +92,43 @@ const HEALTHY_SESSION_MS = 10_000;
 /** Consecutive abnormal deaths; see {@link MAX_NATIVE_FAILURES}. */
 let consecutiveFailures = 0;
 
+/** Sane bounds for {@link takeNextRequestedFps}; see its doc comment. */
+const MIN_REQUESTABLE_FPS = 1;
+const MAX_REQUESTABLE_FPS = 120;
+
+/**
+ * One-shot handoff of the framerate the page asked `getDisplayMedia` for.
+ *
+ * `setDisplayMediaRequestHandler` (registered in window.ts) is never handed
+ * the page's `getDisplayMedia` constraints -- Electron does not pass them
+ * through -- so the main process has no way to see what for-web actually
+ * requested, only `--capture-fps`, which is a cap, not a request. The page
+ * *does* know: the wrapper in appAudioPatch.ts reads
+ * `constraints.video.frameRate.ideal` and sends it here immediately before
+ * calling through to the real `getDisplayMedia`, which is what triggers the
+ * request that reaches this process at all.
+ *
+ * Mirrors the read-and-clear discipline in for-web's
+ * rtc/screenShareCapture.ts, which solves the identical problem one layer
+ * up (a value that cannot cross an API boundary we do not own as a plain
+ * argument): set immediately before the call that needs it, read-and-clear
+ * the instant capture actually starts, so a stale value can never leak into
+ * a share it wasn't meant for.
+ */
+let nextRequestedFps: number | null = null;
+
+/**
+ * Read and clear the pending fps in one step. Returns null if nothing was
+ * announced -- the page's patch didn't run, is stale, or asked for
+ * something invalid -- in which case the caller falls back to today's
+ * default.
+ */
+export function takeNextRequestedFps(): number | null {
+  const fps = nextRequestedFps;
+  nextRequestedFps = null;
+  return fps;
+}
+
 type NativeModule = typeof import("win-capture");
 
 let native: NativeModule | null = null;
@@ -403,6 +440,20 @@ export function initScreenCapture() {
   // appAudio:getState.
   ipcMain.handle("screenCapture:getState", () => buildState());
   ipcMain.on("screenCapture:stop", () => stop());
+  // The value arrives from a remote page, so it is validated, not trusted:
+  // reject anything that isn't a finite number (same distrust as
+  // RENDERER_WRITABLE_KEYS in config.ts) and clamp the rest to a sane range
+  // before it can ever reach mod.start()'s fps argument.
+  ipcMain.on("screenCapture:setNextFps", (_event, fps: unknown) => {
+    if (typeof fps !== "number" || !Number.isFinite(fps)) {
+      appAudioLog("screen capture: ignoring invalid setNextFps value:", fps);
+      return;
+    }
+    nextRequestedFps = Math.min(
+      MAX_REQUESTABLE_FPS,
+      Math.max(MIN_REQUESTABLE_FPS, Math.round(fps)),
+    );
+  });
   // The injected page patch's console is filtered below error level (see
   // window.ts), so it reports which video path a share actually took --
   // MediaStreamTrackGenerator, the canvas fallback, or leaving Chromium's
