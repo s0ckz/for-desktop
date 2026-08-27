@@ -121,8 +121,26 @@ const REACQUIRE_POLL_MAX_MS = 5000;
 // ground on regardless. Ninety seconds covers an app recreating its window
 // without leaving a poll running long after anyone cares.
 const REACQUIRE_TIMEOUT_MS = 90 * 1000;
-/** How long a found window stays armed before the picker comes back. */
-const ARMED_TTL_MS = 10_000;
+/**
+ * How long a found window stays armed before the picker comes back.
+ *
+ * Nothing cancels an in-flight re-acquire when the user simply gives up -- they
+ * leave the call, or stop sharing -- so the poll keeps running and can still
+ * arm a window afterwards. The next `getDisplayMedia` inside this window is
+ * then answered with the remembered source and no picker, which means a user
+ * who retries straight away gets the *old* window shared without being asked.
+ *
+ * The legitimate path consumes the arm within milliseconds: for-web awaits
+ * `reacquireScreenShare()` and calls `getDisplayMedia` the moment it resolves
+ * true. Ten seconds bought nothing and left that door wide open; three is
+ * generous for the real path and narrows the wrong-window window considerably.
+ *
+ * A renderer-driven cancel IPC would close it outright rather than narrow it,
+ * but it only works once both for-web and for-desktop are current, and desktop
+ * updates need a manual reinstall -- so it would sit half-deployed for as long
+ * as anyone puts that off. This works on every client version.
+ */
+const ARMED_TTL_MS = 3_000;
 
 /**
  * `--capture-fps=N` caps the frame rate the page may ask for. WGC brokers each
