@@ -288,9 +288,14 @@ export function initScreenCapture() {
     Boolean(mod),
     nativeLoadError ? `(${nativeLoadError})` : "",
   );
+  // Always log *why* when unsupported. The addon records a reason for every
+  // false it returns, and an unexplained "supported: false" here previously
+  // sent a debugging session looking in entirely the wrong layer.
+  const supported = isScreenCaptureSupported();
   appAudioLog(
     "screen capture: GPU capture supported:",
-    isScreenCaptureSupported(),
+    supported,
+    supported ? "" : `(${mod?.lastError() ?? "native module not loaded"})`,
   );
 
   // The renderer asks for this right after getDisplayMedia resolves, so it can

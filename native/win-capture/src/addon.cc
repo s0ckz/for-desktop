@@ -585,20 +585,47 @@ Napi::Value IsSupported(const Napi::CallbackInfo& info) {
   // Windows Graphics Capture's free-threaded frame pool (what this module
   // needs) landed in the Windows.Foundation.UniversalApiContract v7 update,
   // Windows 10 1903 (build 18362).
+  // Every `false` below records why. A bare unexplained `false` here is what
+  // sent us hunting through the wrong layer once already -- the caller logs
+  // lastError() alongside the verdict.
   using RtlGetVersionFn = LONG(WINAPI*)(PRTL_OSVERSIONINFOW);
   HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-  if (!ntdll) return Napi::Boolean::New(env, false);
+  if (!ntdll) {
+    SetError("GetModuleHandle(ntdll)", HRESULT_FROM_WIN32(GetLastError()));
+    return Napi::Boolean::New(env, false);
+  }
   auto fn = reinterpret_cast<RtlGetVersionFn>(GetProcAddress(ntdll, "RtlGetVersion"));
-  if (!fn) return Napi::Boolean::New(env, false);
+  if (!fn) {
+    SetError("GetProcAddress(RtlGetVersion)", HRESULT_FROM_WIN32(GetLastError()));
+    return Napi::Boolean::New(env, false);
+  }
   RTL_OSVERSIONINFOW vi{};
   vi.dwOSVersionInfoSize = sizeof(vi);
-  if (fn(&vi) != 0 || vi.dwBuildNumber < 18362) return Napi::Boolean::New(env, false);
+  if (fn(&vi) != 0 || vi.dwBuildNumber < 18362) {
+    SetError("Windows build too old for WGC free-threaded capture (need 18362+)", E_NOTIMPL);
+    return Napi::Boolean::New(env, false);
+  }
 
   // Belt and braces: ask the platform directly too, since some GPU/driver
   // combinations on an otherwise-supported build still refuse capture.
+  // This runs on whichever thread called us. In the Electron *main* process
+  // that is a GUI thread whose COM apartment is already initialised as an STA,
+  // so asking for RO_INIT_MULTITHREADED comes back RPC_E_CHANGED_MODE. That is
+  // not an error -- it means "an apartment exists, just not the model you asked
+  // for" -- and the activation factory below works perfectly well on it.
+  // Treating it as failure is what made this report `GPU capture supported:
+  // false` inside the app while passing in the standalone harness, where the
+  // process has no pre-initialised apartment and the call simply succeeds.
+  //
+  // Only uninitialise when we were the ones who initialised: calling
+  // RoUninitialize() after RPC_E_CHANGED_MODE would release a reference we
+  // never took and tear down the host's own apartment.
   HRESULT hr = RoInitialize(RO_INIT_MULTITHREADED);
-  const bool roInitialised = SUCCEEDED(hr) || hr == S_FALSE;
-  if (!roInitialised) return Napi::Boolean::New(env, false);
+  const bool weInitialised = SUCCEEDED(hr);  // S_OK, or S_FALSE if already MTA
+  if (!weInitialised && hr != RPC_E_CHANGED_MODE) {
+    SetError("RoInitialize", hr);
+    return Napi::Boolean::New(env, false);
+  }
 
   bool supported = false;
   {
@@ -606,12 +633,21 @@ Napi::Value IsSupported(const Napi::CallbackInfo& info) {
     // apartment) strictly *before* RoUninitialize() tears it down below --
     // releasing a WinRT object after uninitializing the apartment crashes.
     ComPtr<WGC::IGraphicsCaptureSessionStatics> statics;
-    if (SUCCEEDED(GetActivationFactory(RuntimeClass_Windows_Graphics_Capture_GraphicsCaptureSession, statics))) {
+    HRESULT factoryHr = GetActivationFactory(RuntimeClass_Windows_Graphics_Capture_GraphicsCaptureSession, statics);
+    if (FAILED(factoryHr)) {
+      SetError("GetActivationFactory(GraphicsCaptureSession)", factoryHr);
+    } else {
       boolean result = FALSE;
-      if (SUCCEEDED(statics->IsSupported(&result))) supported = result != FALSE;
+      HRESULT supportedHr = statics->IsSupported(&result);
+      if (FAILED(supportedHr)) {
+        SetError("GraphicsCaptureSession::IsSupported", supportedHr);
+      } else {
+        supported = result != FALSE;
+        if (!supported) SetError("GraphicsCaptureSession::IsSupported returned false", S_OK);
+      }
     }
   }
-  RoUninitialize();
+  if (weInitialised) RoUninitialize();
   return Napi::Boolean::New(env, supported);
 }
 
