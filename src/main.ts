@@ -12,6 +12,7 @@ import started from "electron-squirrel-startup";
 import { initAppAudio } from "./native/appAudio";
 import { config } from "./native/config";
 import { initDiscordRpc } from "./native/discordRpc";
+import { initScreenCapture } from "./native/screenCapture";
 import { initTray } from "./native/tray";
 import { initVirtualMic } from "./native/virtualMic";
 import { createMainWindow, getBuildUrl, mainWindow } from "./native/window";
@@ -144,6 +145,7 @@ if (acquiredLock) {
     initDiscordRpc();
     initVirtualMic();
     initAppAudio();
+    initScreenCapture();
   });
 
   // focus the window if we try to launch again

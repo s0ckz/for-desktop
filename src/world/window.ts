@@ -61,4 +61,60 @@ contextBridge.exposeInMainWorld("native", {
       return () => ipcRenderer.removeListener("appAudio:chunk", listener);
     },
   },
+
+  // Native GPU-downscaled window capture (Windows). The injected main-world
+  // patch uses this to turn captured NV12 frames back into a
+  // MediaStreamTrack, in place of Chromium's own (slower) capture.
+  screenCapture: {
+    getState: () => ipcRenderer.invoke("screenCapture:getState"),
+    stop: () => ipcRenderer.send("screenCapture:stop"),
+    // The page's console is filtered below error level (see window.ts's
+    // console-message listener), so the injected patch reports which video
+    // path a share took -- and, on fallback, why -- through here instead,
+    // straight into app-audio.log where the rest of this diagnosis lives.
+    log: (message: string) =>
+      ipcRenderer.send("screenCapture:pageLog", message),
+    onFrame: (
+      handler: (
+        frame: Uint8Array,
+        meta: { width: number; height: number },
+      ) => void,
+    ) => {
+      const listener = (
+        _: unknown,
+        frame: Uint8Array,
+        meta: { width: number; height: number },
+      ) => handler(frame, meta);
+      ipcRenderer.on("screenCapture:frame", listener);
+      return () => ipcRenderer.removeListener("screenCapture:frame", listener);
+    },
+    // Pushed whenever capture starts, stops, or the main process detects the
+    // captured window went away -- see the long comment on the watchdogs in
+    // screenCapture.ts for why this has to be a poll-driven push rather than
+    // something the native module itself reports.
+    onState: (
+      handler: (state: {
+        active: boolean;
+        sourceId: string | null;
+        width: number;
+        height: number;
+        fps: number;
+        supported: boolean;
+      }) => void,
+    ) => {
+      const listener = (
+        _: unknown,
+        state: {
+          active: boolean;
+          sourceId: string | null;
+          width: number;
+          height: number;
+          fps: number;
+          supported: boolean;
+        },
+      ) => handler(state);
+      ipcRenderer.on("screenCapture:state", listener);
+      return () => ipcRenderer.removeListener("screenCapture:state", listener);
+    },
+  },
 });
