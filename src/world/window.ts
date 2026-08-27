@@ -68,6 +68,13 @@ contextBridge.exposeInMainWorld("native", {
   screenCapture: {
     getState: () => ipcRenderer.invoke("screenCapture:getState"),
     stop: () => ipcRenderer.send("screenCapture:stop"),
+    // One-shot announcement of the framerate the page just asked
+    // getDisplayMedia for, sent immediately before the call that triggers
+    // the actual display-media request -- see takeNextRequestedFps's doc
+    // comment in native/screenCapture.ts for why this exists and its
+    // read-and-clear contract.
+    setNextFps: (fps: number) =>
+      ipcRenderer.send("screenCapture:setNextFps", fps),
     // The page's console is filtered below error level (see window.ts's
     // console-message listener), so the injected patch reports which video
     // path a share took -- and, on fallback, why -- through here instead,
