@@ -66,6 +66,13 @@ jobs:
           set -e
           find node_modules/win-app-audio -name '*.node' -print
           test -f node_modules/win-app-audio/build/Release/win_app_audio.node
+          # win-capture is the GPU-downscaled screen capture addon. Without
+          # this check a build failure ships an app that looks fine and
+          # silently falls back to Chromium capture at the old frame rate --
+          # index.js is deliberately non-fatal on a missing binary, so nothing
+          # else would ever complain.
+          find node_modules/win-capture -name '*.node' -print
+          test -f node_modules/win-capture/build/Release/win_capture.node
 
       - name: Lint
         run: pnpm lint
@@ -89,7 +96,15 @@ jobs:
             npx --yes @electron/asar list "$ASAR" | grep -i -E 'win-app-audio|\.node' | head -20 || echo "(no matches inside asar)"
           fi
           echo "--- verdict ---"
-          test -n "$(find out -name 'win_app_audio.node' -print -quit)"             && echo "OK: addon present"             || { echo "MISSING: addon not packaged"; exit 1; }
+          FAIL=0
+          for N in win_app_audio win_capture; do
+            if [ -n "$(find out -name "$N.node" -print -quit)" ]; then
+              echo "OK: $N present"
+            else
+              echo "MISSING: $N not packaged"; FAIL=1
+            fi
+          done
+          test "$FAIL" -eq 0
 
       - name: Make installer
         run: pnpm make
