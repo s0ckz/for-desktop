@@ -94,6 +94,28 @@ HANDLE g_stopEvent = nullptr;
 Napi::ThreadSafeFunction g_tsfn;
 std::string g_lastError;
 
+/**
+ * Buffers in the WGC frame pool.
+ *
+ * Left at 2 -- the WGC default -- because raising it was measured and did
+ * nothing. The hypothesis was that holding one frame for the whole of
+ * ProcessFrame left WGC only one buffer to capture into, forcing it to wait
+ * for our release and land the next frame a vsync later, which would produce
+ * delivery at exactly half the refresh rate. That matched the symptom
+ * suspiciously well (49.5fps measured on a 99Hz display, twice) and it is
+ * what Chromium's ZeroCopyDesktopCapture path does (2 -> 5).
+ *
+ * It is still wrong: at 4 buffers the delivered rate was 49.56 and 49.49fps
+ * across two runs -- identical to 2 buffers, to within noise. Each buffer is
+ * a full BGRA copy of the *source* surface (~20MB at 3440x1440), so raising
+ * this costs real GPU memory for no measured gain.
+ *
+ * Recorded here so the next person does not spend the same afternoon on it.
+ * The ~49.5fps ceiling at a 60fps target remains unexplained; see the notes
+ * on the polling loop in CaptureThread.
+ */
+constexpr int kFramePoolBuffers = 2;
+
 UINT32 g_targetW = 0;
 UINT32 g_targetH = 0;
 double g_fps = 30.0;
@@ -154,15 +176,16 @@ bool EnsurePipeline(UINT32 srcW, UINT32 srcH) {
 
   if (!g_framePool) {
     hr = g_poolStatics2->CreateFreeThreaded(
-        g_wgDevice.Get(), WG::DirectX::DirectXPixelFormat_B8G8R8A8UIntNormalized, 2, size,
-        &g_framePool);
+        g_wgDevice.Get(), WG::DirectX::DirectXPixelFormat_B8G8R8A8UIntNormalized,
+        kFramePoolBuffers, size, &g_framePool);
     if (FAILED(hr)) {
       SetError("Direct3D11CaptureFramePool::CreateFreeThreaded", hr);
       return false;
     }
   } else {
     hr = g_framePool->Recreate(
-        g_wgDevice.Get(), WG::DirectX::DirectXPixelFormat_B8G8R8A8UIntNormalized, 2, size);
+        g_wgDevice.Get(), WG::DirectX::DirectXPixelFormat_B8G8R8A8UIntNormalized,
+        kFramePoolBuffers, size);
     if (FAILED(hr)) {
       SetError("Direct3D11CaptureFramePool::Recreate", hr);
       return false;
@@ -266,24 +289,51 @@ struct FramePayload {
   double grabMs;
 };
 
+/**
+ * Frames the JS side was not ready to receive, cumulative for this session.
+ *
+ * Reported in each frame's metadata so the shortfall has a direct measurement
+ * instead of being inferred from inter-arrival gaps. The harness previously
+ * counted "gap > 1.5x target" and labelled it as N-API falling behind, which
+ * cannot distinguish a frame we refused from one the source never painted.
+ */
+std::atomic<uint64_t> g_framesRefused{0};
+
 void Emit(FramePayload* payload) {
   auto status = g_tsfn.NonBlockingCall(payload, [](Napi::Env env, Napi::Function cb, FramePayload* p) {
-    // Napi::Buffer::Copy is the same per-chunk pattern win-app-audio uses for
-    // its (much smaller) PCM chunks -- see the harness/report for whether it
-    // actually keeps up at NV12 video rates.
+    // Copy, and it has to be a copy: Napi::Buffer::New over our own memory
+    // (zero-copy, with a finalizer) is the obvious optimisation here -- it
+    // would save a ~3MB memcpy and a fresh 3MB V8 allocation per frame, some
+    // 180MB/s of allocation churn at 60fps -- but **Electron rejects external
+    // buffers outright**. V8's memory-cage/sandbox hardening means every such
+    // call throws `External buffers are not allowed` before the callback
+    // runs, delivering zero frames. Node swallows that exception by default
+    // (it only surfaces as a DEP0168 warning), so it fails silently and looks
+    // like a capture bug rather than an API misuse. Measured directly on
+    // Electron 43.4.0: 0 frames delivered at both 30 and 60fps.
+    //
+    // If this ever needs optimising, the route is a preallocated pool the JS
+    // side reads from, not an external Buffer.
     auto buffer = Napi::Buffer<uint8_t>::Copy(env, p->nv12.data(), p->nv12.size());
     auto meta = Napi::Object::New(env);
     meta.Set("width", Napi::Number::New(env, p->width));
     meta.Set("height", Napi::Number::New(env, p->height));
     meta.Set("bltMs", Napi::Number::New(env, p->bltMs));
     meta.Set("grabMs", Napi::Number::New(env, p->grabMs));
+    meta.Set("refused", Napi::Number::New(env, static_cast<double>(g_framesRefused.load())));
+    // Safe before the call: Buffer::Copy above already took its own copy of
+    // the pixels, so nothing here outlives this scope. Leaking instead would
+    // cost a whole frame (~3MB) every time, ~180MB/s at 60fps.
     delete p;
     cb.Call({buffer, meta});
   });
-  // Drop, don't queue: if the JS side hasn't drained the previous call yet
-  // (queue size is 1, see Start()), NonBlockingCall fails fast instead of
-  // buffering, and we simply discard this frame.
-  if (status != napi_ok) delete payload;
+  // Drop, don't queue: once the queue is full NonBlockingCall fails fast
+  // instead of buffering, and we discard this frame rather than delivering a
+  // stale one late. See the queue size in Start() for why it is not 1.
+  if (status != napi_ok) {
+    g_framesRefused.fetch_add(1, std::memory_order_relaxed);
+    delete payload;
+  }
 }
 
 // Scale+convert the given source texture into the shared output texture, read
@@ -684,10 +734,22 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
   if (g_stopEvent) CloseHandle(g_stopEvent);
   g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
-  // maxQueueSize = 1: NonBlockingCall fails immediately instead of buffering
-  // once one call is already pending, which is what makes Emit()'s drop
-  // path real rather than a queue in disguise.
-  g_tsfn = Napi::ThreadSafeFunction::New(env, info[4].As<Napi::Function>(), "winCapture", 1, 1);
+  // Queue depth is a jitter allowance, not a buffer. At 30fps a single slot
+  // was fine -- the JS thread always drained inside the 33ms budget, and the
+  // harness measured zero refusals. At 60fps the budget halves to 16.6ms and
+  // one slot leaves *zero* tolerance for ordinary JS-thread scheduling
+  // jitter: any hiccup longer than a frame interval refuses the frame
+  // outright. That alone capped delivery at ~49.5fps against a 60fps target
+  // (a ~17% refusal rate) while the capture thread sat at ~22% of one core
+  // and grab time was unchanged from 30fps -- i.e. nothing was saturated,
+  // frames were simply being turned away.
+  //
+  // Three slots absorb that jitter while still bounding latency to two extra
+  // frames (~33ms at 60fps) and still dropping rather than growing without
+  // limit, so Emit()'s drop path stays real.
+  g_tsfn = Napi::ThreadSafeFunction::New(env, info[4].As<Napi::Function>(), "winCapture", 1, 3);
+  // Per-session, so a later share does not inherit an earlier one's count.
+  g_framesRefused.store(0);
   g_running.store(true);
   g_thread = std::thread(CaptureThread, hwnd);
   return Napi::Boolean::New(env, true);

@@ -1,13 +1,16 @@
 // Throughput/latency harness: capture a real window for ~30s and report
-// whether native GPU-downscaled capture can actually hit 30fps, and whether
-// the per-frame Napi::Buffer copy pattern keeps up with NV12 video-rate
-// throughput (the reason this file exists at all -- see the plan).
+// whether native GPU-downscaled capture can actually hit the target fps, and
+// whether the per-frame Napi::Buffer delivery pattern keeps up with NV12
+// video-rate throughput (the reason this file exists at all -- see the plan).
 //
-//   node test-capture.js [windowTitleSubstring]
+//   node test-capture.js [windowTitleSubstring] [targetFps]
 //
-// With no argument, launches Notepad as a throwaway capture target and closes
-// it when done. Pass a substring (case-insensitive) to match an existing
-// window's title instead -- e.g. `node test-capture.js "Escape from Tarkov"`.
+// With no window title, launches Notepad as a throwaway capture target and
+// closes it when done. Pass a substring (case-insensitive) to match an
+// existing window's title instead -- e.g. `node test-capture.js "Escape from
+// Tarkov"`. targetFps defaults to 30 -- e.g. `node test-capture.js "Escape
+// from Tarkov" 60`. Pass "" for the title to use the default (any visible
+// window) while still setting targetFps.
 "use strict";
 
 const { spawn, execFileSync } = require("node:child_process");
@@ -16,7 +19,12 @@ const capture = require("./index.js");
 const DURATION_MS = 30_000;
 const TARGET_W = 1920;
 const TARGET_H = 1080;
-const TARGET_FPS = 30;
+const TARGET_FPS = process.argv[3] ? Number(process.argv[3]) : 30;
+
+if (!Number.isFinite(TARGET_FPS) || TARGET_FPS <= 0) {
+  console.error(`invalid targetFps argument: "${process.argv[3]}"`);
+  process.exit(1);
+}
 
 console.log("platform      :", process.platform);
 console.log("isSupported() :", capture.isSupported());
@@ -72,7 +80,7 @@ if (titleArg) {
 // --- stats ---
 let frames = 0;
 let bytes = 0;
-let droppedFallingBehind = 0; // frames whose JS callback fired late relative to expected cadence
+let arrivedLate = 0; // frames whose JS callback fired >1.5x the target interval after the previous one
 let lastFrameAt = null;
 let intervalsSum = 0;
 let bltMsSum = 0;
@@ -81,6 +89,7 @@ let bltMsMax = 0;
 let grabMsMax = 0;
 let firstWidth = null;
 let firstHeight = null;
+let lastRefused = 0; // cumulative refused-frame count off the most recent frame's metadata
 
 const testStart = Date.now();
 
@@ -96,13 +105,14 @@ try {
     if (lastFrameAt !== null) {
       const gap = now - lastFrameAt;
       intervalsSum += gap;
-      if (gap > (1000 / TARGET_FPS) * 1.5) droppedFallingBehind++;
+      if (gap > (1000 / TARGET_FPS) * 1.5) arrivedLate++;
     }
     lastFrameAt = now;
     bltMsSum += meta.bltMs;
     grabMsSum += meta.grabMs;
     if (meta.bltMs > bltMsMax) bltMsMax = meta.bltMs;
     if (meta.grabMs > grabMsMax) grabMsMax = meta.grabMs;
+    if (typeof meta.refused === "number") lastRefused = meta.refused;
   });
 } catch (err) {
   console.error("start() threw:", err.message);
@@ -142,7 +152,13 @@ setTimeout(() => {
   console.log("throughput (MB/s)    :", throughputMBps.toFixed(2));
   console.log("avg VideoProcessorBlt (ms) :", avgBltMs.toFixed(3), " max:", bltMsMax.toFixed(3));
   console.log("avg CopyResource+Map (ms)  :", avgGrabMs.toFixed(3), " max:", grabMsMax.toFixed(3));
-  console.log("frames arriving >1.5x late (JS side, N-API falling behind):", droppedFallingBehind);
+  // Late arrival alone doesn't say *why* -- it's consistent with either the
+  // native side refusing frames (queue full / JS not draining in time) or
+  // the capture source simply not painting that often. `refused` below is
+  // the direct measurement of the former; use both together rather than
+  // inferring one from this gap count.
+  console.log("frames arriving >1.5x late (inter-arrival gap only, cause unknown from this alone):", arrivedLate);
+  console.log("frames refused by native (queue full when JS wasn't ready) :", lastRefused);
   console.log("lastError()          :", capture.lastError() || "(none)");
   console.log("");
 
@@ -150,8 +166,11 @@ setTimeout(() => {
     console.log("RESULT: FAIL - no frames delivered at all");
     process.exit(2);
   }
-  if (avgGrabMs > 16.6) {
-    console.log("RESULT: FAIL - CopyResource+Map alone exceeds the 16.6ms/frame budget for 30fps");
+  const frameBudgetMs = 1000 / TARGET_FPS;
+  if (avgGrabMs > frameBudgetMs) {
+    console.log(
+      `RESULT: FAIL - CopyResource+Map alone exceeds the ${frameBudgetMs.toFixed(1)}ms/frame budget for ${TARGET_FPS}fps`
+    );
     process.exit(3);
   }
   if (deliveredFps < TARGET_FPS * 0.9) {
