@@ -62,6 +62,35 @@ const WINDOW_POLL_MS = 1000;
  * treat it as dead. Generous relative to any fps we ask for.
  */
 const FRAME_WATCHDOG_MS = 4000;
+/**
+ * Consecutive abnormal capture deaths before we stop attempting the native
+ * path at all and leave the share on Chromium capture.
+ *
+ * Without this, a GPU or driver that starts capture successfully and then
+ * fails part-way through is worse than one that never starts: each death ends
+ * the track, for-web's reacquire restarts the share, native starts and dies
+ * again, and after three rounds `MAX_RECOVERIES` (rtc/state.tsx) gives up and
+ * the share is dead for good. Degrading to Chromium capture -- the behaviour
+ * before this module existed -- is always the better outcome.
+ *
+ * Once tripped this stays off until the app restarts -- deliberately, since a
+ * disabled path can never deliver the healthy session that would reset it. A
+ * hardware incompatibility is not going to resolve itself mid-session, and the
+ * cost of being wrong is one share running at the old frame rate.
+ *
+ * This is the one failure mode we cannot test for here, since it would come
+ * from hardware we do not have.
+ */
+const MAX_NATIVE_FAILURES = 2;
+/**
+ * A session that has been delivering frames this long is working, whatever
+ * happened before it, so it clears the failure count. Keeps one transient
+ * hiccup from disabling the native path for the rest of the session.
+ */
+const HEALTHY_SESSION_MS = 10_000;
+
+/** Consecutive abnormal deaths; see {@link MAX_NATIVE_FAILURES}. */
+let consecutiveFailures = 0;
 
 type NativeModule = typeof import("win-capture");
 
@@ -92,6 +121,8 @@ let active: {
   width: number;
   height: number;
   lastFrameAt: number;
+  /** When this session began, for the HEALTHY_SESSION_MS failure-count reset. */
+  startedAt: number;
   /**
    * The window is minimised, so WGC has nothing to hand us. The capture
    * session is deliberately still running -- see the poll in
@@ -156,6 +187,17 @@ export function startForSource(sourceId: string, fps: number): boolean {
     return false;
   }
 
+  // A GPU/driver that keeps dying part-way through a share is worse than one
+  // that never starts, so stop trying after enough consecutive deaths and let
+  // Chromium capture have it. See MAX_NATIVE_FAILURES.
+  if (consecutiveFailures >= MAX_NATIVE_FAILURES) {
+    appAudioLog(
+      `screen capture: native path disabled after ${consecutiveFailures} consecutive failures, using Chromium capture; lastError:`,
+      mod.lastError(),
+    );
+    return false;
+  }
+
   stop();
 
   try {
@@ -190,6 +232,7 @@ export function startForSource(sourceId: string, fps: number): boolean {
     width: CAPTURE_TARGET_WIDTH,
     height: CAPTURE_TARGET_HEIGHT,
     lastFrameAt: Date.now(),
+    startedAt: Date.now(),
     paused: false,
   };
   appAudioLog(
@@ -205,9 +248,20 @@ function onFrame(
   meta: { width: number; height: number; bltMs: number; grabMs: number },
 ) {
   if (!active) return;
-  active.lastFrameAt = Date.now();
+  const now = Date.now();
+  active.lastFrameAt = now;
   active.width = meta.width;
   active.height = meta.height;
+
+  // Frames have been flowing long enough to call this session good, so
+  // whatever failed before it no longer counts against the native path.
+  if (consecutiveFailures > 0 && now - active.startedAt > HEALTHY_SESSION_MS) {
+    appAudioLog(
+      "screen capture: native capture healthy again, clearing failure count",
+    );
+    consecutiveFailures = 0;
+  }
+
   const win = BrowserWindow.getAllWindows()[0];
   if (!win || win.isDestroyed()) return;
   win.webContents.send(SCREEN_CAPTURE_FRAME, frame, {
@@ -271,10 +325,14 @@ function startWatchdogs() {
     if (!active || active.paused) return;
     if (Date.now() - active.lastFrameAt > FRAME_WATCHDOG_MS) {
       const mod = loadNative();
+      // An abnormal death: the window is still there and not minimised, but
+      // frames stopped. Count it -- enough of these and we stop using the
+      // native path rather than letting it kill the share.
+      consecutiveFailures++;
       appAudioLog(
         "screen capture: no frames for",
         FRAME_WATCHDOG_MS,
-        "ms, ending native capture; lastError:",
+        `ms, ending native capture (failure ${consecutiveFailures}/${MAX_NATIVE_FAILURES}); lastError:`,
         mod?.lastError() ?? "(unknown)",
       );
       stop();
