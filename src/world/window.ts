@@ -41,12 +41,6 @@ contextBridge.exposeInMainWorld("native", {
   // getDisplayMedia is answered with it and no picker appears.
   reacquireScreenShare: (): Promise<boolean> =>
     ipcRenderer.invoke("screenShare:reacquire"),
-  /**
-   * Abandon an in-flight re-acquire. Call this when the user stops sharing or
-   * leaves the call, otherwise the poll outlives the share it was started for.
-   */
-  cancelReacquireScreenShare: (): void =>
-    ipcRenderer.send("screenShare:cancelReacquire"),
 
   // Per-application screen share audio (Windows). The injected main-world
   // patch uses this to turn captured PCM back into a MediaStreamTrack.

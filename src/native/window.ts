@@ -324,22 +324,6 @@ async function primaryScreenSource(): Promise<Electron.DesktopCapturerSource | n
  * Resolves false on timeout, if there is nothing to re-acquire, or if another
  * call supersedes this one.
  */
-/**
- * Abandon any in-flight re-acquire. The renderer calls this when the user stops
- * sharing or leaves the call, so a poll cannot outlive the share it was started
- * for.
- */
-ipcMain.on("screenShare:cancelReacquire", () => {
-  if (lastShare) appAudioLog("reacquire: cancelled by renderer");
-  reacquireGeneration++;
-  lastShare = null;
-  armedShare = null;
-  // The renderer sends this once it considers the share fully over, so any
-  // native video capture still running at this point is a leak, not a race
-  // we need to be gentle with.
-  stopScreenCapture();
-});
-
 ipcMain.handle("screenShare:reacquire", async () => {
   const target = lastShare;
   if (!target) {
