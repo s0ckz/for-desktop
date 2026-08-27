@@ -92,6 +92,12 @@ let active: {
   width: number;
   height: number;
   lastFrameAt: number;
+  /**
+   * The window is minimised, so WGC has nothing to hand us. The capture
+   * session is deliberately still running -- see the poll in
+   * {@link startWatchdogs} for why we do not tear down over this.
+   */
+  paused: boolean;
 } | null = null;
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -184,6 +190,7 @@ export function startForSource(sourceId: string, fps: number): boolean {
     width: CAPTURE_TARGET_WIDTH,
     height: CAPTURE_TARGET_HEIGHT,
     lastFrameAt: Date.now(),
+    paused: false,
   };
   appAudioLog(
     `screen capture: native GPU path active for ${sourceId} (hwnd ${hwnd}), target ${CAPTURE_TARGET_WIDTH}x${CAPTURE_TARGET_HEIGHT}@${fps}fps`,
@@ -217,16 +224,51 @@ function startWatchdogs() {
     // No native audio module loaded means no way to tell this way; the frame
     // watchdog below is what's left.
     if (!state) return;
-    if (!state.exists || state.iconic) {
+    if (!state.exists) {
       appAudioLog(
-        "screen capture: captured window gone or minimised, ending native capture for",
+        "screen capture: captured window is gone, ending native capture for",
         active.sourceId,
       );
       stop();
+      return;
+    }
+
+    // Minimised is not gone. WGC cannot produce frames for an iconic window,
+    // but the capture session survives it -- the addon's loop only bails on
+    // !IsWindow(), which a minimised window still satisfies. So tearing the
+    // share down here is unnecessary, and actively harmful: every teardown
+    // spends one of for-web's three recoveries per 60s (MAX_RECOVERIES in
+    // rtc/state.tsx), and minimising a few times in quick succession used to
+    // exhaust that budget and kill the share for good.
+    //
+    // Leave the session running instead. The viewer sees the last frame held
+    // until the window comes back, which is a far better outcome than the
+    // share ending.
+    if (state.iconic) {
+      if (!active.paused) {
+        active.paused = true;
+        appAudioLog(
+          "screen capture: window minimised, holding the session open (no frames until restored) for",
+          active.sourceId,
+        );
+      }
+      return;
+    }
+    if (active.paused) {
+      active.paused = false;
+      // Not a resubscribe: WGC resumes delivering into the same session, so
+      // there is nothing to restart here.
+      active.lastFrameAt = Date.now();
+      appAudioLog(
+        "screen capture: window restored, frames resuming for",
+        active.sourceId,
+      );
     }
   }, WINDOW_POLL_MS);
   watchdogTimer = setInterval(() => {
-    if (!active) return;
+    // While minimised there are legitimately no frames, so the watchdog must
+    // not read that as a dead capture.
+    if (!active || active.paused) return;
     if (Date.now() - active.lastFrameAt > FRAME_WATCHDOG_MS) {
       const mod = loadNative();
       appAudioLog(
