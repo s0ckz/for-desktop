@@ -60,7 +60,8 @@
     "electron-store": "^10.1.0",
     "update-electron-app": "^3.1.1",
     "utf-8-validate": "^6.0.5",
-    "win-app-audio": "file:native/win-app-audio"
+    "win-app-audio": "file:native/win-app-audio",
+    "win-capture": "file:native/win-capture"
   },
   "optionalDependencies": {
     "node-pipewire": "1.1.0"

@@ -23,6 +23,10 @@ import {
 } from "./appAudio";
 import { APP_AUDIO_PATCH } from "./appAudioPatch";
 import { config, getPersistedServer } from "./config";
+import {
+  startForSource as startScreenCapture,
+  stop as stopScreenCapture,
+} from "./screenCapture";
 import { updateTrayMenu } from "./tray";
 
 // global reference to main window
@@ -120,6 +124,24 @@ const REACQUIRE_TIMEOUT_MS = 90 * 1000;
 const ARMED_TTL_MS = 10_000;
 
 /**
+ * `--capture-fps=N` caps the frame rate the page may ask for. WGC brokers each
+ * frame through CaptureService, so the rate is a direct lever on how hard that
+ * service is driven -- and this fork raised the requested rate when it removed
+ * an old 5fps clamp.
+ *
+ * Module-scoped (rather than local to `createMainWindow`) so
+ * `respondToDisplayMedia` can read it too: it is the value native video
+ * capture is started with, composing the same cap that used to be enforced by
+ * capping Chromium's video track constraints -- see `withFpsCap` in
+ * appAudioPatch.ts, which now only applies when native capture did not start.
+ */
+function captureFpsCap(): number | null {
+  if (!app.commandLine.hasSwitch("capture-fps")) return null;
+  const raw = Number(app.commandLine.getSwitchValue("capture-fps"));
+  return Number.isFinite(raw) && raw > 0 ? Math.round(raw) : null;
+}
+
+/**
  * Answer a display media request, preferring audio from just the shared
  * application.
  *
@@ -162,6 +184,38 @@ async function respondToDisplayMedia(
     } else {
       appAudioLog("window-shares-as-screen: no screen source; keeping window");
     }
+  }
+
+  // Native GPU-downscaled capture: Windows + window sources only (the agreed
+  // scope boundary -- screen sources and every other platform keep today's
+  // Chromium path untouched). `videoSource` may have been swapped to a screen
+  // above by --window-shares-as-screen, which must NOT go through here: that
+  // flag exists specifically to route a window off WGC, and this module's
+  // whole point is capturing a *window* through WGC, just more cheaply.
+  if (
+    process.platform === "win32" &&
+    isWindow &&
+    videoSource.id === source.id
+  ) {
+    const fps = captureFpsCap() ?? 30;
+    if (startScreenCapture(source.id, fps)) {
+      appAudioLog(
+        "video path: native GPU capture (WGC + VideoProcessorBlt) for",
+        source.id,
+        `at up to ${fps}fps`,
+      );
+    } else {
+      appAudioLog(
+        "video path: Chromium capture (native GPU path unavailable, see reason above) for",
+        source.id,
+      );
+    }
+  } else {
+    appAudioLog(
+      "video path: Chromium capture for",
+      videoSource.id,
+      isWindow ? "(window, but out of native scope)" : "(screen source)",
+    );
   }
 
   if (!audio || app.commandLine.hasSwitch("no-per-app-audio")) {
@@ -271,6 +325,10 @@ ipcMain.on("screenShare:cancelReacquire", () => {
   reacquireGeneration++;
   lastShare = null;
   armedShare = null;
+  // The renderer sends this once it considers the share fully over, so any
+  // native video capture still running at this point is a leak, not a race
+  // we need to be gentle with.
+  stopScreenCapture();
 });
 
 ipcMain.handle("screenShare:reacquire", async () => {
@@ -435,18 +493,6 @@ export function createMainWindow() {
       appAudioLog(`page error: ${message} (${sourceId}:${line})`);
     },
   );
-
-  /**
-   * `--capture-fps=N` caps the frame rate the page may ask for. WGC brokers each
-   * frame through CaptureService, so the rate is a direct lever on how hard that
-   * service is driven -- and this fork raised the requested rate when it removed
-   * an old 5fps clamp.
-   */
-  function captureFpsCap(): number | null {
-    if (!app.commandLine.hasSwitch("capture-fps")) return null;
-    const raw = Number(app.commandLine.getSwitchValue("capture-fps"));
-    return Number.isFinite(raw) && raw > 0 ? Math.round(raw) : null;
-  }
 
   // The web app is remote, so the getDisplayMedia override has to be injected
   // into its main world on every load (contextIsolation keeps the preload out).
@@ -614,6 +660,7 @@ export function createMainWindow() {
       if (armed && Date.now() - armed.at < ARMED_TTL_MS) {
         appAudioLog("answering with re-acquired source", armed.source.id);
         stopAppAudio();
+        stopScreenCapture();
         void respondToDisplayMedia(
           armed.source,
           armed.audio && request.audioRequested,
@@ -640,6 +687,7 @@ export function createMainWindow() {
         .then((sources) => {
           // Any previous share is over by the time a new one is requested.
           stopAppAudio();
+          stopScreenCapture();
           appAudioLog("sources offered:", String(sources.length));
 
           // Shortcut for linux wayland.

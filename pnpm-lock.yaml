@@ -38,6 +38,9 @@ importers:
       win-app-audio:
         specifier: file:native/win-app-audio
         version: file:native/win-app-audio
+      win-capture:
+        specifier: file:native/win-capture
+        version: file:native/win-capture
     devDependencies:
       '@electron-forge/cli':
         specifier: ^7.11.2
@@ -3695,6 +3698,9 @@ packages:
 
   win-app-audio@file:native/win-app-audio:
     resolution: {directory: native/win-app-audio, type: directory}
+
+  win-capture@file:native/win-capture:
+    resolution: {directory: native/win-capture, type: directory}
 
   winreg@1.2.4:
     resolution: {integrity: sha512-IHpzORub7kYlb8A43Iig3reOvlcBJGX9gZ0WycHhghHtA65X0LYnMRuJs+aH1abVnMJztQkvQNlltnbPi5aGIA==}
@@ -7938,6 +7944,10 @@ snapshots:
       isexe: 2.0.0
 
   win-app-audio@file:native/win-app-audio:
+    dependencies:
+      node-addon-api: 8.9.2
+
+  win-capture@file:native/win-capture:
     dependencies:
       node-addon-api: 8.9.2
 

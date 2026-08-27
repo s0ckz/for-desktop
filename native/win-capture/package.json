@@ -1,0 +1,12 @@
+{
+  "name": "win-capture",
+  "version": "1.0.0",
+  "description": "GPU-downscaled window capture for Windows (Windows Graphics Capture + D3D11 video processor).",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "gypfile": true,
+  "license": "MIT",
+  "dependencies": {
+    "node-addon-api": "^8.3.0"
+  }
+}

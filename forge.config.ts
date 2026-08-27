@@ -165,6 +165,26 @@ const config: ForgeConfig = {
         }
       }
 
+      // GPU-downscaled window capture (Windows only). Same story as
+      // win-app-audio above: it is a file: dependency, so Forge prunes it and
+      // the compiled addon has to be copied in by hand. Without this the app
+      // packages cleanly, finds no binary at runtime, and silently falls back
+      // to Chromium capture at the old frame rate -- which is exactly what the
+      // "Confirm addon shipped" gate in win-app-audio.yml exists to catch.
+      if (platform === "win32") {
+        const from = "node_modules/win-capture";
+        const to = path.join(buildPath, "node_modules/win-capture");
+        fs.mkdirSync(path.join(to, "build/Release"), { recursive: true });
+        for (const entry of [
+          "package.json",
+          "index.js",
+          "index.d.ts",
+          "build/Release/win_capture.node",
+        ]) {
+          fs.cpSync(path.join(from, entry), path.join(to, entry));
+        }
+      }
+
       if (platform === "linux") {
         // Copy only the files we need to run the code, which is dist, LICENSE, and package.json
         fs.cpSync(

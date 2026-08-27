@@ -1,5 +1,6 @@
 allowBuilds:
   win-app-audio@file:native/win-app-audio: true
+  win-capture@file:native/win-capture: true
   bufferutil: true
   electron: true
   electron-winstaller: true
