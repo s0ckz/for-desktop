@@ -20,6 +20,12 @@ declare const winCapture: {
     ) => void,
   ): boolean;
   stop(): void;
+  /**
+   * Change the delivery rate of the capture already running. Returns false if
+   * nothing is capturing or the value is unusable. Takes effect on the next
+   * frame -- no session teardown.
+   */
+  setFps(fps: number): boolean;
   lastError(): string;
 };
 

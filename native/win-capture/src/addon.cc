@@ -118,7 +118,16 @@ constexpr int kFramePoolBuffers = 2;
 
 UINT32 g_targetW = 0;
 UINT32 g_targetH = 0;
-double g_fps = 30.0;
+/**
+ * Delivery cadence, changeable while capture is running.
+ *
+ * Atomic because the capture thread reads it every iteration while SetFps()
+ * writes it from the JS thread. The web client picks a screen-share quality
+ * *after* the share has already started (the picker resolves once capture is
+ * live), so a rate fixed at Start() would strand every later quality change --
+ * which is exactly the bug this exists to fix.
+ */
+std::atomic<double> g_fps{30.0};
 
 ComPtr<ID3D11Device> g_device;
 ComPtr<ID3D11DeviceContext> g_context;
@@ -510,7 +519,6 @@ void CaptureThread(HWND hwnd) {
       break;
     }
 
-    const auto interval = std::chrono::duration<double>(1.0 / g_fps);
 
     // Windows' default system timer resolution is ~15.6ms, so without this,
     // WaitForSingleObject(..., 33) actually wakes up on the next ~15.6ms tick
@@ -530,12 +538,17 @@ void CaptureThread(HWND hwnd) {
     // frame. Computing the wait as "time until the next scheduled tick"
     // instead absorbs that processing time into the interval rather than
     // adding to it.
-    auto nextTick = std::chrono::steady_clock::now() + interval;
+    auto nextTick = std::chrono::steady_clock::now() +
+                    std::chrono::duration<double>(1.0 / g_fps.load(std::memory_order_relaxed));
 
     while (g_running.load()) {
       const auto now = std::chrono::steady_clock::now();
       const auto waitFor = std::chrono::duration_cast<std::chrono::milliseconds>(nextTick - now);
       const DWORD waitMs = waitFor.count() > 0 ? static_cast<DWORD>(waitFor.count()) : 0;
+      // Re-read every iteration so a mid-share rate change takes effect on the
+      // very next frame instead of the next capture session.
+      const auto interval =
+          std::chrono::duration<double>(1.0 / g_fps.load(std::memory_order_relaxed));
       nextTick += std::chrono::duration_cast<std::chrono::steady_clock::duration>(interval);
 
       // WaitForSingleObject IS the pacing: whatever WGC produced during this
@@ -722,8 +735,8 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
 
   g_targetW = info[1].As<Napi::Number>().Uint32Value();
   g_targetH = info[2].As<Napi::Number>().Uint32Value();
-  g_fps = info[3].As<Napi::Number>().DoubleValue();
-  if (!(g_fps > 0)) g_fps = 30.0;
+  const double startFps = info[3].As<Napi::Number>().DoubleValue();
+  g_fps.store(startFps > 0 ? startFps : 30.0);
   if (g_targetW < 2 || g_targetH < 2) {
     Napi::Error::New(env, "targetWidth/targetHeight must be >= 2").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -772,10 +785,30 @@ Napi::Value LastError(const Napi::CallbackInfo& info) {
   return Napi::String::New(info.Env(), g_lastError);
 }
 
+/**
+ * Change the delivery cadence of the running capture.
+ *
+ * Cheap and safe at any time: the capture thread re-reads g_fps every
+ * iteration and nothing else depends on the rate, so there is no session to
+ * tear down and no pipeline to rebuild. Returns false when nothing is
+ * capturing or the value is not usable, so the caller can log rather than
+ * assume it took.
+ */
+Napi::Value SetFps(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (!g_running.load()) return Napi::Boolean::New(env, false);
+  if (info.Length() < 1 || !info[0].IsNumber()) return Napi::Boolean::New(env, false);
+  const double fps = info[0].As<Napi::Number>().DoubleValue();
+  if (!(fps > 0) || fps > 240) return Napi::Boolean::New(env, false);
+  g_fps.store(fps, std::memory_order_relaxed);
+  return Napi::Boolean::New(env, true);
+}
+
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("isSupported", Napi::Function::New(env, IsSupported));
   exports.Set("start", Napi::Function::New(env, Start));
   exports.Set("stop", Napi::Function::New(env, Stop));
+  exports.Set("setFps", Napi::Function::New(env, SetFps));
   exports.Set("lastError", Napi::Function::New(env, LastError));
   return exports;
 }

@@ -24,6 +24,7 @@ import {
 import { APP_AUDIO_PATCH } from "./appAudioPatch";
 import { config, getPersistedServer } from "./config";
 import {
+  setLiveFps as setScreenCaptureFps,
   startForSource as startScreenCapture,
   stop as stopScreenCapture,
   takeNextRequestedFps,
@@ -342,6 +343,27 @@ async function primaryScreenSource(): Promise<Electron.DesktopCapturerSource | n
  * Resolves false on timeout, if there is nothing to re-acquire, or if another
  * call supersedes this one.
  */
+/**
+ * A quality change on a share that is already running.
+ *
+ * for-web resolves its picker *after* `setScreenShareEnabled`, so the chosen
+ * quality arrives as `applyConstraints({ frameRate })` on the live track --
+ * long after capture started at whatever the saved default was. The page patch
+ * forwards that here rather than swallowing it, which is what makes picking
+ * "1080p 60FPS" in the picker actually reach capture.
+ *
+ * Lives here rather than in screenCapture.ts so `--capture-fps` still wins,
+ * exactly as it does for the initial rate in respondToDisplayMedia.
+ */
+ipcMain.on("screenCapture:setFps", (_event, fps: unknown) => {
+  if (typeof fps !== "number" || !Number.isFinite(fps)) {
+    appAudioLog("screen capture: ignoring invalid setFps value:", fps);
+    return;
+  }
+  const cap = captureFpsCap();
+  setScreenCaptureFps(cap !== null ? Math.min(fps, cap) : fps);
+});
+
 ipcMain.handle("screenShare:reacquire", async () => {
   const target = lastShare;
   if (!target) {
