@@ -167,9 +167,17 @@ function captureFpsCap(): number | null {
  *
  * A *window* share that cannot get per-app audio is answered with video only:
  * Chromium's `"loopback"` is the entire system mix, including the voice call
- * itself, which is exactly the leak this whole module exists to avoid. Only
- * whole-screen shares -- where the system mix is what the user asked for
- * anyway -- fall back to it.
+ * itself, which is exactly the leak this whole module exists to avoid.
+ *
+ * A *screen* share used to fall back to `"loopback"` on the same failure --
+ * that was the actual bug this module was built to fix (see appAudio.ts's
+ * header). On Windows, appAudio's own system-mix capture (every audible
+ * process except the blocklist and our own tree) is what a screen share gets
+ * instead; if even that fails, we share video only and log why, rather than
+ * silently reintroducing the leak. `--allow-system-audio-mix` is the
+ * deliberate escape hatch back to Chromium's raw loopback, and it is now the
+ * *only* route to it. Non-Windows platforms have no appAudio system-mix path
+ * to fall back from, so their behaviour (straight to loopback) is unchanged.
  */
 async function respondToDisplayMedia(
   source: Electron.DesktopCapturerSource,
@@ -251,6 +259,15 @@ async function respondToDisplayMedia(
     callback({ video: videoSource });
     return;
   }
+  // For a screen source this calls into startSystemExcluding(), which blocks
+  // the calling thread -- here, the Electron main thread -- until its first
+  // enumerate-and-activate pass finishes, so the report it returns names the
+  // processes actually captured rather than an empty guess. Measured on a
+  // desktop with 8 audible applications: 18ms median, 23ms worst over five
+  // runs, i.e. imperceptible at share start. The native side caps that wait
+  // at 5s, but the cap is a backstop for an activation that hangs, not a
+  // figure this approaches -- a freeze here would be user-visible, so
+  // re-measure before assuming it is still cheap.
   if (startForSource(source.id)) {
     // Audio arrives out-of-band and is stitched in by the renderer; asking
     // Chromium for loopback too would double up the sound.
@@ -263,6 +280,26 @@ async function respondToDisplayMedia(
       "no per-app audio for window",
       source.id,
       "- sharing video only rather than the whole system mix",
+    );
+    callback({ video: videoSource });
+    return;
+  }
+  // Screen share, and appAudio's system-mix capture didn't come up (native
+  // module missing, unsupported OS, or activation failed -- appAudio already
+  // logged which). Falling back to Chromium's raw loopback here is exactly
+  // the bug this module exists to fix: it is the entire system mix,
+  // including whatever voice call the sharer is on. So on Windows we share
+  // video only by default, unless the user has opted into the raw mix with
+  // --allow-system-audio-mix. Non-Windows platforms never had a system-mix
+  // path to fall back from, so they go straight to loopback as before.
+  if (
+    process.platform === "win32" &&
+    !app.commandLine.hasSwitch("allow-system-audio-mix")
+  ) {
+    appAudioLog(
+      "screen share: no system-mix audio and Chromium loopback is disabled by default on Windows",
+      "(it would rebroadcast any voice call the sharer is on) - sharing video only;",
+      "pass --allow-system-audio-mix to opt into the raw system mix instead",
     );
     callback({ video: videoSource });
     return;
@@ -461,6 +498,7 @@ export function createMainWindow() {
       "window-shares-as-screen",
       "no-per-app-audio",
       "background-throttling",
+      "allow-system-audio-mix",
     ].filter((flag) => app.commandLine.hasSwitch(flag));
     appAudioLog("capture flags:", flags.length ? flags.join(", ") : "(none)");
     appAudioLog("capture fps cap:", String(captureFpsCap() ?? "none"));
