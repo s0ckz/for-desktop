@@ -11,6 +11,7 @@ try {
 }
 
 const missingWindow = { exists: false, visible: false, iconic: false };
+const deadMixState = { running: false, clients: [], scans: 0, lastError: "not loaded" };
 
 const unavailable = {
   isSupported: () => false,
@@ -21,6 +22,11 @@ const unavailable = {
   },
   stop: () => {},
   lastError: () => (loadError ? String(loadError.message || loadError) : "not loaded"),
+  listAudioProcesses: () => [],
+  startSystemExcluding: () => {
+    throw new Error("win-app-audio native module is not available");
+  },
+  mixState: () => deadMixState,
   sampleRate: 48000,
   channels: 2,
 };
@@ -66,6 +72,30 @@ module.exports = {
       return api.lastError();
     } catch {
       return "unknown";
+    }
+  },
+  /** Enumerate every process currently rendering audio. Swallows on error. */
+  listAudioProcesses: () => {
+    try {
+      return api.listAudioProcesses() || [];
+    } catch {
+      return [];
+    }
+  },
+  /**
+   * Begin mixed capture of every audible process except those named in
+   * excludedNames (lowercase exe basenames). onChunk receives 48kHz stereo
+   * signed 16-bit LE PCM buffers -- the same wire format as start(). Throws
+   * when the native binary is not available, matching start()'s contract,
+   * so beginCapture's existing try/catch handles both the same way.
+   */
+  startSystemExcluding: (excludedNames, onChunk) => api.startSystemExcluding(excludedNames, onChunk),
+  /** Snapshot of the running mixer: live clients, scan count, last error. Swallows on error. */
+  mixState: () => {
+    try {
+      return api.mixState() || deadMixState;
+    } catch {
+      return deadMixState;
     }
   },
   sampleRate: api.sampleRate || 48000,
