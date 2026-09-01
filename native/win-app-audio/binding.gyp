@@ -8,7 +8,7 @@
         ["OS=='win'", {
           "sources": ["src/addon.cc"],
           "defines": ["UNICODE", "_UNICODE", "NOMINMAX", "WIN32_LEAN_AND_MEAN"],
-          "libraries": ["-lmmdevapi.lib", "-lole32.lib", "-loleaut32.lib", "-luser32.lib"],
+          "libraries": ["-lmmdevapi.lib", "-lole32.lib", "-loleaut32.lib", "-luser32.lib", "-lavrt.lib"],
           "msvs_settings": {
             "VCCLCompilerTool": {
               "ExceptionHandling": 1,
