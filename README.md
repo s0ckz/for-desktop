@@ -21,6 +21,19 @@ Application for Windows, macOS, and Linux.
 
 - All downloads and instructions for Stoat can be found on our [Website](https://stoat.chat/download).
 
+## Releases & Auto-Update
+
+Releases are cut automatically by [`win-app-audio.yml`](.github/workflows/win-app-audio.yml) on every push to `main`. It looks at the commits since the last `v*` tag and applies [release-please](https://github.com/googleapis/release-please)'s own bump rule to their subjects: any `feat:` bumps minor, else any `fix:`/`perf:`/`revert:` bumps patch, else (only `chore:`/`docs:`/`ci:`/`style:`/`test:`/`refactor:`) nothing is released. A `!` before the colon, or a `BREAKING CHANGE:`/`BREAKING-CHANGE:` footer at the start of a line, forces a major bump regardless. When a release is warranted, the workflow bumps `package.json` and `.release-please-manifest.json`, commits as `chore(release): v<version>`, tags it, pushes both to `main`, builds from that bumped commit, and publishes a real GitHub release (`v<version>`, not a pre-release) containing the full Squirrel output (`RELEASES`, the `*-full.nupkg`, and `Setup.exe`) — no portable `.zip` is included in a versioned release; see below.
+
+If a build or publish step fails *after* the version bump has already landed on `main`, the workflow deletes the `v<version>` tag it just created so there's never a tag without a matching release, but it does not revert the version bump commit itself. In that rare case `package.json` briefly claims a version that was never released; the next successful release is computed from that already-bumped number, so at worst you get one extra patch/minor bump the following time around.
+
+`CHANGELOG.md` and `release-please-config.json`/`.release-please-manifest.json` are left over from when this repo ran the actual [release-please](https://github.com/googleapis/release-please) GitHub Action; that workflow was removed, so nothing updates `CHANGELOG.md` anymore. The manifest file is only still read (and kept in sync) because `win-app-audio.yml` writes to it alongside `package.json` for consistency with that earlier setup.
+
+Two things to know about how updates actually reach users:
+
+- **Auto-update only works for the `Setup.exe` install.** The app uses Squirrel.Windows for updates, and Squirrel only knows how to patch an install it made itself. The portable `.zip` build (only ever produced by the rolling pre-release below, not by a versioned release) has no updater wired into it at all -- it has to be re-downloaded by hand for a new version.
+- **The rolling `win-per-app-audio` build is not, and cannot be, an update source.** It publishes a "latest main build" download on a fixed tag for testing, and it's deliberately marked as a pre-release so it doesn't fight with real releases for that tag name. `update.electronjs.org` (what the app's auto-updater talks to) only ever serves the latest release that is *both* semver-tagged *and* not a pre-release, so it ignores that build entirely -- by design, not by accident.
+
 ## Development Guide
 
 _Contribution guidelines for Desktop app TBA!_

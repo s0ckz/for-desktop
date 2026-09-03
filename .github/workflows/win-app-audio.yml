@@ -18,6 +18,12 @@ on:
 # once and whichever finishes last wins -- possibly with the other's installer
 # half-uploaded. Queue instead of cancelling, so a run that is already uploading
 # is allowed to finish.
+#
+# Note this only serialises RUNS of this workflow against each other -- it
+# does not freeze the `main` ref itself. An ordinary merge (or any other push)
+# can still land on main while a run here is mid-flight, between its checkout
+# and its own push in "Bump version, commit, and tag" below. That step retries
+# against exactly that race; see the comment there.
 concurrency:
   group: win-app-audio-release
   cancel-in-progress: false
@@ -39,8 +45,14 @@ jobs:
       PLATFORM: win32
 
     steps:
+      # fetch-depth: 0 is required below -- the version-bump step walks
+      # `git log <last-tag>..HEAD` and needs full history plus every tag to
+      # find "the most recent v* tag". The default shallow (depth-1) clone
+      # would see neither.
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Checkout assets
         run: git -c submodule."assets".update=checkout submodule update --init assets
@@ -55,6 +67,180 @@ jobs:
         with:
           node-version: 22
           cache: "pnpm"
+
+      # Decides whether this push warrants a real, versioned release, and if
+      # so what the next version is. Deliberately plain git/gh/node shell,
+      # not a third-party "bump version" or "conventional commits" action:
+      # this step pushes commits and tags straight to main, and that is not
+      # somewhere to add a new, unpinned marketplace dependency just to save
+      # a few lines of grep. This re-implements just the slice of
+      # release-please's own rule that we need:
+      #   - any feat: (or feat(scope):) commit                 -> minor
+      #   - else any fix:/perf:/revert: commit (with scope)    -> patch
+      #   - else (only chore/docs/ci/style/test/refactor)      -> no release
+      #   - a ! before the colon, or a BREAKING CHANGE: footer,
+      #     overrides all of the above                         -> major
+      # Only runs for a genuine push to main -- workflow_dispatch and the two
+      # frozen legacy branches must never cut a release.
+      - name: Decide release
+        id: release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          set -e
+
+          # v[0-9]* rather than v* -- a stray tag like `vendor-freeze` would
+          # otherwise match and get treated as a version.
+          LAST_TAG=$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n1 || true)
+
+          if [ -z "$LAST_TAG" ]; then
+            # No v* tag yet -- this is the first release cut by this
+            # workflow. Scan the whole history rather than crashing on an
+            # empty range.
+            echo "No previous v* tag found; scanning full history."
+            RANGE="HEAD"
+          else
+            echo "Last release tag: $LAST_TAG"
+            RANGE="$LAST_TAG..HEAD"
+          fi
+
+          # Subjects decide feat/fix/breaking-bang; bodies are scanned
+          # separately for a BREAKING CHANGE: footer. Order/commit-association
+          # doesn't matter -- we only need to know whether ANY commit in range
+          # trips each rule.
+          #
+          # %b includes merge commit bodies, and this repo merge-commits its
+          # PRs -- so a PR description ends up in here too. The footer match
+          # below is anchored to the start of a line (^BREAKING[ -]CHANGE:,
+          # release-please accepts the hyphenated form as well) specifically
+          # so that a PR whose description merely mentions the words
+          # "BREAKING CHANGE:" in a sentence -- like this PR's own README
+          # section explaining this rule -- can't accidentally force a major
+          # bump. An unanchored `grep -q 'BREAKING CHANGE:'` would match that
+          # sentence anywhere on any line.
+          SUBJECTS=$(git log "$RANGE" --format='%s' || true)
+          BODIES=$(git log "$RANGE" --format='%b' || true)
+
+          if echo "$SUBJECTS" | grep -qE '^[a-zA-Z]+(\([^)]*\))?!:' || echo "$BODIES" | grep -qE '^BREAKING[ -]CHANGE:'; then
+            BUMP=major
+          elif echo "$SUBJECTS" | grep -qE '^feat(\([^)]*\))?:'; then
+            BUMP=minor
+          elif echo "$SUBJECTS" | grep -qE '^(fix|perf|revert)(\([^)]*\))?:'; then
+            BUMP=patch
+          else
+            BUMP=none
+          fi
+
+          echo "Computed bump: $BUMP"
+          echo "bump=$BUMP" >> "$GITHUB_OUTPUT"
+
+          if [ "$BUMP" = "none" ]; then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CURRENT=$(node -p "require('./package.json').version")
+
+          # Refuse to guess at a bump for anything that isn't a plain X.Y.Z --
+          # a prerelease suffix (1.5.2-beta.1) or a stray non-numeric part
+          # would otherwise fail deep inside the arithmetic below with a
+          # cryptic "invalid arithmetic operator" and no context.
+          if ! [[ "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::package.json version '$CURRENT' is not a plain X.Y.Z semver; refusing to guess the next version."
+            exit 1
+          fi
+
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+
+          # The 10# base prefix matters: a version part with a leading zero
+          # (e.g. the "08" in 1.08.2) would otherwise be parsed as octal by
+          # bash's arithmetic context and blow up with "value too great for
+          # base" the moment it hit a digit like 8 or 9.
+          case "$BUMP" in
+            major) MAJOR=$((10#$MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((10#$MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((10#$PATCH + 1)) ;;
+          esac
+
+          NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+          echo "Current version: $CURRENT -> new version: $NEW_VERSION"
+
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+      # Bumps package.json + .release-please-manifest.json together (they
+      # must stay in agreement), commits, tags, and pushes -- BEFORE the app
+      # is built. Squirrel's update check compares the version baked into the
+      # running app against the version on the release; building first and
+      # tagging after would ship an installer whose own version already
+      # equals (or exceeds) the tag it's supposedly updating to, so it could
+      # never see itself as out of date.
+      #
+      # Pushing here with the default GITHUB_TOKEN does NOT retrigger this
+      # (or any) `on: push` workflow -- GitHub's loop-prevention rule for
+      # actions-authored pushes -- so this does not cause win-app-audio.yml
+      # (or build.yml / multiplatform_build.yml, which also trigger on
+      # push-to-main) to run again on the commit it creates. This run simply
+      # continues on to build that commit itself.
+      #
+      # What the `concurrency` group at the top of this file does NOT protect
+      # against: it only stops another RUN OF THIS WORKFLOW from executing in
+      # parallel. It does nothing to stop an ordinary merge (or any other
+      # push) from moving the `main` ref while this run is still sitting in
+      # checkout/setup, several steps before it gets here -- that merge
+      # happens the instant it's clicked, independent of whether this
+      # workflow's steps are running or queued. If that happens, `git push`
+      # below is a plain non-fast-forward rejection. Retry by fetching and
+      # rebasing our one small commit onto whatever main has become, a few
+      # times, rather than dying red on a race we can trivially recover from.
+      # The tag is only created once the commit has actually landed, so it
+      # never ends up pointing at a pre-rebase, unreachable commit.
+      - name: Bump version, commit, and tag
+        id: bump
+        if: steps.release.outputs.should_release == 'true'
+        shell: bash
+        run: |
+          set -e
+          VERSION="${{ steps.release.outputs.version }}"
+
+          node -e "
+            const fs = require('fs');
+
+            const pkgPath = 'package.json';
+            const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+            pkg.version = '$VERSION';
+            fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+
+            const manifestPath = '.release-please-manifest.json';
+            const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+            manifest['.'] = '$VERSION';
+            fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+          "
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package.json .release-please-manifest.json
+          git commit -m "chore(release): v$VERSION"
+
+          # HEAD is detached (actions/checkout doesn't leave a local main
+          # branch), so push it explicitly onto main. Retry with a rebase on
+          # a non-fast-forward rejection -- see the comment above this step.
+          ATTEMPT=1
+          MAX_ATTEMPTS=5
+          until git push origin HEAD:main; do
+            if [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
+              echo "::error::Could not push $VERSION to main after $MAX_ATTEMPTS attempts -- main kept moving underneath this run."
+              exit 1
+            fi
+            echo "Push rejected (main moved underneath this run) -- fetching and rebasing, attempt $ATTEMPT/$MAX_ATTEMPTS."
+            git fetch origin main
+            git rebase origin/main
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+
+          # Only tag now that we know exactly which commit landed on main.
+          git tag "v$VERSION"
+          git push origin "v$VERSION"
 
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
@@ -106,11 +292,26 @@ jobs:
           done
           test "$FAIL" -eq 0
 
+      # continue-on-error stays true for the rolling dev build (no prior step
+      # set should_release, or it's false) -- a broken `make` there just
+      # means today's win-per-app-audio asset doesn't update, which is
+      # tolerable. On the release path it must fail loudly instead: silently
+      # continuing past a failed `make` here would go on to publish a real,
+      # non-prerelease release with missing or partial Squirrel assets, which
+      # is exactly the bug this whole change exists to prevent.
       - name: Make installer
         run: pnpm make
-        continue-on-error: true
+        continue-on-error: ${{ steps.release.outputs.should_release != 'true' }}
 
+      # if: always() on this and the next two steps -- a release-worthy push
+      # whose `make` fails now fails the job (continue-on-error is false
+      # above), and by default GitHub Actions skips every later step without
+      # its own `if:` once one has failed. Without always() here, that would
+      # also take out today's win-per-app-audio rolling asset even though
+      # nothing about the rolling build itself changed -- these three steps
+      # still only ever act on whatever out/make actually contains.
       - name: Upload packaged app
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: stoat-windows-per-app-audio
@@ -124,6 +325,7 @@ jobs:
       # installer as a release asset instead -- that is a plain public link.
       - name: Collect release assets
         id: assets
+        if: always()
         shell: bash
         run: |
           mkdir -p release
@@ -152,6 +354,7 @@ jobs:
           ls -la release
 
       - name: Publish release
+        if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -185,3 +388,142 @@ jobs:
           fi
 
           echo "Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
+
+      # Squirrel.Windows (MakerSquirrel here) does not poll the exe, GitHub's
+      # "latest release" API, or anything update-electron-app-shaped -- it
+      # downloads a plain-text RELEASES index (nupkg filename + SHA1 + size,
+      # one line per version) and then the exact *-full.nupkg it names. Both
+      # come out of `pnpm make` under out/make/squirrel.windows alongside the
+      # Setup.exe, and the "Collect release assets" step above throws them
+      # away -- it only globs for *.exe/*.zip for the rolling build. Skipping
+      # this check would let a `make` that silently dropped the nupkg (or
+      # produced RELEASES with no matching payload) through to a published
+      # release that every installed app would fail to update from.
+      #
+      # `pnpm make` has never actually run to completion in CI before this
+      # change (it's had continue-on-error: true since day one), so the most
+      # likely first failure here is out/make/squirrel.windows not existing
+      # at all. That path is checked explicitly, with its own message, and
+      # every `find` below it is followed by `|| true`: under `set -e`,
+      # `find` on a missing directory exits non-zero, and stderr is
+      # discarded by the 2>/dev/null on the same line -- without `|| true`
+      # the step would abort silently right there, before any of the
+      # ::error:: messages below it ever had a chance to print, in exactly
+      # the failure case this step exists to report clearly.
+      - name: Verify Squirrel release assets exist
+        if: steps.release.outputs.should_release == 'true'
+        shell: bash
+        run: |
+          set -e
+          SQUIRREL_DIR="out/make/squirrel.windows"
+
+          if [ ! -d "$SQUIRREL_DIR" ]; then
+            echo "::error::$SQUIRREL_DIR does not exist -- 'pnpm make' did not produce a squirrel.windows output at all. Check the 'Make installer' step above."
+            exit 1
+          fi
+
+          echo "--- squirrel.windows contents ---"
+          find "$SQUIRREL_DIR" -type f
+
+          RELEASES_FILE=$(find "$SQUIRREL_DIR" -name 'RELEASES' -print -quit 2>/dev/null || true)
+          NUPKG_FILE=$(find "$SQUIRREL_DIR" -name '*-full.nupkg' -print -quit 2>/dev/null || true)
+          SETUP_FILE=$(find "$SQUIRREL_DIR" -name '*.exe' -print -quit 2>/dev/null || true)
+
+          if [ -z "$RELEASES_FILE" ]; then
+            echo "::error::No RELEASES file under $SQUIRREL_DIR -- Squirrel has no update feed to read, so auto-update would silently never fire for anyone on this release. Check the 'Make installer' step above."
+            exit 1
+          fi
+
+          if [ -z "$NUPKG_FILE" ]; then
+            echo "::error::No *-full.nupkg under $SQUIRREL_DIR -- RELEASES would point at a payload that was never produced."
+            exit 1
+          fi
+
+          if [ -z "$SETUP_FILE" ]; then
+            echo "::error::No Setup.exe under $SQUIRREL_DIR -- nothing for a fresh install to download."
+            exit 1
+          fi
+
+          echo "OK: $RELEASES_FILE"
+          echo "OK: $NUPKG_FILE"
+          echo "OK: $SETUP_FILE"
+
+      # The real, semver-tagged, non-prerelease release. update.electronjs.org
+      # (what update-electron-app's ElectronPublicUpdateService talks to)
+      # only ever serves a repo's latest release that is BOTH semver-tagged
+      # AND not marked prerelease -- it is the sole thing this repo publishes
+      # that the auto-updater can see at all. win-per-app-audio above is a
+      # prerelease on a fixed tag on purpose, so it stays invisible to it.
+      #
+      # Ship the entire out/make/squirrel.windows output verbatim, under its
+      # own filenames -- Squirrel resolves the .nupkg it needs by the exact
+      # name written inside RELEASES, so renaming (like the rolling build
+      # does above for its own assets) would break the update.
+      #
+      # Created as a draft first, on purpose: gh release create without
+      # --draft makes the release live (and visible to update.electronjs.org)
+      # immediately, before a single asset is attached. A client polling in
+      # that window would see RELEASES pointing at a .nupkg that doesn't
+      # exist yet -- a 404 the update service then caches -- and if the
+      # upload step failed partway through, that broken, half-published
+      # state would be permanent even though the job itself goes red. Upload
+      # everything first, then flip it to public in one step at the end.
+      - name: Publish versioned release
+        if: steps.release.outputs.should_release == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -e
+          VERSION="${{ steps.release.outputs.version }}"
+          BUMP="${{ steps.release.outputs.bump }}"
+          TAG="v$VERSION"
+
+          shopt -s globstar nullglob
+          ASSETS=()
+          for f in out/make/squirrel.windows/**; do
+            [ -f "$f" ] && ASSETS+=("$f")
+          done
+
+          if [ ${#ASSETS[@]} -eq 0 ]; then
+            echo "::error::No files found under out/make/squirrel.windows to publish."
+            exit 1
+          fi
+
+          echo "--- assets to publish ---"
+          printf '%s\n' "${ASSETS[@]}"
+
+          NOTES="Automated release from \`main\` (bump: $BUMP).
+
+          Commit: \`$(git rev-parse --short HEAD)\`"
+
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY"               --title "Stoat for Desktop v$VERSION"               --notes "$NOTES" --draft
+          else
+            # Re-run after a previous partial failure -- the release (still a
+            # draft at this point) already exists, just refresh its notes.
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes "$NOTES"
+          fi
+
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${ASSETS[@]}"
+
+          # Every asset is confirmed uploaded -- safe to make it a real,
+          # public, non-prerelease release now.
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+
+          echo "Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
+
+      # If anything from "Bump version, commit, and tag" onward fails, main
+      # is left on a commit whose package.json already claims a version that
+      # was never actually released (see the README caveat on this -- it is
+      # a real, if narrow, gap: this step tidies up the tag namespace, not
+      # the version bump itself). Deleting the tag here means there is never
+      # a v<version> tag on the repo without a matching GitHub release next
+      # to it, and the failure stays visible instead of silently leaving a
+      # dangling tag around.
+      - name: Clean up unreleased tag on failure
+        if: failure() && steps.release.outputs.should_release == 'true'
+        shell: bash
+        run: |
+          VERSION="${{ steps.release.outputs.version }}"
+          git push origin ":refs/tags/v$VERSION" || echo "tag v$VERSION was not pushed, or is already gone"

@@ -1,5 +1,18 @@
 # DO NOT EDIT DIRECTLY IN REPOSITORY
 # Managed in Terraform templates
+#
+# The note above is upstream's instruction to ITS OWN maintainers about ITS
+# OWN Terraform-managed sync, not a constraint on this fork -- this fork has
+# no access to that Terraform setup to begin with. It's deviated from here
+# on purpose: this fork doesn't have (and can't set) upstream's
+# STOAT_WEBHOOK_UPDATES_URL secret, and win-app-audio.yml on this fork now
+# publishes real, semver-tagged, non-prerelease releases (see that file's
+# "Publish versioned release" step), which is exactly the `release:
+# published` event this workflow listens for. Before that change this
+# workflow only ever fired for whatever upstream released, so the missing
+# secret never mattered here; now it would fire -- and fail -- on every
+# release this fork cuts. Guarded below so a run with no webhook configured
+# reports success instead of a permanently red `curl -X POST ""`.
 
 name: Release Webhook
 
@@ -20,6 +33,11 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           WEBHOOK_URL: ${{ secrets.STOAT_WEBHOOK_UPDATES_URL }}
         run: |
+          if [ -z "$WEBHOOK_URL" ]; then
+            echo "STOAT_WEBHOOK_UPDATES_URL is not set on this fork -- skipping. See the comment at the top of this file."
+            exit 0
+          fi
+
           RELEASE_URL="https://github.com/${REPOSITORY}/releases/tag/${TAG_NAME}"
           curl -X POST "$WEBHOOK_URL" \
             -H "Content-Type: application/json" \
