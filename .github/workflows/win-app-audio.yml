@@ -82,9 +82,24 @@ jobs:
       #     overrides all of the above                         -> major
       # Only runs for a genuine push to main -- workflow_dispatch and the two
       # frozen legacy branches must never cut a release.
+      #
+      # continue-on-error: true for the same reason as "Bump version, commit,
+      # and tag" below: this step has its own `exit 1` (the "not a plain
+      # X.Y.Z semver" guard) and a `node -p` that can throw, and without
+      # this it would take the whole job down exactly like the bump step
+      # used to -- "Install dependencies" through "Make installer" skipped,
+      # then "Publish release" (the ROLLING build, unrelated to any of
+      # this) failing on "no assets to upload". Downstream steps already
+      # check `steps.bump.outcome` rather than `should_release` for exactly
+      # this class of problem; "Fail the job if a due release did not
+      # complete" at the very end additionally checks
+      # `steps.release.outcome` directly, since a failure here means
+      # `should_release` itself was never written and so can't be relied
+      # on to say a release was due.
       - name: Decide release
         id: release
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        continue-on-error: true
         shell: bash
         run: |
           set -e
@@ -195,13 +210,107 @@ jobs:
       # times, rather than dying red on a race we can trivially recover from.
       # The tag is only created once the commit has actually landed, so it
       # never ends up pointing at a pre-rebase, unreachable commit.
+      #
+      # `continue-on-error: true` -- and everything that follows from it --
+      # is new after this workflow's first real run. That run bumped
+      # package.json to 1.6.0, then failed to push because main has a
+      # ruleset requiring PRs (GH013). Because this step had no
+      # continue-on-error, the whole job died right there: "Install
+      # dependencies", "Package" and "Make installer" all got skipped, so
+      # "Collect release assets" and "Publish release" (the ROLLING
+      # win-per-app-audio prerelease, which has shipped on every push to
+      # main since long before this release machinery existed and has
+      # nothing to do with it) had nothing to publish and failed too. A
+      # bypass entry for the github-actions actor is being added to main's
+      # ruleset separately so the push itself should eventually succeed --
+      # but this step must not be able to take the rolling build down
+      # with it again if it, or anything like it, ever fails for any other
+      # reason. So: this step now degrades gracefully instead of aborting
+      # the job --
+      #   - continue-on-error: true means a failure here is recorded as
+      #     steps.bump.outcome == 'failure' but does NOT stop later steps
+      #     from running (steps.bump.conclusion is forced to 'success', so
+      #     plain `failure()` no longer sees it -- every later step that
+      #     cares whether the bump actually happened checks
+      #     `steps.bump.outcome` explicitly instead, never should_release
+      #     alone, since should_release only says a release was *wanted*).
+      #   - on ANY failure path below, the working tree is reset back to
+      #     the commit this step started from, so "Install dependencies"
+      #     through "Publish release" -- the rolling build -- still run
+      #     against real, unbumped source instead of a half-written
+      #     package.json or a local commit that was never actually pushed
+      #     anywhere.
+      #   - the job still has to end red when a release was due and didn't
+      #     happen, or this whole gap goes unnoticed; see "Fail the job if
+      #     a due release did not complete" at the very end of this file.
+      #
+      # Recovery once a red run like this is seen: just re-run the workflow
+      # (or push again) once the actual cause is fixed. This was verified
+      # end-to-end, not assumed -- re-running after a failed bump takes the
+      # exact same path as an ordinary successful run: checkout returns to
+      # the pre-bump commit, "Decide release" recomputes the same version
+      # (the failed run's bump commit never landed, so it isn't in history
+      # to change that), the branch push either succeeds outright or, if
+      # something else pushed to main in the meantime, is a plain
+      # non-fast-forward that the retry loop below handles normally
+      # (correctly NOT matched by the GH013 grep), the tag and release
+      # publish, and the job goes green. The one caveat already covered in
+      # the README applies here too: if a run's branch push lands but its
+      # tag push then fails, the version it claimed is skipped (the next
+      # run computes e.g. 1.7.0, not a re-attempt at 1.6.0) rather than
+      # reused or double-bumped -- annoying, but harmless.
       - name: Bump version, commit, and tag
         id: bump
         if: steps.release.outputs.should_release == 'true'
+        continue-on-error: true
         shell: bash
         run: |
           set -e
           VERSION="${{ steps.release.outputs.version }}"
+
+          # Snapshot HEAD before touching anything, so any failure below --
+          # whether one of the two explicit cases this step now
+          # distinguishes, or something unanticipated like a rebase
+          # conflict -- can hand back a clean, unbumped tree. See the big
+          # comment above this step for why that now matters: the bump
+          # runs before the build, so this used to be able to take the
+          # rolling build down with it.
+          #
+          # Named PRE_BUMP_HEAD rather than the more obvious ORIG_HEAD --
+          # git itself writes a ref literally called ORIG_HEAD as part of
+          # what `git rebase` does a few lines below, and reusing that name
+          # for an unrelated shell variable sitting right next to a rebase
+          # call is exactly the kind of thing that reads fine today and
+          # confuses somebody in six months.
+          PRE_BUMP_HEAD=$(git rev-parse HEAD)
+
+          restore_tree() {
+            echo "Bump failed -- restoring the working tree to $PRE_BUMP_HEAD (pre-bump) so the build below runs from clean, unbumped source instead of a half-written package.json or an orphaned local commit."
+            # In case the failure happened mid-rebase (see the retry loop
+            # below), clear that state first -- a bare `reset --hard` on
+            # top of an in-progress rebase can leave .git/rebase-merge
+            # behind and confuse the next git command in this same job.
+            git rebase --abort >/dev/null 2>&1 || true
+            # If this reset itself fails (disk/permissions weirdness, a
+            # detached-HEAD edge case, ...) the tree is left exactly as
+            # dangerous as this function exists to prevent -- bumped
+            # package.json, maybe an orphaned commit -- and the build below
+            # would silently package a version that was never released.
+            # There's nothing more we can do about it from here, but at
+            # least say so loudly instead of letting it pass unnoticed.
+            git reset --hard "$PRE_BUMP_HEAD" || echo "::error::restore_tree failed -- the working tree may still be bumped. The build that follows this step may package an unreleased version."
+          }
+
+          # Safety net for any failure this script doesn't explicitly
+          # handle below (the node script throwing, `git commit` failing,
+          # a genuine rebase conflict, the tag push failing after the
+          # branch push already succeeded...). Under `set -e`, any of
+          # those aborts the script anyway -- this just guarantees
+          # restore_tree still runs on the way out. It does NOT fire for
+          # the two `exit 1`s further down (bash does not run ERR traps
+          # for an explicit `exit`), so those call restore_tree themselves
+          # before exiting.
+          trap restore_tree ERR
 
           node -e "
             const fs = require('fs');
@@ -223,16 +332,76 @@ jobs:
           git commit -m "chore(release): v$VERSION"
 
           # HEAD is detached (actions/checkout doesn't leave a local main
-          # branch), so push it explicitly onto main. Retry with a rebase on
-          # a non-fast-forward rejection -- see the comment above this step.
+          # branch), so push it explicitly onto main.
+          #
+          # A rejected push means one of two very different things, and
+          # conflating them is exactly what happened on this workflow's
+          # first real run:
+          #
+          #   1. A genuine race -- an ordinary merge (or any other push)
+          #      landed on main between this run's checkout and this push.
+          #      That's a plain non-fast-forward rejection, and fetching +
+          #      rebasing this one small commit onto the new tip of main
+          #      and pushing again is a real fix. This is what the retry
+          #      loop below is for, and that part is unchanged.
+          #
+          #   2. A repository ruleset rejection (GH013, "push declined due
+          #      to repository rule violations" / "Changes must be made
+          #      through a pull request"). Nothing moved. Retrying hits the
+          #      exact same rule every time. On the actual failed run this
+          #      was misdiagnosed as case 1: the loop burned all 5
+          #      attempts, logged "Current branch main is up to date."
+          #      between every single one of them (proof main never
+          #      moved), and then reported "main kept moving underneath
+          #      this run" -- which was simply false, and would send
+          #      whoever reads the log looking for a race that never
+          #      happened.
+          #
+          # So: capture the push output and check it for the ruleset
+          # signature before ever treating a rejection as a race. If it
+          # matches, stop immediately -- retrying cannot help -- and say
+          # what is actually wrong.
+          #
+          # The check itself uses a here-string (`<<<`), not
+          # `echo "$X" | grep -q PATTERN`. Reason: under `pipefail` (this
+          # shell's default, see the note at the top of this file), if
+          # `grep -q` finds its match early and exits before `echo` has
+          # finished writing, `echo` can be killed by SIGPIPE (status 141),
+          # and pipefail then reports that as the pipeline's status instead
+          # of grep's 0 -- so the `if` below would read as "no match" even
+          # though the pattern was right there. Not reachable today with a
+          # few KB of git output, but latent, and `<<<` sidesteps it
+          # entirely by never opening a pipe. (The unrelated `echo | grep`
+          # pairs already in "Decide release" above are deliberately left
+          # as-is -- that step's bump-rule logic is out of scope here.)
           ATTEMPT=1
           MAX_ATTEMPTS=5
-          until git push origin HEAD:main; do
-            if [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
-              echo "::error::Could not push $VERSION to main after $MAX_ATTEMPTS attempts -- main kept moving underneath this run."
+          while true; do
+            PUSH_OUTPUT=$(git push origin HEAD:main 2>&1) && { echo "$PUSH_OUTPUT"; break; }
+            echo "$PUSH_OUTPUT"
+
+            if grep -qE 'GH013|push declined due to repository rule violations|Changes must be made through a pull request' <<<"$PUSH_OUTPUT"; then
+              # GH013 is the umbrella code for every ruleset violation --
+              # required signatures, linear history, required status
+              # checks, tag protection, not just "PRs only". Only the
+              # "Changes must be made through a pull request" bullet is the
+              # bypass-list problem from this workflow's first real run;
+              # print GitHub's own "remote: - ..." bullet line(s) so
+              # whoever reads this sees the actual rule that fired instead
+              # of just an assumption of which one it was.
+              echo "GitHub's reported rule violation(s):"
+              grep -E '^remote: -' <<<"$PUSH_OUTPUT" || true
+              echo "::error::Push to main was rejected by a repository ruleset (GH013), not a race -- main did not move, so retrying would only fail the same way again. See the 'remote: - ...' line(s) above for which rule actually fired. If it names \"Changes must be made through a pull request\", the likely fix is adding the github-actions actor to main's ruleset bypass list (repo Settings > Rules > Rulesets > the ruleset covering main > Bypass list); a different named rule needs a different fix. Re-run this workflow once fixed. The rolling win-per-app-audio build below will still run, from unbumped source."
+              restore_tree
               exit 1
             fi
-            echo "Push rejected (main moved underneath this run) -- fetching and rebasing, attempt $ATTEMPT/$MAX_ATTEMPTS."
+
+            if [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
+              echo "::error::Could not push $VERSION to main after $MAX_ATTEMPTS attempts -- main kept moving underneath this run (a genuine non-fast-forward race, not a ruleset rejection). The rolling win-per-app-audio build below will still run, from unbumped source."
+              restore_tree
+              exit 1
+            fi
+            echo "Push rejected -- fetching and rebasing onto the new tip of main, attempt $ATTEMPT/$MAX_ATTEMPTS."
             git fetch origin main
             git rebase origin/main
             ATTEMPT=$((ATTEMPT + 1))
@@ -240,7 +409,37 @@ jobs:
 
           # Only tag now that we know exactly which commit landed on main.
           git tag "v$VERSION"
-          git push origin "v$VERSION"
+
+          # A rejected tag push gets exactly the same ruleset-vs-something-
+          # else treatment as the branch push above, for the same reason:
+          # tag-protection rulesets (e.g. a "Restrict creations" rule on
+          # `v*`) are just as common as branch ones, and this repo
+          # demonstrably has at least one ruleset already. Without this,
+          # a GH013 here would fall straight into the generic `trap
+          # restore_tree ERR` below with nothing but a raw git error --
+          # the exact misleading-diagnosis problem this whole change exists
+          # to fix, just moved one push later. The commit itself already
+          # landed on main by this point regardless of how the tag push
+          # goes; only the tag (and therefore the versioned release) is at
+          # risk. restore_tree still resets this run's LOCAL tree back to
+          # pre-bump source for the rolling build below, even though the
+          # remote main now has the bump commit -- main will simply carry
+          # a version bump with no tag on it until the next push recomputes
+          # and republishes it (see the README's note on this same
+          # end-of-step gap for the ordinary success case).
+          TAG_PUSH_OUTPUT=$(git push origin "v$VERSION" 2>&1) || {
+            echo "$TAG_PUSH_OUTPUT"
+            if grep -qE 'GH013|push declined due to repository rule violations|Changes must be made through a pull request' <<<"$TAG_PUSH_OUTPUT"; then
+              echo "GitHub's reported rule violation(s):"
+              grep -E '^remote: -' <<<"$TAG_PUSH_OUTPUT" || true
+              echo "::error::Push of tag v$VERSION was rejected by a repository ruleset (GH013). The commit already landed on main -- only the tag failed. This is most likely a separate tag-protection ruleset, not the branch ruleset handled above; check Settings > Rules > Rulesets for one covering tags and add github-actions to its bypass list if that's what the rule line above names. No tag means no versioned release can be published from this run."
+            else
+              echo "::error::Failed to push tag v$VERSION even though the commit landed on main -- see the git output above for the actual cause. No tag means no versioned release can be published from this run."
+            fi
+            restore_tree
+            exit 1
+          }
+          echo "$TAG_PUSH_OUTPUT"
 
       - name: Install dependencies
         run: pnpm install --no-frozen-lockfile
@@ -292,16 +491,26 @@ jobs:
           done
           test "$FAIL" -eq 0
 
-      # continue-on-error stays true for the rolling dev build (no prior step
-      # set should_release, or it's false) -- a broken `make` there just
-      # means today's win-per-app-audio asset doesn't update, which is
-      # tolerable. On the release path it must fail loudly instead: silently
-      # continuing past a failed `make` here would go on to publish a real,
-      # non-prerelease release with missing or partial Squirrel assets, which
-      # is exactly the bug this whole change exists to prevent.
+      # continue-on-error stays true for the rolling dev build -- a broken
+      # `make` there just means today's win-per-app-audio asset doesn't
+      # update, which is tolerable. On the release path it must fail loudly
+      # instead: silently continuing past a failed `make` here would go on
+      # to publish a real, non-prerelease release with missing or partial
+      # Squirrel assets, which is exactly the bug this whole change exists
+      # to prevent.
+      #
+      # Gated on steps.bump.outcome, not should_release: should_release only
+      # says a release was wanted, not that the bump actually happened. If
+      # "Bump version, commit, and tag" failed (ruleset rejection, exhausted
+      # race retries, ...) there is no versioned release being attempted
+      # this run regardless of should_release -- "Verify Squirrel release
+      # assets exist" and "Publish versioned release" below are both gated
+      # the same way and will not run -- so a `make` hiccup here must stay
+      # tolerable, exactly like the no-release-due case, instead of taking
+      # the rolling build down too.
       - name: Make installer
         run: pnpm make
-        continue-on-error: ${{ steps.release.outputs.should_release != 'true' }}
+        continue-on-error: ${{ steps.bump.outcome != 'success' }}
 
       # if: always() on this and the next two steps -- a release-worthy push
       # whose `make` fails now fails the job (continue-on-error is false
@@ -410,8 +619,14 @@ jobs:
       # the step would abort silently right there, before any of the
       # ::error:: messages below it ever had a chance to print, in exactly
       # the failure case this step exists to report clearly.
+      # Gated on steps.bump.outcome == 'success', not should_release --
+      # should_release only says a release was wanted; steps.bump.outcome
+      # says whether the bump (and its push to main) actually happened. A
+      # push rejected by main's ruleset, or a race that exhausted its
+      # retries, leaves should_release == 'true' with no real bump behind
+      # it, and there is nothing versioned to verify in that case.
       - name: Verify Squirrel release assets exist
-        if: steps.release.outputs.should_release == 'true'
+        if: steps.bump.outcome == 'success'
         shell: bash
         run: |
           set -e
@@ -468,8 +683,11 @@ jobs:
       # upload step failed partway through, that broken, half-published
       # state would be permanent even though the job itself goes red. Upload
       # everything first, then flip it to public in one step at the end.
+      # Same reasoning as "Verify Squirrel release assets exist" above:
+      # gated on the bump having actually succeeded, not merely on a
+      # release having been wanted.
       - name: Publish versioned release
-        if: steps.release.outputs.should_release == 'true'
+        if: steps.bump.outcome == 'success'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -521,9 +739,82 @@ jobs:
       # a v<version> tag on the repo without a matching GitHub release next
       # to it, and the failure stays visible instead of silently leaving a
       # dangling tag around.
+      #
+      # Gated on should_release (a release was wanted at all) AND
+      # steps.bump.outcome != 'success' OR failure() -- not, as it might
+      # look, redundant with steps.bump.outcome == 'success'.
+      #
+      # The first cut of this condition after the continue-on-error
+      # restructure was `failure() && steps.bump.outcome == 'success'`,
+      # reasoned as: "Bump version, commit, and tag" now runs with
+      # continue-on-error: true, so its own failure no longer trips plain
+      # failure() (steps.bump.conclusion is forced to 'success' even when
+      # steps.bump.outcome is 'failure') -- fine, because a failed bump
+      # restores the tree before it ever gets to `git tag`, so there's
+      # nothing to clean up. That reasoning has a hole: it assumed the tag
+      # is created atomically with the rest of the step succeeding, but
+      # `git tag` and its push both run *inside* the same step, before the
+      # step's own exit code is known. A tag push that half-lands --
+      # accepted by the remote but git still exits non-zero (a hook, a
+      # proxy hiccup, the runner being cancelled between the two commands)
+      # -- leaves a real tag on origin while steps.bump.outcome is
+      # 'failure', which the old condition would skip entirely. A stray
+      # `v<version>` tag with no release is worse than it sounds: it
+      # becomes "the most recent v* tag" for the *next* run's "Decide
+      # release" step, which can compute BUMP=none against it and skip a
+      # release that was actually due, with nothing on GitHub or the
+      # updater to show for the version that tag claims.
+      #
+      # So: run whenever a release was wanted and the bump did NOT cleanly
+      # succeed (covers the half-landed-tag case above, belt-and-suspenders
+      # even though "Bump version, commit, and tag" tries to avoid it) OR
+      # something later genuinely failed (covers the original "bump
+      # succeeded, Package/Make/Verify Squirrel/Publish versioned release
+      # failed" case). `!cancelled()` rather than `always()` -- a manually
+      # cancelled run shouldn't have this run a cleanup implying something
+      # was wrong with the release logic itself. The tag-deletion push
+      # itself stays a no-op (falls into its own `|| echo`) whenever there
+      # was no tag to delete, so running this a little more often than
+      # strictly necessary is harmless.
       - name: Clean up unreleased tag on failure
-        if: failure() && steps.release.outputs.should_release == 'true'
+        if: "!cancelled() && steps.release.outputs.should_release == 'true' && (failure() || steps.bump.outcome != 'success')"
         shell: bash
         run: |
           VERSION="${{ steps.release.outputs.version }}"
           git push origin ":refs/tags/v$VERSION" || echo "tag v$VERSION was not pushed, or is already gone"
+
+      # Everything above this point -- including the rolling win-per-app-
+      # audio build and its own prerelease publish -- is now allowed to
+      # succeed even when the versioned release did not happen; that is the
+      # entire point of the continue-on-error / restore_tree restructure on
+      # "Bump version, commit, and tag" (and, for the same reason, on
+      # "Decide release") above. But a release that was due and silently
+      # didn't happen must not be allowed to look like an ordinary green
+      # run, or nobody will notice the ruleset bypass-list gap (or whatever
+      # else broke) until someone goes looking for a release that was never
+      # published. So: fail the job here -- deliberately the very last
+      # step, with `!cancelled()` (not `always()`, so a manually cancelled
+      # run doesn't get an extra misleading "release did not complete"
+      # error alongside the cancellation) so every rolling-build step above
+      # it has already had its chance to run and publish first -- when
+      # either of two things happened:
+      #   - "Decide release" itself failed (steps.release.outcome ==
+      #     'failure'). Its own should_release output was then never
+      #     written at all, so this is checked directly rather than via
+      #     should_release, which would otherwise read as empty/false and
+      #     let the run end green with no release and no explanation.
+      #   - "Decide release" succeeded, did decide a release was due
+      #     (should_release == 'true'), but the bump did not actually
+      #     succeed (steps.bump.outcome != 'success') -- a ruleset
+      #     rejection, an exhausted race, or a half-landed tag push, all
+      #     covered above.
+      - name: Fail the job if a due release did not complete
+        if: "!cancelled() && (steps.release.outcome == 'failure' || (steps.release.outputs.should_release == 'true' && steps.bump.outcome != 'success'))"
+        shell: bash
+        run: |
+          if [ "${{ steps.release.outcome }}" = "failure" ]; then
+            echo "::error::The 'Decide release' step failed, so it's unknown whether a release was even due on this push -- see that step's log above for the actual cause. The rolling win-per-app-audio pre-release was still rebuilt and republished from unbumped source; only the versioned release path is affected."
+          else
+            echo "::error::A ${{ steps.release.outputs.bump }} release (v${{ steps.release.outputs.version }}) was due on this push but did not happen -- see the 'Bump version, commit, and tag' step above for the actual cause. The rolling win-per-app-audio pre-release was still rebuilt and republished from unbumped source; only the versioned release is missing."
+          fi
+          exit 1
