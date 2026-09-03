@@ -139,18 +139,26 @@ ComPtr<WGC::IGraphicsCaptureItem> g_item;
 ComPtr<WGC::IDirect3D11CaptureFramePool> g_framePool;
 ComPtr<WGC::IGraphicsCaptureSession> g_session;
 
-// Rebuilt by EnsurePipeline() whenever the captured window's content size
-// changes (WGC frames can change size mid-session, e.g. the game window is
-// resized or a fullscreen-exclusive toggle happens).
+// Rebuilt by EnsurePipeline() whenever the TEXTURE we actually hold changes
+// size. Deliberately keyed on the texture, not on the window's content size:
+// see EnsurePool below (which owns the frame pool, keyed on content size
+// instead) and the ProcessFrame call site in CaptureThread for why the two
+// are tracked separately and can disagree for up to one frame after a
+// resize.
 ComPtr<ID3D11VideoProcessorEnumerator> g_vpEnum;
 ComPtr<ID3D11VideoProcessor> g_videoProcessor;
 ComPtr<ID3D11Texture2D> g_outputTex;   // D3D11_USAGE_DEFAULT, NV12, VP output target
 ComPtr<ID3D11Texture2D> g_stagingTex;  // D3D11_USAGE_STAGING, CPU-readable copy of the above
 ComPtr<ID3D11VideoProcessorOutputView> g_outputView;
-UINT32 g_srcW = 0;
+UINT32 g_srcW = 0;  // dimensions EnsurePipeline last built the VP/textures for
 UINT32 g_srcH = 0;
 UINT32 g_outW = 0;
 UINT32 g_outH = 0;
+
+// The frame pool's own buffer size, tracked separately from g_srcW/g_srcH --
+// see EnsurePool.
+UINT32 g_poolW = 0;
+UINT32 g_poolH = 0;
 
 void SetError(const char* stage, HRESULT hr) {
   char buf[192];
@@ -172,16 +180,25 @@ HWND HwndFromValue(const Napi::Value& value) {
 }
 
 // ---------------------------------------------------------------------------
-// (Re)build the video processor + output/staging textures for a given source
-// size. Cheap to call every frame (it no-ops when nothing changed); expensive
-// only on the first frame and on a resize.
+// (Re)create the WGC frame pool for a given content size.
+//
+// Split out from EnsurePipeline (below) on purpose: this is keyed on the
+// window's CURRENT content size (what we ask WGC to capture into), while
+// EnsurePipeline is keyed on the dimensions of whatever texture we actually
+// have in hand *right now*. Those two were the same call once, sharing one
+// cached size (g_srcW/g_srcH) -- which is exactly what produced the original
+// bug (see the REJECTED comment at the ProcessFrame call site in
+// CaptureThread): recreating the pool and rebuilding the video processor
+// together, off the frame's ContentSize, while still holding a texture from
+// the *old* pool. Keeping them separate means a resize can update the pool
+// for future frames without ever touching what this frame is blitted with.
 // ---------------------------------------------------------------------------
 
-bool EnsurePipeline(UINT32 srcW, UINT32 srcH) {
-  if (srcW == g_srcW && srcH == g_srcH && g_vpEnum) return true;
+bool EnsurePool(UINT32 w, UINT32 h) {
+  if (w == g_poolW && h == g_poolH && g_framePool) return true;
 
   HRESULT hr;
-  WG::SizeInt32 size{static_cast<INT32>(srcW), static_cast<INT32>(srcH)};
+  WG::SizeInt32 size{static_cast<INT32>(w), static_cast<INT32>(h)};
 
   if (!g_framePool) {
     hr = g_poolStatics2->CreateFreeThreaded(
@@ -200,14 +217,37 @@ bool EnsurePipeline(UINT32 srcW, UINT32 srcH) {
       return false;
     }
   }
+  g_poolW = w;
+  g_poolH = h;
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// (Re)build the video processor + output/staging textures for the size of the
+// texture we are about to blit. Cheap to call every frame (it no-ops when
+// nothing changed, which is every frame between resizes); expensive only on
+// the first frame and right after a resize lands a differently-sized texture.
+// Does NOT touch the frame pool -- see EnsurePool above.
+// ---------------------------------------------------------------------------
+
+bool EnsurePipeline(UINT32 srcW, UINT32 srcH) {
+  if (srcW == g_srcW && srcH == g_srcH && g_vpEnum) return true;
+
+  HRESULT hr;
 
   // Fit-inside scaling: never stretch, always fit the whole source inside the
   // requested bounding box, then round to the nearest even number on each
   // axis -- NV12 requires even dimensions (the chroma plane is subsampled
   // 2x2). A 3440x1440 source targeting a 1920x1080 box is width-constrained
   // (scale = 1920/3440) and lands on 1920x804, not 1920x1080.
-  const double scale = (std::min)(static_cast<double>(g_targetW) / srcW,
-                                   static_cast<double>(g_targetH) / srcH);
+  //
+  // Clamped to 1: without it, a source smaller than the target box (an
+  // 800x600 window against the 1920x1080 target) gets scale > 1 here and is
+  // blown up to fill the box, spending bitrate on invented pixels instead of
+  // the real ones. Fit-inside should only ever shrink.
+  const double scale = (std::min)({static_cast<double>(g_targetW) / srcW,
+                                    static_cast<double>(g_targetH) / srcH,
+                                    1.0});
   UINT32 outW = static_cast<UINT32>(std::lround(srcW * scale));
   UINT32 outH = static_cast<UINT32>(std::lround(srcH * scale));
   if (outW % 2) outW += 1;
@@ -308,6 +348,29 @@ struct FramePayload {
  */
 std::atomic<uint64_t> g_framesRefused{0};
 
+/**
+ * Times the frame pool was actually Create()'d/Recreate()'d for a new content
+ * size this session -- i.e. how many resize events EnsurePool absorbed.
+ *
+ * REJECTED: an earlier version of this fix dropped the current frame instead
+ * of blitting it whenever the texture and content size disagreed (a resize
+ * in flight), and counted *that* here as "frames dropped on resize". It broke
+ * under a continuous resize -- dragging a window edge, or an engine's
+ * fullscreen transition animating over a second -- because contentSize
+ * changes on every poll while the pool is still catching up, so *every* frame
+ * got dropped and this session delivered nothing until FRAME_WATCHDOG_MS (the
+ * JS-side watchdog in screenCapture.ts) killed it: the exact symptom this
+ * module exists to fix, reached by a new route. See the ProcessFrame call
+ * site in CaptureThread for the fix (always blit the texture we hold).
+ *
+ * With nothing ever dropped, this now counts pool-resize events instead --
+ * still useful in the same spot: a session that died with this at zero was a
+ * real capture failure, one that died with this climbing was mid-resize when
+ * it happened (screenCapture.ts's watchdog logs it alongside lastError() for
+ * exactly that distinction).
+ */
+std::atomic<uint64_t> g_poolResizes{0};
+
 void Emit(FramePayload* payload) {
   auto status = g_tsfn.NonBlockingCall(payload, [](Napi::Env env, Napi::Function cb, FramePayload* p) {
     // Copy, and it has to be a copy: Napi::Buffer::New over our own memory
@@ -330,6 +393,7 @@ void Emit(FramePayload* payload) {
     meta.Set("bltMs", Napi::Number::New(env, p->bltMs));
     meta.Set("grabMs", Napi::Number::New(env, p->grabMs));
     meta.Set("refused", Napi::Number::New(env, static_cast<double>(g_framesRefused.load())));
+    meta.Set("poolResizes", Napi::Number::New(env, static_cast<double>(g_poolResizes.load())));
     // Safe before the call: Buffer::Copy above already took its own copy of
     // the pixels, so nothing here outlives this scope. Leaking instead would
     // cost a whole frame (~3MB) every time, ~180MB/s at 60fps.
@@ -346,9 +410,14 @@ void Emit(FramePayload* payload) {
 }
 
 // Scale+convert the given source texture into the shared output texture, read
-// it back, pack it as tight NV12, and deliver it. Returns false only on a
-// hard D3D/WGC failure (frame skips for pacing reasons are handled by the
-// caller and never reach here).
+// it back, pack it as tight NV12, and deliver it. srcW/srcH must be the
+// *texture's own* dimensions (srcTex->GetDesc), not the frame's ContentSize --
+// see the caller in CaptureThread for why those can briefly disagree and what
+// goes wrong if you pass ContentSize here instead. Called for every frame the
+// capture loop decides to process -- there is no resize case that skips this
+// call any more, only the pacing skips upstream of it (the drain loop and the
+// "nothing new since last poll" check). Returns false only on a hard D3D/WGC
+// failure.
 bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH) {
   if (!EnsurePipeline(srcW, srcH)) return false;
 
@@ -506,6 +575,7 @@ void CaptureThread(HWND hwnd) {
       break;
     }
 
+    if (!EnsurePool(static_cast<UINT32>(itemSize.Width), static_cast<UINT32>(itemSize.Height))) break;
     if (!EnsurePipeline(static_cast<UINT32>(itemSize.Width), static_cast<UINT32>(itemSize.Height))) break;
 
     hr = g_framePool->CreateCaptureSession(g_item.Get(), &g_session);
@@ -598,7 +668,78 @@ void CaptureThread(HWND hwnd) {
         continue;
       }
 
-      ProcessFrame(srcTex.Get(), static_cast<UINT32>(contentSize.Width), static_cast<UINT32>(contentSize.Height));
+      // REJECTED #1: passing contentSize.Width/Height straight into
+      // ProcessFrame here, as this originally did. contentSize is the
+      // window's CURRENT content extent per WGC, but srcTex is a frame-pool
+      // texture -- its *actual* dimensions are whatever the pool was last
+      // Recreate()'d to, which lags one frame behind a resize. ProcessFrame
+      // fed its (srcW, srcH) straight into EnsurePipeline (which rebuilt the
+      // video processor for the size WGC just reported) and into srcRect for
+      // VideoProcessorBlt -- so on the frame right after a resize this passed
+      // the NEW size as the source rect while srcTex still held the OLD
+      // pool's texture, and VideoProcessorBlt failed with E_INVALIDARG
+      // (0x80070057) on every single frame until the pool caught up. This is
+      // exactly the failure a racing sim toggling fullscreen/borderless hit
+      // in production, repeatedly, and it is an easy mistake to reintroduce
+      // because contentSize *looks* like the right value to pass -- it is,
+      // just not for a texture that has not been resized to match it yet.
+      //
+      // REJECTED #2: once the above was caught, the fix here dropped this
+      // frame (instead of blitting it) whenever srcTex's own dimensions
+      // disagreed with contentSize, and recreated the pool for the new size
+      // before continuing. That is correct for a *discrete* resize (one
+      // Recreate, no oscillation) but breaks under a *continuous* one --
+      // dragging a window edge, or an engine's fullscreen transition
+      // animating over a second -- where contentSize changes faster than a
+      // Recreate (which itself costs a full enumerator + processor + two
+      // CreateTexture2D calls) can keep up. Every poll during that window
+      // sees a fresh mismatch, so every frame gets dropped and this session
+      // delivers nothing until FRAME_WATCHDOG_MS (screenCapture.ts) kills it
+      // for lack of frames -- the exact symptom this module exists to fix,
+      // reached by a new route.
+      //
+      // The actual fix: there is no correctness reason to drop. srcTex is
+      // valid at its own dimensions regardless of what contentSize says --
+      // on *grow* WGC has cropped the larger window into the smaller
+      // surface (every pixel real, just cropped); on *shrink* the top-left
+      // region matching the new, smaller content is valid and the margin
+      // outside it is 1-2 frames of stale ghost pixels. Both are invisible
+      // at 30fps next to seconds of black. So always blit the texture we
+      // actually hold, sized to itself (srcRect == texture bounds by
+      // construction, matching vpDesc.InputWidth/Height exactly --
+      // E_INVALIDARG from a size mismatch becomes structurally impossible
+      // rather than merely avoided), and use contentSize only to decide,
+      // separately and without blocking this frame, whether the pool needs
+      // recreating for frames still to come. Do NOT try to clamp srcRect to
+      // min(srcDesc, contentSize) to trim the shrink-case ghost margin --
+      // that puts vpDesc.InputWidth/Height out of step with the input view's
+      // actual texture again, which is the exact shape the original bug
+      // lived in.
+      D3D11_TEXTURE2D_DESC srcDesc{};
+      srcTex->GetDesc(&srcDesc);
+      ProcessFrame(srcTex.Get(), srcDesc.Width, srcDesc.Height);
+
+      // Recreate the pool for the window's current content size if it has
+      // drifted from what the pool was last built for. Deliberately after
+      // ProcessFrame and gated on the POOL's own last size (g_poolW/g_poolH),
+      // not on whether it differs from srcDesc -- this frame's texture came
+      // from the pool as it was *before* any Recreate below, so it will
+      // legitimately still show a resize in progress on the very next poll
+      // too; that is expected, not a bug, and is exactly what keeps this
+      // converging (one Recreate per real size change) instead of every
+      // frame re-deciding based on a comparison that's already stale by the
+      // time it runs.
+      if (contentSize.Width != static_cast<INT32>(g_poolW) ||
+          contentSize.Height != static_cast<INT32>(g_poolH)) {
+        g_poolResizes.fetch_add(1, std::memory_order_relaxed);
+        if (!EnsurePool(static_cast<UINT32>(contentSize.Width), static_cast<UINT32>(contentSize.Height))) {
+          // Pool recreation failing mid-session is worse than the 4s the JS
+          // watchdog would otherwise burn waiting for frames that are never
+          // coming: end the capture thread now, the same way !IsWindow(hwnd)
+          // does above, with lastError() already populated by EnsurePool.
+          break;
+        }
+      }
     }
 
     timeEndPeriod(1);
@@ -631,6 +772,7 @@ void CaptureThread(HWND hwnd) {
   g_context.Reset();
   g_device.Reset();
   g_srcW = g_srcH = g_outW = g_outH = 0;
+  g_poolW = g_poolH = 0;
 
   if (roInitialised) RoUninitialize();
 
@@ -744,6 +886,7 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
 
   g_lastError.clear();
   g_srcW = g_srcH = g_outW = g_outH = 0;
+  g_poolW = g_poolH = 0;
   if (g_stopEvent) CloseHandle(g_stopEvent);
   g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
@@ -763,6 +906,7 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
   g_tsfn = Napi::ThreadSafeFunction::New(env, info[4].As<Napi::Function>(), "winCapture", 1, 3);
   // Per-session, so a later share does not inherit an earlier one's count.
   g_framesRefused.store(0);
+  g_poolResizes.store(0);
   g_running.store(true);
   g_thread = std::thread(CaptureThread, hwnd);
   return Napi::Boolean::New(env, true);

@@ -92,6 +92,17 @@ const HEALTHY_SESSION_MS = 10_000;
 /** Consecutive abnormal deaths; see {@link MAX_NATIVE_FAILURES}. */
 let consecutiveFailures = 0;
 
+/**
+ * Why native capture is not currently engaged, for the *page-visible* log
+ * only (app-audio.log already gets the specific reason from the appAudioLog
+ * call next to each assignment below). Cleared by {@link stop} so a reason
+ * from an earlier share never bleeds into a later one that never even
+ * attempts the native path -- e.g. a screen source, or
+ * --window-shares-as-screen, both of which skip {@link startForSource}
+ * entirely. Null while a session is active.
+ */
+let lastFallbackReason: string | null = null;
+
 /** Sane bounds for {@link takeNextRequestedFps}; see its doc comment. */
 const MIN_REQUESTABLE_FPS = 1;
 const MAX_REQUESTABLE_FPS = 120;
@@ -166,6 +177,17 @@ let active: {
    * {@link startWatchdogs} for why we do not tear down over this.
    */
   paused: boolean;
+  /**
+   * Latest counters off the frame metadata (see native/win-capture/index.d.ts),
+   * kept here so the watchdog's death log can report them alongside
+   * lastError() -- see {@link startWatchdogs}. `refused` is JS-side
+   * backpressure; `poolResizes` is how many times the frame pool was
+   * recreated for a content-size change this session. A death with
+   * `poolResizes` climbing was mid-resize when it happened; a death at zero
+   * is a genuine capture failure.
+   */
+  refused: number;
+  poolResizes: number;
 } | null = null;
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -198,8 +220,14 @@ export function isScreenCaptureActive() {
  * share normally, just at the old, slower path.
  */
 export function startForSource(sourceId: string, fps: number): boolean {
+  // Belt and braces on top of stop()'s own clear: every return path below
+  // already sets this to something specific (or to null on success), but
+  // clearing it here too means a future early-return branch that forgets to
+  // set it can never leak a previous, unrelated share's reason instead.
+  lastFallbackReason = null;
   const mod = loadNative();
   if (!mod) {
+    lastFallbackReason = `native module not loaded: ${nativeLoadError}`;
     appAudioLog(
       "screen capture: no native GPU path, falling back to Chromium capture: native module not loaded:",
       nativeLoadError,
@@ -207,6 +235,7 @@ export function startForSource(sourceId: string, fps: number): boolean {
     return false;
   }
   if (!mod.isSupported()) {
+    lastFallbackReason = "OS/GPU reports unsupported";
     appAudioLog(
       "screen capture: no native GPU path, falling back to Chromium capture: OS/GPU reports unsupported",
     );
@@ -217,6 +246,7 @@ export function startForSource(sourceId: string, fps: number): boolean {
   if (!hwnd) {
     // Screen sources have no window handle; this module only ever handles
     // window shares, by design (see the plan's scope boundary).
+    lastFallbackReason = "source is not a window";
     appAudioLog(
       "screen capture: source is not a window, falling back to Chromium capture:",
       sourceId,
@@ -228,6 +258,7 @@ export function startForSource(sourceId: string, fps: number): boolean {
   // that never starts, so stop trying after enough consecutive deaths and let
   // Chromium capture have it. See MAX_NATIVE_FAILURES.
   if (consecutiveFailures >= MAX_NATIVE_FAILURES) {
+    lastFallbackReason = `native path disabled after ${consecutiveFailures} consecutive failures`;
     appAudioLog(
       `screen capture: native path disabled after ${consecutiveFailures} consecutive failures, using Chromium capture; lastError:`,
       mod.lastError(),
@@ -246,6 +277,7 @@ export function startForSource(sourceId: string, fps: number): boolean {
       (frame: Buffer, meta) => onFrame(frame, meta),
     );
     if (!started) {
+      lastFallbackReason = `native start() returned false: ${mod.lastError()}`;
       appAudioLog(
         "screen capture: native start() returned false, falling back to Chromium capture:",
         mod.lastError(),
@@ -253,6 +285,7 @@ export function startForSource(sourceId: string, fps: number): boolean {
       return false;
     }
   } catch (err) {
+    lastFallbackReason = `native start() threw: ${String(err)}`;
     appAudioLog(
       "screen capture: native start() threw, falling back to Chromium capture:",
       String(err),
@@ -262,6 +295,7 @@ export function startForSource(sourceId: string, fps: number): boolean {
     return false;
   }
 
+  lastFallbackReason = null;
   active = {
     sourceId,
     hwnd,
@@ -271,6 +305,8 @@ export function startForSource(sourceId: string, fps: number): boolean {
     lastFrameAt: Date.now(),
     startedAt: Date.now(),
     paused: false,
+    refused: 0,
+    poolResizes: 0,
   };
   appAudioLog(
     `screen capture: native GPU path active for ${sourceId} (hwnd ${hwnd}), target ${CAPTURE_TARGET_WIDTH}x${CAPTURE_TARGET_HEIGHT}@${fps}fps`,
@@ -282,13 +318,22 @@ export function startForSource(sourceId: string, fps: number): boolean {
 
 function onFrame(
   frame: Buffer,
-  meta: { width: number; height: number; bltMs: number; grabMs: number },
+  meta: {
+    width: number;
+    height: number;
+    bltMs: number;
+    grabMs: number;
+    refused: number;
+    poolResizes: number;
+  },
 ) {
   if (!active) return;
   const now = Date.now();
   active.lastFrameAt = now;
   active.width = meta.width;
   active.height = meta.height;
+  active.refused = meta.refused;
+  active.poolResizes = meta.poolResizes;
 
   // Frames have been flowing long enough to call this session good, so
   // whatever failed before it no longer counts against the native path.
@@ -366,11 +411,18 @@ function startWatchdogs() {
       // frames stopped. Count it -- enough of these and we stop using the
       // native path rather than letting it kill the share.
       consecutiveFailures++;
+      // poolResizes climbing says this session was mid-resize when it died --
+      // a discrete or continuous window resize that (correctly) never drops a
+      // frame can still coincide with a death from something else entirely,
+      // so this doesn't prove causation, but a death with poolResizes at 0 is
+      // a real capture failure unrelated to resizing, which is exactly the
+      // distinction app-audio.log needs to tell those apart at a glance.
       appAudioLog(
         "screen capture: no frames for",
         FRAME_WATCHDOG_MS,
         `ms, ending native capture (failure ${consecutiveFailures}/${MAX_NATIVE_FAILURES}); lastError:`,
         mod?.lastError() ?? "(unknown)",
+        `; refused=${active.refused} poolResizes=${active.poolResizes}`,
       );
       stop();
     }
@@ -425,15 +477,54 @@ export function setLiveFps(fps: number): boolean {
   return true;
 }
 
-export function stop() {
-  stopWatchdogs();
-  if (!active) return;
+/**
+ * Reset the consecutive-failure counter kept by {@link MAX_NATIVE_FAILURES}.
+ *
+ * Call this when a *new* share begins -- the user answered the picker, or the
+ * single-source Wayland shortcut fired -- never on the armed-reacquire fast
+ * path in window.ts, which recovers the *same* share rather than starting a
+ * fresh one. Recovery must keep the within-share budget intact, since that is
+ * what stops one pathological window from retrying forever (each retry costs
+ * ~4s of black plus a visible stop/start for viewers); a genuinely new share
+ * deserves a clean slate instead of inheriting a previous window's failures.
+ */
+export function resetNativeFailures() {
+  if (consecutiveFailures > 0) {
+    appAudioLog(
+      `screen capture: new share started, clearing native failure count (was ${consecutiveFailures})`,
+    );
+  }
+  consecutiveFailures = 0;
+}
+
+/** Stops whatever native capture is running, without touching our own
+ *  bookkeeping. Split out of stop() so it can run unconditionally there,
+ *  ahead of the `!active` check -- see stop()'s comment for why. */
+function stopNative() {
   const mod = loadNative();
   try {
     mod?.stop();
   } catch {
     /* already stopped */
   }
+}
+
+export function stop() {
+  stopWatchdogs();
+  // Unconditionally, not `if (active)`. Native stop() is a no-op when nothing
+  // is capturing, so this is free in the common case -- and `active` is not a
+  // trustworthy proxy for "native is idle" (same reasoning as appAudio.ts's
+  // beginCapture): a native session that ever started without `active` being
+  // set would otherwise survive an exported stop() that already cleared it,
+  // leaving every later start() throw "capture already running" for the rest
+  // of the process's life.
+  stopNative();
+  // Scope the fallback reason to the share that is about to start (or that
+  // never even attempts native capture, e.g. a screen source) -- see
+  // lastFallbackReason's doc comment for why this must happen here rather
+  // than only inside startForSource.
+  lastFallbackReason = null;
+  if (!active) return;
   appAudioLog(`screen capture: stopped native capture for ${active.sourceId}`);
   active = null;
   broadcastState();
@@ -456,6 +547,12 @@ function buildState() {
     height: active?.height ?? CAPTURE_TARGET_HEIGHT,
     fps: active?.fps ?? 30,
     supported: isScreenCaptureSupported(),
+    // Why native capture is not engaged for the share the page is asking
+    // about right now, if it isn't -- see lastFallbackReason's doc comment.
+    // The page's own log (appAudioPatch.ts) had no reason at all before this;
+    // app-audio.log always did, from the appAudioLog call next to each
+    // assignment.
+    reason: active ? null : lastFallbackReason,
   };
 }
 

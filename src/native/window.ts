@@ -24,6 +24,7 @@ import {
 import { APP_AUDIO_PATCH } from "./appAudioPatch";
 import { config, getPersistedServer } from "./config";
 import {
+  resetNativeFailures,
   setLiveFps as setScreenCaptureFps,
   startForSource as startScreenCapture,
   stop as stopScreenCapture,
@@ -740,6 +741,11 @@ export function createMainWindow() {
         return;
       }
       if (armed) {
+        // The picker below still runs, and the user still chooses a window
+        // through it -- from resetNativeFailures's point of view that makes
+        // this a new share like any other picker answer, not a continuation
+        // of the stale one, so falling through to the same reset just below
+        // is deliberate, not an accident of where this line happens to sit.
         appAudioLog("re-acquired source went stale; showing the picker");
       }
 
@@ -759,6 +765,26 @@ export function createMainWindow() {
           // Any previous share is over by the time a new one is requested.
           stopAppAudio();
           stopScreenCapture();
+          // Everything past this point is a *new* share, not a recovery of
+          // the one the armed fast path above would have answered -- the
+          // Wayland single-source shortcut and a fresh picker answer both
+          // land here. Reset the native failure budget so a window that
+          // previously tripped it does not disable native capture for a
+          // share that has nothing to do with the one that failed. See
+          // resetNativeFailures's doc comment for why the armed path above
+          // must never do this.
+          //
+          // Placed here, right after stopScreenCapture() rather than
+          // synchronously before this getSources() call: getSources({
+          // fetchWindowIcons: true }) is a visible stall (see the comment on
+          // it above), and stopScreenCapture() -- which stops the *previous*
+          // session's watchdog timers -- does not run until it resolves. A
+          // reset issued before that await would race the old session's own
+          // watchdog: if it was already stalled, it could still fire and
+          // increment consecutiveFailures in that gap, and the new share
+          // would inherit a failure count this reset was meant to have
+          // already cleared.
+          resetNativeFailures();
           appAudioLog("sources offered:", String(sources.length));
 
           // Shortcut for linux wayland.
