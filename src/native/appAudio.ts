@@ -165,6 +165,18 @@ let systemSession: {
   restarts: number;
 } | null = null;
 
+/**
+ * Include-mode bookkeeping, symmetric with `systemSession` above but for the
+ * single-process path. Include capture never restarts in place (no watchdog
+ * for it), so this is simply created alongside `active` and read back in
+ * stop() -- it exists so a window share's audio has *some* telemetry at all;
+ * before this, only system-mix shares emitted a byte rate to compare against.
+ */
+let includeSession: {
+  startedAt: number;
+  bytes: number;
+} | null = null;
+
 /** Last known count of processes actually contributing to the mix. */
 let systemSources = 0;
 /** Names blocked by the blocklist so far this session (deduped), for buildState(). */
@@ -294,6 +306,7 @@ function beginCapture(plan: CapturePlan, sourceId: string): boolean {
   if (plan.mode === "include") {
     try {
       mod.start(plan.pid, true, (chunk: Buffer) => {
+        if (includeSession) includeSession.bytes += chunk.length;
         const win = BrowserWindow.getAllWindows()[0];
         if (!win || win.isDestroyed()) return;
         win.webContents.send(APP_AUDIO_CHUNK, chunk);
@@ -314,6 +327,7 @@ function beginCapture(plan: CapturePlan, sourceId: string): boolean {
       pid: plan.pid,
       attemptStartedAt: Date.now(),
     };
+    includeSession = { startedAt: Date.now(), bytes: 0 };
     log(`capturing include pid ${plan.pid} for ${sourceId}`);
     broadcastState();
     return true;
@@ -579,6 +593,18 @@ export function stop() {
       `system mix receipt for ${active.sourceId}: ${durationS}s, ${systemSession.bytes} bytes, ${systemSources} source(s), ${systemSession.restarts} restart(s)`,
     );
   }
+  // Symmetric with the system-mix receipt above -- gives window shares the
+  // same byte-rate telemetry system-mix shares already had, so a silent or
+  // choppy window share can be checked against system mode's known-good
+  // ~192,000 B/s instead of having no audio telemetry at all.
+  if (active.mode === "include" && includeSession) {
+    const durationS = ((Date.now() - includeSession.startedAt) / 1000).toFixed(
+      1,
+    );
+    log(
+      `include receipt for ${active.sourceId}: ${durationS}s, ${includeSession.bytes} bytes`,
+    );
+  }
   // The include wording is preserved verbatim from before this module grew a
   // second mode, so old logs and any habit of grepping for it still work.
   // System mode gets its own phrasing rather than reusing it: there is no one
@@ -592,6 +618,7 @@ export function stop() {
 
   active = null;
   systemSession = null;
+  includeSession = null;
   systemSources = 0;
   systemBlockedNames = [];
   knownClientPids = new Set();
