@@ -54,6 +54,14 @@ contextBridge.exposeInMainWorld("native", {
       ipcRenderer.on("appAudio:chunk", listener);
       return () => ipcRenderer.removeListener("appAudio:chunk", listener);
     },
+    // Direct observable for the duplicate-subscription mechanism behind the
+    // session-overlap bug: the injected patch logs this alongside every
+    // session it builds. This is read *after* the new session's onChunk has
+    // subscribed and *before* the old session's unsubscribes, so
+    // "chunk listeners=2" is the normal reading on every source change, not a
+    // regression -- do not triage on it. A regression is 2 observed
+    // steady-state (well after a share has settled) or >=3 at build time.
+    listenerCount: () => ipcRenderer.listenerCount("appAudio:chunk"),
   },
 
   // Native GPU-downscaled window capture (Windows). The injected main-world
