@@ -1,12 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
-import {
-  IUpdateInfo,
-  UpdateSourceType,
-  updateElectronApp,
-} from "update-electron-app";
 
-import { BrowserWindow, Notification, app, autoUpdater, shell } from "electron";
+import { BrowserWindow, app, shell } from "electron";
 import started from "electron-squirrel-startup";
 
 import { initAppAudio } from "./native/appAudio";
@@ -14,6 +9,7 @@ import { config } from "./native/config";
 import { initDiscordRpc } from "./native/discordRpc";
 import { initScreenCapture } from "./native/screenCapture";
 import { initTray } from "./native/tray";
+import { initUpdater } from "./native/update";
 import { initVirtualMic } from "./native/virtualMic";
 import { createMainWindow, getBuildUrl, mainWindow } from "./native/window";
 
@@ -94,56 +90,22 @@ if (process.platform === "win32") {
 // ensure only one copy of the application can run
 const acquiredLock = app.requestSingleInstanceLock();
 
-/**
- * Tell the user an update is staged, and let one click apply it.
- *
- * Passing this at all replaces update-electron-app's own notifier, which puts
- * up a modal dialog with Restart Now / Later and calls quitAndInstall() for
- * you. A toast is the right call here -- this app is usually behind a game or
- * a call, and stealing focus to announce an update is worse than the update
- * waiting -- but the toast has to actually *do* something, otherwise the only
- * way to apply an update is to notice a message that has already faded and
- * then quit by hand.
- *
- * Not `silent`: a notification nobody hears, about a thing nobody is looking
- * for, is decoration.
- */
-const onNotifyUser = (_info: IUpdateInfo) => {
-  const notification = new Notification({
-    title: "Update Available",
-    body: "Click here to restart and install the update.",
-  });
-
-  notification.on("click", () => {
-    // Squirrel has already staged the new version by the time this fires
-    // (it is only called from the update-downloaded handler), so this swaps
-    // to it and relaunches. It throws when the app was not installed by
-    // Squirrel -- a portable/zip copy, or `electron-forge start` -- and there
-    // is nothing useful to do about that beyond not crashing the app over a
-    // notification click: those builds have no update to apply in the first
-    // place, and never reach this callback.
-    try {
-      autoUpdater.quitAndInstall();
-    } catch (err) {
-      console.error("[update] quitAndInstall failed:", err);
-    }
-  });
-
-  notification.show();
-};
-
 /** Guards against this module being evaluated more than once. */
 let didInitialise = false;
 
 if (acquiredLock) {
-  // start auto update logic
-  updateElectronApp({
-    updateSource: {
-      type: UpdateSourceType.ElectronPublicUpdateService,
-      repo: "s0ckz/for-desktop",
-    },
-    onNotifyUser,
-  });
+  // start auto update logic -- see native/update.ts for the toast, the tray
+  // fallback, and the diagnostic logging around both.
+  //
+  // NOT covered by `didInitialise` below: that guard lives inside the
+  // `app.on("ready", ...)` callback, and this call is outside it. That's not
+  // a new problem -- the `updateElectronApp()` call this replaced was outside
+  // it too -- but it does mean that if this module is ever evaluated twice
+  // (see the `didInitialise` comment for the confirmed case of that), you get
+  // two updaters, two polling intervals, and two `onNotifyUser` calls per
+  // download. Read a duplicated `update:` line in app-audio.log as a sign of
+  // that, not as Squirrel retrying the download.
+  initUpdater();
 
   // create and configure the app when electron is ready
   app.on("ready", () => {
