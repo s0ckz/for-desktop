@@ -1,7 +1,9 @@
 // Non-Windows builds get a stub so the package installs cleanly everywhere.
 // Windows Graphics Capture has no equivalent outside Windows; other platforms
 // simply never call isSupported() true, so the caller keeps using Chromium's
-// own desktop capture path unconditionally.
+// own desktop capture path unconditionally. start() below never touches the
+// onFrame callback at all -- it always returns false without starting a
+// session, so index.d.ts's null-frame death signal never applies here.
 #include <napi.h>
 
 namespace {

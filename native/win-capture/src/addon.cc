@@ -332,10 +332,15 @@ bool EnsurePipeline(UINT32 srcW, UINT32 srcH) {
 // shrink.
 struct FramePayload {
   std::vector<uint8_t> nv12;
-  UINT32 width;
-  UINT32 height;
-  double bltMs;
-  double grabMs;
+  UINT32 width = 0;
+  UINT32 height = 0;
+  double bltMs = 0;
+  double grabMs = 0;
+  // Set only for the one death-signal payload CaptureThread emits on loop
+  // exit (see its teardown, below) -- frame arrives as null in JS and
+  // `reason` carries lastError() at that moment. See index.d.ts.
+  bool isDeath = false;
+  std::string reason;
 };
 
 /**
@@ -371,40 +376,101 @@ std::atomic<uint64_t> g_framesRefused{0};
  */
 std::atomic<uint64_t> g_poolResizes{0};
 
-void Emit(FramePayload* payload) {
-  auto status = g_tsfn.NonBlockingCall(payload, [](Napi::Env env, Napi::Function cb, FramePayload* p) {
-    // Copy, and it has to be a copy: Napi::Buffer::New over our own memory
-    // (zero-copy, with a finalizer) is the obvious optimisation here -- it
-    // would save a ~3MB memcpy and a fresh 3MB V8 allocation per frame, some
-    // 180MB/s of allocation churn at 60fps -- but **Electron rejects external
-    // buffers outright**. V8's memory-cage/sandbox hardening means every such
-    // call throws `External buffers are not allowed` before the callback
-    // runs, delivering zero frames. Node swallows that exception by default
-    // (it only surfaces as a DEP0168 warning), so it fails silently and looks
-    // like a capture bug rather than an API misuse. Measured directly on
-    // Electron 43.4.0: 0 frames delivered at both 30 and 60fps.
-    //
-    // If this ever needs optimising, the route is a preallocated pool the JS
-    // side reads from, not an external Buffer.
-    auto buffer = Napi::Buffer<uint8_t>::Copy(env, p->nv12.data(), p->nv12.size());
-    auto meta = Napi::Object::New(env);
-    meta.Set("width", Napi::Number::New(env, p->width));
-    meta.Set("height", Napi::Number::New(env, p->height));
-    meta.Set("bltMs", Napi::Number::New(env, p->bltMs));
-    meta.Set("grabMs", Napi::Number::New(env, p->grabMs));
-    meta.Set("refused", Napi::Number::New(env, static_cast<double>(g_framesRefused.load())));
-    meta.Set("poolResizes", Napi::Number::New(env, static_cast<double>(g_poolResizes.load())));
-    // Safe before the call: Buffer::Copy above already took its own copy of
-    // the pixels, so nothing here outlives this scope. Leaking instead would
-    // cost a whole frame (~3MB) every time, ~180MB/s at 60fps.
+// Named (not an inline lambda at the call site) so Emit() below can pass it
+// to more than one NonBlockingCall attempt when retrying a death payload.
+void EmitToJs(Napi::Env env, Napi::Function cb, FramePayload* p) {
+  auto meta = Napi::Object::New(env);
+  meta.Set("refused", Napi::Number::New(env, static_cast<double>(g_framesRefused.load())));
+  meta.Set("poolResizes", Napi::Number::New(env, static_cast<double>(g_poolResizes.load())));
+  if (p->isDeath) {
+    // No pixel buffer for a death signal -- see FramePayload::isDeath.
+    meta.Set("reason", Napi::String::New(env, p->reason));
     delete p;
-    cb.Call({buffer, meta});
-  });
+    cb.Call({env.Null(), meta});
+    return;
+  }
+  // Copy, and it has to be a copy: Napi::Buffer::New over our own memory
+  // (zero-copy, with a finalizer) is the obvious optimisation here -- it
+  // would save a ~3MB memcpy and a fresh 3MB V8 allocation per frame, some
+  // 180MB/s of allocation churn at 60fps -- but **Electron rejects external
+  // buffers outright**. V8's memory-cage/sandbox hardening means every such
+  // call throws `External buffers are not allowed` before the callback
+  // runs, delivering zero frames. Node swallows that exception by default
+  // (it only surfaces as a DEP0168 warning), so it fails silently and looks
+  // like a capture bug rather than an API misuse. Measured directly on
+  // Electron 43.4.0: 0 frames delivered at both 30 and 60fps.
+  //
+  // If this ever needs optimising, the route is a preallocated pool the JS
+  // side reads from, not an external Buffer.
+  auto buffer = Napi::Buffer<uint8_t>::Copy(env, p->nv12.data(), p->nv12.size());
+  meta.Set("width", Napi::Number::New(env, p->width));
+  meta.Set("height", Napi::Number::New(env, p->height));
+  meta.Set("bltMs", Napi::Number::New(env, p->bltMs));
+  meta.Set("grabMs", Napi::Number::New(env, p->grabMs));
+  // Safe before the call: Buffer::Copy above already took its own copy of
+  // the pixels, so nothing here outlives this scope. Leaking instead would
+  // cost a whole frame (~3MB) every time, ~180MB/s at 60fps.
+  delete p;
+  cb.Call({buffer, meta});
+}
+
+/**
+ * Bounded retry for a dropped death payload alone -- see Emit() below for why
+ * a frame drop and a death drop are not the same risk. 10 attempts x 5ms caps
+ * the added delay at ~50ms in the one case where retrying can't help (see
+ * Emit()), which is negligible next to Stop()'s join.
+ */
+constexpr int kDeathRetries = 10;
+constexpr DWORD kDeathRetryDelayMs = 5;
+
+void Emit(FramePayload* payload) {
+  auto status = g_tsfn.NonBlockingCall(payload, EmitToJs);
   // Drop, don't queue: once the queue is full NonBlockingCall fails fast
-  // instead of buffering, and we discard this frame rather than delivering a
-  // stale one late. See the queue size in Start() for why it is not 1.
-  if (status != napi_ok) {
+  // instead of buffering. For an ordinary frame that is correct as-is --
+  // delivering a stale frame late is worse than skipping it. See the queue
+  // size in Start() for why it is not 1.
+  if (status == napi_ok) return;
+  if (!payload->isDeath) {
     g_framesRefused.fetch_add(1, std::memory_order_relaxed);
+    delete payload;
+    return;
+  }
+
+  // The death payload is not a frame: it's the only fatal signal left on the
+  // state-readable path in screenCapture.ts (the old FRAME_WATCHDOG_HARD_LEAK_MS
+  // hard-leak guard was deliberately removed on the assumption that this
+  // signal always lands -- see the REJECTED comment above startWatchdogs
+  // there). Dropping it silently the same way a frame is dropped would leave
+  // a session whose capture thread died, but whose window is still open,
+  // paused forever with nothing to notice. So retry a bounded number of times
+  // instead of giving up on the first full queue.
+  //
+  // Safe in both cases this can fire from:
+  //  - Abnormal death (the case this retry actually exists for): Stop()
+  //    below is NOT joining -- nothing called it -- so the JS thread is free
+  //    to drain the queue and a retry lands almost immediately.
+  //  - Ordinary stop(): Stop() IS blocked in g_thread.join() waiting for
+  //    this very thread, so the JS thread cannot drain and every retry here
+  //    will exhaust. That's moot, not a problem: `active` is already null on
+  //    the JS side by the time Stop() called us, so nothing was waiting on
+  //    this signal anyway. kDeathRetries x kDeathRetryDelayMs bounds how long
+  //    this can add to Stop()'s join to ~50ms worst case -- do not raise it
+  //    into the seconds.
+  //
+  // Must NOT be a BlockingCall: Stop() joins this thread from the main/JS
+  // thread, so a call that blocks waiting for queue space only the JS thread
+  // can drain would deadlock Stop() forever on the ordinary-stop path above.
+  for (int attempt = 0; attempt < kDeathRetries && status != napi_ok; attempt++) {
+    Sleep(kDeathRetryDelayMs);
+    status = g_tsfn.NonBlockingCall(payload, EmitToJs);
+  }
+  if (status != napi_ok) {
+    // Retries exhausted -- record the drop through the normal error channel
+    // instead of losing it silently. Overwrites whatever g_lastError held
+    // (the death payload's own `reason`, already lost with it); still
+    // surfaced through lastError(), e.g. in the FRAME_WATCHDOG_NO_STATE_MS
+    // log line in screenCapture.ts.
+    g_lastError = "death signal dropped: TSFN queue stayed full after retries";
     delete payload;
   }
 }
@@ -744,6 +810,20 @@ void CaptureThread(HWND hwnd) {
 
     timeEndPeriod(1);
   } while (false);
+
+  // Signal exit to JS, once, whatever kind of exit this was -- including an
+  // ordinary JS-driven stop() (g_lastError may be empty, or stale from an
+  // earlier transient hiccup this session survived; the JS side already
+  // discards this signal correctly for a normal stop, since `active` is null
+  // there by the time it arrives). This is what lets screenCapture.ts's
+  // onFrame react immediately instead of waiting out the watchdog. See A3
+  // item 5.
+  {
+    auto* death = new FramePayload();
+    death->isDeath = true;
+    death->reason = g_lastError;
+    Emit(death);
+  }
 
   // Teardown, in reverse order of acquisition. Closing the session/pool
   // (rather than only Releasing them) tells WGC to stop capturing

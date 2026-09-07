@@ -38,21 +38,14 @@ export const CAPTURE_TARGET_HEIGHT = 1080;
 /**
  * How often we check that the captured window still exists.
  *
- * The native module has no way to push "the window is gone" to JS: its
- * capture thread notices internally (`IsWindow(hwnd)` inside the poll loop in
- * src/addon.cc), records `lastError()`, and simply stops calling back --
- * nothing crosses the ThreadSafeFunction to say why. Today, with Chromium
- * owning the pixels, Chromium's own track ends itself when its capturer sees
- * the same thing, and that is what `screenShare:reacquire` in window.ts reacts
- * to. Once we own the pixels instead, that signal is gone unless we
- * synthesize it -- so this module polls, reusing win-app-audio's `windowState`
- * (win-capture exposes no equivalent) since that costs nothing new to wire up.
- *
- * This is a real gap in win-capture, not a design choice: ideally the addon
- * would surface thread-exit (window gone or any other capture failure)
- * through the same onFrame callback or a dedicated one, instead of going
- * silent. Flagging it here rather than leaving the recovery path silently
- * dead until someone notices reacquire stopped working.
+ * The capture thread notices a gone window internally (`IsWindow(hwnd)`
+ * inside the poll loop in src/addon.cc) and exits, and {@link onFrame}'s
+ * null-frame branch now hears about that exit directly (A3 item 5). But
+ * Chromium's own capturer -- what for-web's `screenShare:reacquire` actually
+ * reacts to -- has no idea any of this happened, since it never owned these
+ * pixels to begin with. So this module still polls, reusing win-app-audio's
+ * `windowState` (win-capture exposes no equivalent) to detect the same
+ * condition on a signal Chromium's side can act on.
  */
 const WINDOW_POLL_MS = 1000;
 /**
@@ -296,6 +289,15 @@ let active: {
    */
   refused: number;
   poolResizes: number;
+  /**
+   * Identifies which request started this session. Assigned by window.ts at
+   * the top of each display-media request, before any `await` -- so two
+   * requests racing through the async chain in `respondToDisplayMedia` still
+   * get IDs in true arrival order, letting {@link stop} and {@link onFrame}
+   * refuse to act on a session that has since been superseded. See item 4 of
+   * the A3 plan.
+   */
+  sessionId: number;
 } | null = null;
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -326,8 +328,16 @@ export function isScreenCaptureActive() {
  * appAudio.startForSource's degrade-quietly contract: on false, the caller
  * keeps Chromium's own capture running untouched, video (and audio) still
  * share normally, just at the old, slower path.
+ * @param sessionId Identity of the request starting this session -- see
+ *   {@link active}'s doc comment. Threaded into the pre-start `stop()` call
+ *   below and stamped onto `active` so a later stale caller can never affect
+ *   this session once it exists.
  */
-export function startForSource(sourceId: string, fps: number): boolean {
+export function startForSource(
+  sourceId: string,
+  fps: number,
+  sessionId: number,
+): boolean {
   // Belt and braces on top of stop()'s own clear: every return path below
   // already sets this to something specific (or to null on success), but
   // clearing it here too means a future early-return branch that forgets to
@@ -376,9 +386,13 @@ export function startForSource(sourceId: string, fps: number): boolean {
 
   // "superseded", not the "stopped" default: whatever was running before
   // this attempt is being replaced by it, not user/page-stopped. See
-  // StopReason's doc comment. If the attempt below fails to actually start,
+  // StopReason's doc comment. Passing sessionId means this is a no-op
+  // instead if a still-newer request already replaced whatever we think
+  // we're superseding (item 4) -- the mod.start() below then fails with
+  // "capture already running" and falls back to Chromium capture, same as
+  // any other start failure. If the attempt below fails to actually start,
   // the `!started`/catch branches undo this -- see their comments.
-  stop("superseded");
+  stop("superseded", sessionId);
 
   try {
     const started = mod.start(
@@ -386,7 +400,7 @@ export function startForSource(sourceId: string, fps: number): boolean {
       CAPTURE_TARGET_WIDTH,
       CAPTURE_TARGET_HEIGHT,
       fps,
-      (frame: Buffer, meta) => onFrame(frame, meta),
+      (frame, meta) => onFrame(frame, meta, sessionId),
     );
     if (!started) {
       lastFallbackReason = `native start() returned false: ${mod.lastError()}`;
@@ -432,6 +446,7 @@ export function startForSource(sourceId: string, fps: number): boolean {
     stateReadable: true,
     refused: 0,
     poolResizes: 0,
+    sessionId,
   };
   appAudioLog(
     `screen capture: native GPU path active for ${sourceId} (hwnd ${hwnd}), target ${CAPTURE_TARGET_WIDTH}x${CAPTURE_TARGET_HEIGHT}@${fps}fps`,
@@ -441,25 +456,58 @@ export function startForSource(sourceId: string, fps: number): boolean {
   return true;
 }
 
+/** Meta for a live frame -- see native/win-capture/index.d.ts's `start()`. */
+type LiveFrameMeta = {
+  width: number;
+  height: number;
+  bltMs: number;
+  grabMs: number;
+  refused: number;
+  poolResizes: number;
+};
+
+/** Meta for the one death-signal call on capture-thread exit (`frame` null)
+ *  -- no width/height/bltMs/grabMs, see index.d.ts. */
+type DeathFrameMeta = { refused: number; poolResizes: number; reason: string };
+
 function onFrame(
-  frame: Buffer,
-  meta: {
-    width: number;
-    height: number;
-    bltMs: number;
-    grabMs: number;
-    refused: number;
-    poolResizes: number;
-  },
+  frame: Buffer | null,
+  meta: LiveFrameMeta | DeathFrameMeta,
+  sessionId: number,
 ) {
   if (!active) return;
+  if (frame === null) {
+    // The capture thread exited -- addon.cc invokes the TSFN once more on
+    // loop exit with a null frame and lastError() as `reason`, so death no
+    // longer has to be inferred from a frame drought (item 5). sessionId
+    // scopes this to the session that actually died: stop() itself also
+    // checks it, so a dead thread's signal, queued before a newer session
+    // replaced this one, can never end the wrong session -- see item 4 and
+    // StopReason's doc comment.
+    //
+    // Asserted, not narrowed: TS can't tie `meta`'s type to the `frame ===
+    // null` check above on its own (they're separate parameters) -- but
+    // index.d.ts's two call signatures guarantee this shape whenever `frame`
+    // is null, so this is exactly the case the union type exists to catch if
+    // it were ever violated at the one call site (startForSource, above).
+    const death = meta as DeathFrameMeta;
+    appAudioLog(
+      "screen capture: native capture thread exited:",
+      death.reason || "(no reason given)",
+      `; refused=${death.refused} poolResizes=${death.poolResizes}`,
+    );
+    stop("capture-error", sessionId);
+    return;
+  }
+  // Same reasoning as the death branch above, mirrored for the live case.
+  const live = meta as LiveFrameMeta;
   const now = Date.now();
   const wasPaused = active.paused;
   active.lastFrameAt = now;
-  active.width = meta.width;
-  active.height = meta.height;
-  active.refused = meta.refused;
-  active.poolResizes = meta.poolResizes;
+  active.width = live.width;
+  active.height = live.height;
+  active.refused = live.refused;
+  active.poolResizes = live.poolResizes;
 
   // One-shot, alongside the lastFrameAt update above: the frame watchdog in
   // {@link startWatchdogs} is the only thing that sets `paused`, this is the
@@ -482,8 +530,8 @@ function onFrame(
   const win = BrowserWindow.getAllWindows()[0];
   if (!win || win.isDestroyed()) return;
   win.webContents.send(SCREEN_CAPTURE_FRAME, frame, {
-    width: meta.width,
-    height: meta.height,
+    width: live.width,
+    height: live.height,
   });
 }
 
@@ -530,10 +578,10 @@ function onFrame(
  * So `lastError()` is called ONLY as diagnostic context appended to the log
  * line of the one path that actually stops the session below
  * (FRAME_WATCHDOG_NO_STATE_MS) -- exactly how the pre-this-PR code used it.
- * The correct fatal signal does not exist yet: PR A3 item 5 has the addon
- * invoke the ThreadSafeFunction once on loop exit with a null frame and a
- * reason, and once that lands, `stop("capture-error")` on that path should
- * be driven by that callback instead of by this timeout guessing.
+ * The real fatal signal now exists (A3 item 5): addon.cc invokes the
+ * ThreadSafeFunction once more on loop exit with a null frame and lastError()
+ * as `reason`, and {@link onFrame}'s null-frame branch drives
+ * `stop("capture-error")` from that instead of from any timeout.
  */
 /**
  * REJECTED: a second, longer timeout on the state-readable path (there used
@@ -547,9 +595,9 @@ function onFrame(
  * track frozen instead of `ended`, so for-web never recovers -- permanently
  * frozen, no path back. No unbounded leak to guard against either: the poll
  * ends the session the instant the window closes (`state.exists === false`
- * above). The genuine "capture thread died" signal does not exist yet (A3
- * item 5 above); that, not a clock, should drive `stop("capture-error")`
- * here once it lands.
+ * above). The genuine "capture thread died" signal now exists ({@link
+ * onFrame}'s null-frame branch, A3 item 5) and drives `stop("capture-error")`
+ * on this path instead of any clock.
  */
 function startWatchdogs() {
   stopWatchdogs();
@@ -732,8 +780,19 @@ function stopNative() {
  * @param reason Why -- see {@link StopReason}'s doc comment. Defaults to the
  *   ordinary "stopped" (a user- or page-driven end); every call site that
  *   ends a session for a more specific reason passes one explicitly.
+ * @param sessionId When given, this call only takes effect against the
+ *   session it names (or an older one) -- see {@link active}'s doc comment.
+ *   A caller whose own request has since been superseded by a newer one
+ *   passes its own (now stale) id and is turned into a no-op here rather
+ *   than tearing down a session it doesn't own (item 4). Omitted entirely by
+ *   callers that mean "stop whatever is active right now, unconditionally"
+ *   (the page's own `screenCapture:stop`, the window-gone poll, ...).
  */
-export function stop(reason: StopReason = "stopped") {
+export function stop(reason: StopReason = "stopped", sessionId?: number) {
+  if (sessionId !== undefined && active && sessionId < active.sessionId) {
+    appAudioLog(`screen capture: stop ignored: stale session ${sessionId}`);
+    return;
+  }
   stopWatchdogs();
   // Unconditionally, not `if (active)`. Native stop() is a no-op when nothing
   // is capturing, so this is free in the common case -- and `active` is not a
@@ -796,6 +855,8 @@ function buildState() {
     // from `reason` just above (see StopReason's doc comment for the split).
     // Null while a session is active.
     stopReason: active ? null : stopReason,
+    // Diagnostic only -- see active's doc comment (item 4).
+    sessionId: active?.sessionId ?? 0,
   };
 }
 

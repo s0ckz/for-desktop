@@ -152,6 +152,13 @@ let active: {
    * screenCapture.ts's HEALTHY_SESSION_MS.
    */
   attemptStartedAt: number;
+  /**
+   * Identity of the request that started this session -- mirrors
+   * screenCapture.ts's `active.sessionId` (A3 item 4). Preserved, not
+   * reassigned, across an in-place watchdog restart (`handleSystemStall`),
+   * since that is still the same logical session.
+   */
+  sessionId: number;
 } | null = null;
 
 /**
@@ -289,8 +296,15 @@ function stopNative() {
  * bookkeeping lives in exactly one place. The include path's behaviour and
  * log wording are unchanged from before this generalisation, so old logs
  * still grep.
+ * @param sessionId Stamped onto `active` -- see its doc comment. Callers
+ *   restarting the *same* session in place (handleSystemStall) pass the
+ *   existing id back; a genuinely new share passes a fresh one.
  */
-function beginCapture(plan: CapturePlan, sourceId: string): boolean {
+function beginCapture(
+  plan: CapturePlan,
+  sourceId: string,
+  sessionId: number,
+): boolean {
   const mod = loadNative();
   if (!mod) return false;
 
@@ -326,6 +340,7 @@ function beginCapture(plan: CapturePlan, sourceId: string): boolean {
       mode: "include",
       pid: plan.pid,
       attemptStartedAt: Date.now(),
+      sessionId,
     };
     includeSession = { startedAt: Date.now(), bytes: 0 };
     log(`capturing include pid ${plan.pid} for ${sourceId}`);
@@ -347,7 +362,13 @@ function beginCapture(plan: CapturePlan, sourceId: string): boolean {
     return false;
   }
 
-  active = { sourceId, mode: "system", pid: 0, attemptStartedAt: Date.now() };
+  active = {
+    sourceId,
+    mode: "system",
+    pid: 0,
+    attemptStartedAt: Date.now(),
+    sessionId,
+  };
   // Only a genuinely new share (systemSession still null, because stop()
   // cleared it) resets the failure budget and the running totals -- an
   // in-place watchdog restart must preserve both, or the receipt in stop()
@@ -444,6 +465,7 @@ function tickSystemWatchdog() {
 function handleSystemStall() {
   if (!active || active.mode !== "system") return;
   const sourceId = active.sourceId;
+  const sessionId = active.sessionId;
   consecutiveSystemFailures++;
   log(
     `system mix stalled: no chunks for over ${SYSTEM_STALL_MS}ms (failure ${consecutiveSystemFailures}/${MAX_SYSTEM_FAILURES})`,
@@ -459,7 +481,7 @@ function handleSystemStall() {
 
   log("system mix: attempting an in-place restart");
   if (systemSession) systemSession.restarts++;
-  const restarted = beginCapture({ mode: "system" }, sourceId);
+  const restarted = beginCapture({ mode: "system" }, sourceId, sessionId);
   if (!restarted) {
     log("system mix: restart failed to start at all, giving up");
     stop();
@@ -531,8 +553,11 @@ function checkSystemMembership() {
 /**
  * Try to start per-application capture for a desktopCapturer source.
  * Returns true only when audio is actually flowing from that process.
+ * @param sessionId Identity of the request starting this session -- see
+ *   `active`'s doc comment and screenCapture.ts's identical parameter for
+ *   why (A3 item 4).
  */
-export function startForSource(sourceId: string): boolean {
+export function startForSource(sourceId: string, sessionId: number): boolean {
   const mod = loadNative();
   if (!mod) {
     log("no per-app capture: native module not loaded:", nativeLoadError);
@@ -543,6 +568,11 @@ export function startForSource(sourceId: string): boolean {
     return false;
   }
 
+  // Clear whatever was running before this attempt -- a no-op if a still
+  // newer session has already taken over, mirroring screenCapture.ts's
+  // identical pre-start guard.
+  stop(sessionId);
+
   const handle = windowHandleFromSourceId(sourceId);
 
   // Whole-screen share: there is no single app to capture, so mix every
@@ -552,7 +582,7 @@ export function startForSource(sourceId: string): boolean {
     log(
       "whole-screen share: mixing every audible process except the blocklist",
     );
-    return beginCapture({ mode: "system" }, sourceId);
+    return beginCapture({ mode: "system" }, sourceId, sessionId);
   }
 
   // A window share must never be widened to the system mix: that is how the
@@ -570,7 +600,7 @@ export function startForSource(sourceId: string): boolean {
 
   // Include the process *tree*: browsers and Electron apps render audio from
   // a child process, so targeting the visible window's pid alone is silent.
-  if (!beginCapture({ mode: "include", pid }, sourceId)) {
+  if (!beginCapture({ mode: "include", pid }, sourceId, sessionId)) {
     log(
       `window share: include capture failed for pid ${pid} - no audio for this share`,
     );
@@ -580,7 +610,19 @@ export function startForSource(sourceId: string): boolean {
   return true;
 }
 
-export function stop() {
+/**
+ * Ends whatever per-app/system-mix audio capture is running, if any.
+ * @param sessionId When given, this call only takes effect against the
+ *   session it names (or an older one) -- see `active`'s doc comment.
+ *   Omitted by callers that mean "stop whatever is active right now,
+ *   unconditionally" (the page's own `appAudio:stop`). Mirrors
+ *   screenCapture.ts's `stop()` (A3 item 4).
+ */
+export function stop(sessionId?: number) {
+  if (sessionId !== undefined && active && sessionId < active.sessionId) {
+    log(`stop ignored: stale session ${sessionId}`);
+    return;
+  }
   stopSystemWatchdog();
   if (!active) return;
   stopNative();
@@ -649,6 +691,8 @@ function buildState() {
     // `sampleRate` (see appAudioPatch.ts), nothing here is load-bearing.
     sources: active?.mode === "system" ? systemSources : active ? 1 : 0,
     blocked: active?.mode === "system" ? systemBlockedNames.slice() : [],
+    // Diagnostic only -- see active's doc comment (item 4).
+    sessionId: active?.sessionId ?? 0,
   };
 }
 

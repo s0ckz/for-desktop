@@ -145,6 +145,142 @@ const REACQUIRE_TIMEOUT_MS = 90 * 1000;
 const ARMED_TTL_MS = 3_000;
 
 /**
+ * Identifies one display-media request, assigned at the very top of the
+ * handler below, before any `await`. Threaded through to
+ * `stopScreenCapture`/`stopAppAudio` and into `startForSource` in both
+ * native modules so a request that gets delayed by an await (e.g.
+ * `--window-shares-as-screen`'s screen lookup) and resumes after a later,
+ * faster request has already started can never stop or clobber that newer
+ * session -- both modules' `stop()` refuse a stale id instead. See A3 item 4.
+ */
+let nextRequestId = 0;
+
+/**
+ * Wrap Electron's display-media callback so it can be answered at most once,
+ * from whichever of several paths gets there first (a direct answer, a
+ * picker response, a supersede, a leak-guard timeout, or an error fallback)
+ * without each of them having to coordinate with the others. Electron throws
+ * if the callback runs after the request is already gone (e.g. the renderer
+ * reloaded mid-picker); every path here gets that for free instead of
+ * needing its own try/catch. See A3 item 1.
+ */
+function answerOnce(callback: DisplayMediaCallback) {
+  let answered = false;
+  const guard = (respond: () => void) => {
+    if (answered) return;
+    answered = true;
+    try {
+      respond();
+    } catch (err) {
+      appAudioLog(
+        "display media: callback threw answering request (request likely already gone):",
+        String(err),
+      );
+    }
+  };
+  return {
+    answer: (streams: Electron.Streams) => guard(() => callback(streams)),
+    // Electron's typings insist on an argument, but the documented way to
+    // cancel is calling back with none: that is what turns into a clean
+    // NotAllowedError in the renderer instead of an unexpected rejection.
+    cancel: () => guard(() => (callback as unknown as () => void)()),
+  };
+}
+
+type PendingPicker = {
+  id: number;
+  sources: Electron.DesktopCapturerSource[];
+  /** idx < 0 (or out of range) cancels; otherwise answers with sources[idx]. */
+  answer: (idx: number, audio: boolean) => void;
+  timer: ReturnType<typeof setTimeout>;
+};
+
+/**
+ * The picker currently awaiting the renderer's `screenPickerCallback`, if
+ * any. Backs a single `ipcMain.on` handler registered once in
+ * `createMainWindow`, replacing the old `ipcMain.once` registered fresh per
+ * request -- which stacked across overlapping requests and could answer the
+ * wrong one. See A3 item 3.
+ */
+let pendingPicker: PendingPicker | null = null;
+let nextPickerId = 0;
+
+/**
+ * Backstop for a picker that never gets a renderer response at all (a crash,
+ * or a reload that drops the IPC round-trip entirely) -- `did-finish-load`,
+ * `render-process-gone` and window `closed` already cover the ordinary ways
+ * that happens, so this is only for whatever those don't catch.
+ */
+const PICKER_LEAK_GUARD_MS = 10 * 60 * 1000;
+
+/**
+ * Supersede whatever picker is currently pending, answering it with a cancel
+ * so the renderer gets a clean NotAllowedError instead of a request that
+ * never resolves. Safe to call when nothing is pending.
+ */
+function cancelPendingPicker(reason: string) {
+  // Captured into a local first, not narrowed-and-reused: `pendingPicker` is
+  // reassigned inside closures elsewhere in this module, so TS cannot narrow
+  // it across the appAudioLog() call below and neither can we rely on it.
+  const picker = pendingPicker;
+  if (!picker) return;
+  appAudioLog("screen picker: cancelling pending request:", reason);
+  picker.answer(-1, false);
+}
+
+/**
+ * Arm the picker for one request: supersedes into `pendingPicker`, wires the
+ * leak-guard timer, and dispatches the renderer's eventual response (or a
+ * supersede/timeout) through `respondToDisplayMedia`.
+ */
+function registerPendingPicker(
+  sources: Electron.DesktopCapturerSource[],
+  respond: (streams: Electron.Streams) => void,
+  cancelRequest: () => void,
+  requestId: number,
+) {
+  const id = ++nextPickerId;
+  const timer = setTimeout(() => {
+    const picker = pendingPicker;
+    if (!picker || picker.id !== id) return;
+    appAudioLog(
+      "screen picker: leak guard fired after",
+      PICKER_LEAK_GUARD_MS,
+      "ms with no response; cancelling",
+    );
+    picker.answer(-1, false);
+  }, PICKER_LEAK_GUARD_MS);
+
+  pendingPicker = {
+    id,
+    sources,
+    answer: (idx, audio) => {
+      clearTimeout(timer);
+      pendingPicker = null;
+      if (idx < 0 || idx >= sources.length) {
+        // Electron's typings insist on an argument, but the documented way
+        // to cancel is calling back with none -- that is what turns into a
+        // clean NotAllowedError in the renderer instead of an unexpected
+        // rejection.
+        lastShare = null;
+        cancelRequest();
+        return;
+      }
+      void respondToDisplayMedia(sources[idx], audio, respond, requestId).catch(
+        (err) => {
+          appAudioLog(
+            "respondToDisplayMedia failed, answering with video-only fallback:",
+            String(err),
+          );
+          respond({ video: sources[idx] });
+        },
+      );
+    },
+    timer,
+  };
+}
+
+/**
  * `--capture-fps=N` caps the frame rate the page may ask for. WGC brokers each
  * frame through CaptureService, so the rate is a direct lever on how hard that
  * service is driven -- and this fork raised the requested rate when it removed
@@ -183,7 +319,8 @@ function captureFpsCap(): number | null {
 async function respondToDisplayMedia(
   source: Electron.DesktopCapturerSource,
   audio: boolean,
-  callback: DisplayMediaCallback,
+  answer: (streams: Electron.Streams) => void,
+  sessionId: number,
 ) {
   const isWindow = source.id.startsWith("window:");
   lastShare = {
@@ -235,7 +372,7 @@ async function respondToDisplayMedia(
     const requestedFps = takeNextRequestedFps() ?? 30;
     const fpsCap = captureFpsCap();
     const fps = fpsCap !== null ? Math.min(requestedFps, fpsCap) : requestedFps;
-    if (startScreenCapture(source.id, fps)) {
+    if (startScreenCapture(source.id, fps, sessionId)) {
       appAudioLog(
         "video path: native GPU capture (WGC + VideoProcessorBlt) for",
         source.id,
@@ -257,7 +394,7 @@ async function respondToDisplayMedia(
 
   if (!audio || app.commandLine.hasSwitch("no-per-app-audio")) {
     appAudioLog("sharing", videoSource.id, "without audio");
-    callback({ video: videoSource });
+    answer({ video: videoSource });
     return;
   }
   // For a screen source this calls into startSystemExcluding(), which blocks
@@ -269,11 +406,11 @@ async function respondToDisplayMedia(
   // at 5s, but the cap is a backstop for an activation that hangs, not a
   // figure this approaches -- a freeze here would be user-visible, so
   // re-measure before assuming it is still cheap.
-  if (startForSource(source.id)) {
+  if (startForSource(source.id, sessionId)) {
     // Audio arrives out-of-band and is stitched in by the renderer; asking
     // Chromium for loopback too would double up the sound.
     appAudioLog("sharing", videoSource.id, "with per-app audio");
-    callback({ video: videoSource });
+    answer({ video: videoSource });
     return;
   }
   if (isWindow) {
@@ -282,7 +419,7 @@ async function respondToDisplayMedia(
       source.id,
       "- sharing video only rather than the whole system mix",
     );
-    callback({ video: videoSource });
+    answer({ video: videoSource });
     return;
   }
   // Screen share, and appAudio's system-mix capture didn't come up (native
@@ -302,13 +439,13 @@ async function respondToDisplayMedia(
       "(it would rebroadcast any voice call the sharer is on) - sharing video only;",
       "pass --allow-system-audio-mix to opt into the raw system mix instead",
     );
-    callback({ video: videoSource });
+    answer({ video: videoSource });
     return;
   }
   appAudioLog(
     "screen share falling back to Chromium loopback (whole system mix)",
   );
-  callback({ video: videoSource, audio: "loopback" });
+  answer({ video: videoSource, audio: "loopback" });
 }
 
 /**
@@ -546,11 +683,14 @@ export function createMainWindow() {
       details.reason,
       `exitCode=${details.exitCode}`,
     );
+    console.error("RENDERER CRASHED:", details.reason, details.exitCode);
+    cancelPendingPicker("renderer process gone");
   });
 
-  mainWindow.webContents.on("unresponsive", () =>
-    appAudioLog("renderer became unresponsive"),
-  );
+  mainWindow.webContents.on("unresponsive", () => {
+    appAudioLog("renderer became unresponsive");
+    console.error("WINDOW UNRESPONSIVE");
+  });
 
   mainWindow.webContents.on("preload-error", (_event, preloadPath, error) =>
     appAudioLog("preload failed:", preloadPath, String(error)),
@@ -570,6 +710,9 @@ export function createMainWindow() {
   // into its main world on every load (contextIsolation keeps the preload out).
   mainWindow.webContents.on("did-finish-load", () => {
     appAudioLog("page loaded:", mainWindow.webContents.getURL());
+    // The picker lived in the page that just went away; whatever answer it
+    // would have sent can never arrive now.
+    cancelPendingPicker("page reloaded");
     const prelude =
       "window.__stoatCaptureFps = " + JSON.stringify(captureFpsCap()) + ";\n";
     mainWindow.webContents
@@ -611,6 +754,11 @@ export function createMainWindow() {
       mainWindow.hide();
     }
   });
+
+  // Unlike "close" above, this fires only once the window is actually gone
+  // (never on a minimise-to-tray hide), so a picker waiting on it truly has
+  // no answer coming.
+  mainWindow.on("closed", () => cancelPendingPicker("window closed"));
 
   // update tray menu when window is shown/hidden
   mainWindow.on("show", updateTrayMenu);
@@ -661,16 +809,6 @@ export function createMainWindow() {
 
   // send the config
   mainWindow.webContents.on("did-finish-load", () => config.sync());
-
-  // Log renderer crashes to terminal
-  mainWindow.webContents.on("render-process-gone", (_, details) => {
-    console.error("RENDERER CRASHED:", details.reason, details.exitCode);
-  });
-
-  // Log unresponsive events
-  mainWindow.on("unresponsive", () => {
-    console.error("WINDOW UNRESPONSIVE");
-  });
 
   // configure spellchecker context menu
   mainWindow.webContents.on("context-menu", (_, params) => {
@@ -725,25 +863,42 @@ export function createMainWindow() {
         String(request.audioRequested),
       );
 
+      const requestId = ++nextRequestId;
+      const { answer, cancel } = answerOnce(callback);
+
+      // Anything the user starts by hand ends whatever else was already
+      // waiting on an answer -- a picker still showing from an earlier
+      // request gets a clean NotAllowedError instead of being left to
+      // answer whichever request happens to still be listening. See item 3.
+      cancelPendingPicker("superseded by a new display media request");
+
       // A re-acquire that already found the window answers straight away, so
       // the recovered share does not make the user pick it again.
       const armed = armedShare;
       armedShare = null;
       if (armed && Date.now() - armed.at < ARMED_TTL_MS) {
         appAudioLog("answering with re-acquired source", armed.source.id);
-        stopAppAudio();
+        stopAppAudio(requestId);
         // "superseded", not the "stopped" default: this ends the previous
         // native session because a new one (the re-acquired source) is about
         // to replace it, not because the user asked to stop sharing. The
         // companion for-web PR keys its recovery-budget accounting off this
         // field, and a supersede must not look like a user stop -- see
-        // StopReason's doc comment in screenCapture.ts.
-        stopScreenCapture("superseded");
+        // StopReason's doc comment in screenCapture.ts. requestId scopes it
+        // to sessions older than this one -- see item 4.
+        stopScreenCapture("superseded", requestId);
         void respondToDisplayMedia(
           armed.source,
           armed.audio && request.audioRequested,
-          callback,
-        );
+          answer,
+          requestId,
+        ).catch((err) => {
+          appAudioLog(
+            "respondToDisplayMedia failed, answering with video-only fallback:",
+            String(err),
+          );
+          answer({ video: armed.source });
+        });
         return;
       }
       if (armed) {
@@ -769,10 +924,10 @@ export function createMainWindow() {
         })
         .then((sources) => {
           // Any previous share is over by the time a new one is requested.
-          stopAppAudio();
+          stopAppAudio(requestId);
           // "superseded", not "stopped" -- see the comment on the other
           // stopScreenCapture() call above.
-          stopScreenCapture("superseded");
+          stopScreenCapture("superseded", requestId);
           // Everything past this point is a *new* share, not a recovery of
           // the one the armed fast path above would have answered -- the
           // Wayland single-source shortcut and a fresh picker answer both
@@ -800,34 +955,18 @@ export function createMainWindow() {
             void respondToDisplayMedia(
               sources[0],
               request.audioRequested,
-              callback,
-            );
+              answer,
+              requestId,
+            ).catch((err) => {
+              appAudioLog(
+                "respondToDisplayMedia failed, answering with video-only fallback:",
+                String(err),
+              );
+              answer({ video: sources[0] });
+            });
             return;
           }
-          ipcMain.once(
-            "screenPickerCallback",
-            (_, idx: number, audio: boolean) => {
-              appAudioLog(
-                "picker chose index",
-                String(idx),
-                "audio =",
-                String(audio),
-                idx >= 0 && idx < sources.length
-                  ? sources[idx].id
-                  : "(out of range)",
-              );
-              if (idx < 0 || idx >= sources.length) {
-                // Electron's typings insist on an argument, but the documented
-                // way to cancel is calling back with none: that is what turns
-                // into a clean NotAllowedError in the renderer instead of an
-                // unexpected rejection.
-                lastShare = null;
-                (callback as unknown as () => void)();
-              } else {
-                void respondToDisplayMedia(sources[idx], audio, callback);
-              }
-            },
-          );
+          registerPendingPicker(sources, answer, cancel, requestId);
           mainWindow.webContents.send(
             "screenPicker",
             sources.map((source, idx) => {
@@ -847,10 +986,39 @@ export function createMainWindow() {
               };
             }),
           );
+        })
+        .catch((err) => {
+          // No sources means no picker to show and no source to answer
+          // with -- cancel rather than leave the request hanging. See item 2.
+          appAudioLog(
+            "could not list sources for display media request:",
+            String(err),
+          );
+          cancel();
         });
     },
     { useSystemPicker: true },
   );
+
+  // A single handler for the whole app's life, dispatching to whichever
+  // picker is currently pending -- see `pendingPicker`'s doc comment (item 3).
+  ipcMain.on("screenPickerCallback", (_event, idx: number, audio: boolean) => {
+    const picker = pendingPicker;
+    if (!picker) {
+      appAudioLog("screen picker: response with no pending request; ignoring");
+      return;
+    }
+    appAudioLog(
+      "picker chose index",
+      String(idx),
+      "audio =",
+      String(audio),
+      idx >= 0 && idx < picker.sources.length
+        ? picker.sources[idx].id
+        : "(out of range)",
+    );
+    picker.answer(idx, audio);
+  });
 
   // push world events to the window
   ipcMain.on("minimise", () => mainWindow.minimize());
