@@ -1010,10 +1010,30 @@ bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH, double time
 // anything real.
 // ---------------------------------------------------------------------------
 
+// This handler MUST be agile. The frame pool it subscribes to (created above
+// via CreateFreeThreaded) is itself free-threaded, and a free-threaded
+// source is entitled to raise FrameArrived on whatever thread pool thread it
+// pleases -- never guaranteed to be the thread that called add_FrameArrived.
+// WinRT enforces that guarantee at subscription time, not delivery time: the
+// free-threaded frame pool's add_FrameArrived calls QueryInterface for
+// IAgileObject on the handler it's given, and if that fails, refuses the
+// subscription outright with RO_E_MUST_BE_AGILE (0x8000001C) rather than
+// risk marshalling a non-agile object across apartments later. Plain
+// RuntimeClassFlags<ClassicCom> gets none of that: it's a bare classic-COM
+// object with no apartment/marshalling story of its own, so it fails that
+// QueryInterface. Adding Microsoft::WRL::FtmBase to the template list mixes
+// in IAgileObject (satisfying the check) plus the free-threaded marshaler's
+// IMarshal implementation (satisfying the ACTUAL cross-apartment call once
+// subscribed) -- both for free, without changing anything about how Invoke()
+// runs or on which thread. Do not remove FtmBase: without it, add_FrameArrived
+// fails every single time against a free-threaded pool, silently -- the
+// event-driven capture path never fires and every share falls back to
+// Chromium's capturer with only a log line (see SetError below) to show why.
 class FrameArrivedHandler
     : public Microsoft::WRL::RuntimeClass<
           Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
-          ABI::Windows::Foundation::ITypedEventHandler<WGC::Direct3D11CaptureFramePool*, IInspectable*>> {
+          ABI::Windows::Foundation::ITypedEventHandler<WGC::Direct3D11CaptureFramePool*, IInspectable*>,
+          Microsoft::WRL::FtmBase> {
  public:
   HRESULT RuntimeClassInitialize(HANDLE frameEvent) {
     frameEvent_.store(frameEvent, std::memory_order_release);

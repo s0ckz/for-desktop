@@ -150,6 +150,19 @@ let consecutiveFailures = 0;
  * attempts the native path -- e.g. a screen source, or
  * --window-shares-as-screen, both of which skip {@link startForSource}
  * entirely. Null while a session is active.
+ *
+ * One exception: the two "capture-error" call sites ({@link onFrame}'s
+ * null-frame branch, and the state-unreadable watchdog in
+ * {@link startWatchdogs}) each set this again, deliberately, in the
+ * statement right after their own `stop("capture-error")` call -- stop()
+ * clears it unconditionally as part of that same call, so setting it before
+ * would just be immediately erased. Without that, a native session that
+ * failed outright (e.g. the frame pool rejecting its own event handler at
+ * subscription time) left this null same as the ordinary "stopped" case,
+ * and the page's own log (appAudioPatch.ts's "native GPU path not engaged
+ * for this share" line) only names a reason when one is present here -- so
+ * a real failure and a normal end of share were indistinguishable from the
+ * page's own console. Naming the failure here is what fixes that.
  */
 let lastFallbackReason: string | null = null;
 
@@ -739,6 +752,19 @@ function onFrame(
     // happens synchronously before this statement even returns, so nothing
     // here needs to wait on the native join to have already taken effect.
     void stop("capture-error", sessionId);
+    // stop() above unconditionally nulls lastFallbackReason before this line
+    // ever runs (it has to, for the ordinary stop reasons -- see its own
+    // comment), so this deliberately runs AFTER that call rather than
+    // before it, or the real reason would already be gone by the time
+    // buildState() next reads it. Without this, a native GPU capture that
+    // failed at subscription/setup (e.g. add_FrameArrived rejecting the
+    // handler) read, to both app-audio.log's page-forwarded line and the
+    // page's own console, as a plain unexplained choice to use Chromium
+    // capture -- see appAudioPatch.ts's "native GPU path not engaged for
+    // this share" log, which only names a reason when one is present here.
+    // Naming the failure plainly (not just "not engaged") is what makes a
+    // regression like that loud instead of silent next time.
+    lastFallbackReason = `native GPU capture FAILED: ${death.reason || "(no reason given)"}`;
     return;
   }
   // Same reasoning as the death branch above, mirrored for the live case.
@@ -1026,6 +1052,12 @@ function startWatchdogs() {
         // Sync timer callback -- same reasoning as the other stop() call
         // sites in this file.
         void stop("capture-error");
+        // Same reasoning as onFrame's death branch above: set AFTER stop()
+        // so it survives stop()'s own unconditional clear, and name the
+        // actual failure rather than leaving the page (and app-audio.log's
+        // page-forwarded line) to report a bare "not engaged" with no
+        // explanation.
+        lastFallbackReason = `native GPU capture FAILED: no window-state signal for ${FRAME_WATCHDOG_NO_STATE_MS}ms; lastError: ${mod?.lastError() ?? "(unknown)"}`;
       }
       return;
     }
