@@ -47,8 +47,8 @@ setTimeout(() => {
   }
 }, 700);
 
-setTimeout(() => {
-  audio.stop();
+setTimeout(async () => {
+  await audio.stop();
   try {
     child.kill();
   } catch {

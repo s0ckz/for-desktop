@@ -238,6 +238,25 @@ export const APP_AUDIO_PATCH = [
   "    return 0;",
   "  };",
   "",
+  // Same shape as frameRateOf, for width/height (PR C3 item 1): the desktop
+  // side (native/screenCapture.ts's setLiveTarget, screenCaptureBridge.
+  // setTarget here) is fully wired for this, forwarding whatever generator.
+  // applyConstraints below is called with straight through to the native GPU
+  // scaler. The for-web side that would actually CALL applyConstraints with
+  // { width, height } after a preset pick -- state.tsx's counterpart to the
+  // frameRate forwarding already below -- is a separate, not-yet-made change
+  // in the other repo; see the desktop PR notes. Until that lands this is
+  // dead code on a healthy path, not a bug: dimOf(c, 'width'/'height') simply
+  // returns 0 for a constraints object that never carries them, same as
+  // frameRateOf does for one without frameRate.
+  "  const dimOf = (c, key) => {",
+  "    if (!c || typeof c !== 'object') return 0;",
+  "    const v = c[key];",
+  "    if (typeof v === 'number') return v;",
+  "    if (v && typeof v === 'object') return v.ideal || v.exact || v.max || 0;",
+  "    return 0;",
+  "  };",
+  "",
   "  const fpsCap = window.__stoatCaptureFps;",
   "  const withFpsCap = (c) => {",
   "    if (!fpsCap || !c || typeof c !== 'object') return c;",
@@ -267,7 +286,15 @@ export const APP_AUDIO_PATCH = [
   "    const owner = generation;",
   "    let lastWidth = state.width || 1920;",
   "    let lastHeight = state.height || 1080;",
-  "    const frameDurationUs = Math.max(1, Math.round(1000000 / (fps || 30)));",
+  "    // Real per-frame timing (meta.timestampUs -- native/win-capture's own",
+  "    // frame->get_SystemRelativeTime(), not when this process happened to",
+  "    // receive it) replaces a fixed duration computed once at build time,",
+  "    // which used to keep emitting e.g. 33333us durations across a 30->60fps",
+  "    // mid-share quality change. null until the first frame arrives -- there",
+  "    // is no previous timestamp to diff yet, so that one frame's VideoFrame",
+  "    // is built with no `duration` at all (a valid, optional field) rather",
+  "    // than a guessed value.",
+  "    let lastTimestampUs = null;",
   "",
   "    if (typeof MediaStreamTrackGenerator === 'function') {",
   "      let generator = null;",
@@ -275,20 +302,38 @@ export const APP_AUDIO_PATCH = [
   "      if (generator) {",
   "        const writer = generator.writable.getWriter();",
   "        let closed = false;",
+  // Backpressure (PR A4 item 1). Without this, a slow consumer (encoder
+  // busy, tab backgrounded, WritableStream's own internal queue full)
+  // leaves nothing to push back on: writer.write() just queues, and every
+  // queued frame is a full NV12 buffer (~3MB at 1080p), so a stalled
+  // writable grows without bound. `pending` and `desiredSize` are
+  // complementary, not redundant: `desiredSize` reflects the stream's own
+  // queue (positive means "room for at least one more write"), while
+  // `pending` is whether the write this handler most recently accepted has
+  // actually settled -- `desiredSize` can still read positive for one more
+  // write while an accepted one is in flight, and native delivers fast
+  // enough to call back again before that promise settles. Dropping (never
+  // buffering) keeps at most one frame in flight to the writer at a time.
+  "        let pending = 0;",
   "        const unsubFrame = screenCaptureBridge.onFrame((buf, meta) => {",
   "          if (closed) return;",
   "          lastWidth = meta.width; lastHeight = meta.height;",
+  "          const vfInit = {",
+  "            format: 'NV12',",
+  "            codedWidth: meta.width,",
+  "            codedHeight: meta.height,",
+  "            timestamp: meta.timestampUs,",
+  "          };",
+  "          if (lastTimestampUs !== null) vfInit.duration = Math.max(0, meta.timestampUs - lastTimestampUs);",
+  "          lastTimestampUs = meta.timestampUs;",
   "          let vf = null;",
-  "          try {",
-  "            vf = new VideoFrame(buf, {",
-  "              format: 'NV12',",
-  "              codedWidth: meta.width,",
-  "              codedHeight: meta.height,",
-  "              timestamp: Math.round(performance.now() * 1000),",
-  "              duration: frameDurationUs,",
-  "            });",
-  "          } catch (e) { return; }",
-  "          writer.write(vf).catch(() => { /* noop */ }).finally(() => { try { vf.close(); } catch (e) { /* noop */ } });",
+  "          try { vf = new VideoFrame(buf, vfInit); } catch (e) { return; }",
+  "          if (writer.desiredSize <= 0 || pending > 0) {",
+  "            try { vf.close(); } catch (e) { /* noop */ }",
+  "            return;",
+  "          }",
+  "          pending++;",
+  "          writer.write(vf).catch(() => { /* noop */ }).finally(() => { pending--; try { vf.close(); } catch (e) { /* noop */ } });",
   "        });",
   "        // The addon has no way to tell us the window died or capture",
   "        // otherwise failed -- see the long comment on the watchdogs in",
@@ -326,6 +371,8 @@ export const APP_AUDIO_PATCH = [
   "        generator.applyConstraints = function (c) {",
   "          const next = frameRateOf(c);",
   "          if (next) { try { screenCaptureBridge.setFps(next); } catch (e) { /* noop */ } }",
+  "          const w = dimOf(c, 'width'); const h = dimOf(c, 'height');",
+  "          if (w && h && screenCaptureBridge.setTarget) { try { screenCaptureBridge.setTarget(w, h); } catch (e) { /* noop */ } }",
   "          return Promise.resolve();",
   "        };",
   "        return {",
@@ -354,22 +401,34 @@ export const APP_AUDIO_PATCH = [
   "        const canvasTrack = canvasStream.getVideoTracks()[0];",
   "        if (canvasTrack) {",
   "          let closed = false;",
+  // Same backpressure motivation as the generator path above, but there is
+  // no writable queue to read here -- canvas.captureStream() samples the
+  // canvas on its own timer regardless of how often it is drawn to, so
+  // drawing faster than that (native can outrun the fallback's own `fps`
+  // when the page asked for less than the capture default) burns a GPU
+  // upload plus a compositor hop on frames captureStream will never sample.
+  // `lastDrawUs` throttles draws to one per frame interval using the same
+  // real capture timestamps buildVideoTrack already tracks for `duration`.
+  "          let lastDrawUs = null;",
+  "          const frameIntervalUs = fps > 0 ? 1e6 / fps : 0;",
   "          const unsubFrame = screenCaptureBridge.onFrame((buf, meta) => {",
   "            if (closed) return;",
   "            if (meta.width !== canvas.width || meta.height !== canvas.height) {",
   "              canvas.width = meta.width; canvas.height = meta.height;",
   "            }",
   "            lastWidth = meta.width; lastHeight = meta.height;",
+  "            const vfInit = {",
+  "              format: 'NV12',",
+  "              codedWidth: meta.width,",
+  "              codedHeight: meta.height,",
+  "              timestamp: meta.timestampUs,",
+  "            };",
+  "            if (lastTimestampUs !== null) vfInit.duration = Math.max(0, meta.timestampUs - lastTimestampUs);",
+  "            lastTimestampUs = meta.timestampUs;",
+  "            if (frameIntervalUs > 0 && lastDrawUs !== null && meta.timestampUs - lastDrawUs < frameIntervalUs) return;",
+  "            lastDrawUs = meta.timestampUs;",
   "            let vf = null;",
-  "            try {",
-  "              vf = new VideoFrame(buf, {",
-  "                format: 'NV12',",
-  "                codedWidth: meta.width,",
-  "                codedHeight: meta.height,",
-  "                timestamp: Math.round(performance.now() * 1000),",
-  "                duration: frameDurationUs,",
-  "              });",
-  "            } catch (e) { return; }",
+  "            try { vf = new VideoFrame(buf, vfInit); } catch (e) { return; }",
   "            try { ctx2d.drawImage(vf, 0, 0, canvas.width, canvas.height); } catch (e) { /* noop */ }",
   "            try { vf.close(); } catch (e) { /* noop */ }",
   "          });",
@@ -390,6 +449,8 @@ export const APP_AUDIO_PATCH = [
   "          canvasTrack.applyConstraints = function (c) {",
   "            const next = frameRateOf(c);",
   "            if (next) { try { screenCaptureBridge.setFps(next); } catch (e) { /* noop */ } }",
+  "            const w = dimOf(c, 'width'); const h = dimOf(c, 'height');",
+  "            if (w && h && screenCaptureBridge.setTarget) { try { screenCaptureBridge.setTarget(w, h); } catch (e) { /* noop */ } }",
   "            return Promise.resolve();",
   "          };",
   "          return {",

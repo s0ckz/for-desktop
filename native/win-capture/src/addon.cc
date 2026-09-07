@@ -18,18 +18,46 @@
 //
 // Threading model, deliberately simple: capture runs entirely from ONE
 // dedicated thread that we own end to end -- it creates the D3D11 device,
-// the WGC capture item/session/frame pool, and then polls
-// IDirect3D11CaptureFramePool::TryGetNextFrame() on a fixed cadence tied to
-// the requested fps, instead of subscribing to the pool's FrameArrived
-// event. Frame pools created with CreateFreeThreaded() do not require a
-// DispatcherQueue/message pump to deliver frames either way; polling from a
-// plain background thread avoids implementing the ABI's parameterized
+// the WGC capture item/session/frame pool, subscribes to the pool's
+// FrameArrived event, and waits on that subscription (CaptureThread, below)
+// instead of polling TryGetNextFrame() on a fixed cadence.
+//
+// This module used to poll instead, on purpose, specifically to avoid
+// implementing the ABI's parameterized
 // ITypedEventHandler<Direct3D11CaptureFramePool, IInspectable> callback
-// interface, which needs no extra WinRT projection machinery beyond what
-// this file already includes. Every frame we retrieve and don't use for
-// pacing purposes is released immediately (its ComPtr going out of scope),
-// which is what returns the buffer to the pool -- so a "drop" costs nothing
-// beyond the Release.
+// interface. That tradeoff is reversed here: polling at ~fps against a
+// source presenting at its own unrelated rate is a sampling-vs-source-rate
+// aliasing problem, and it showed up exactly where that theory predicts -- a
+// 60Hz game polled at ~60Hz drifts in and out of phase with its own presents,
+// so some polls see 0 new frames and the next sees 2 (dup/skip judder despite
+// every individual frame being correct), plus up to one whole poll interval
+// of pure latency between a present and this thread noticing it. Subscribing
+// removes both, and implementing the callback interface needed nothing more
+// than a small Microsoft::WRL::RuntimeClass<ClassicCom, ITypedEventHandler
+// <...>> -- see FrameArrivedHandler below -- not the extra projection
+// machinery the old comment here worried about. Frame pools created with
+// CreateFreeThreaded() never needed a DispatcherQueue/message pump either
+// way, polled or subscribed; that part of the old reasoning was never the
+// actual issue.
+//
+// FrameArrived's handler does nothing but SetEvent() a HANDLE this thread
+// waits on -- see FrameArrivedHandler's own comment for why nothing else is
+// safe there. Delivery is paced on each frame's own
+// frame->get_SystemRelativeTime() (a 100ns-unit timestamp WGC stamps on the
+// frame itself) rather than on wall-clock arrival time -- see the pacing
+// comment above lastDeliveredTs in CaptureThread for why that, not the event
+// subscription by itself, is what removes the aliasing above. A
+// CreateWaitableTimerExW high-resolution timer still wakes this loop roughly
+// once an interval when FrameArrived does not fire at all (a static window
+// legitimately produces no FrameArrived events), purely so the liveness
+// checks -- window still exists, stop requested -- keep running promptly; it
+// has no say any more in which frames get delivered.
+//
+// Every frame we retrieve and don't use -- draining the pool to the newest
+// one, or a frame arriving faster than the requested pacing allows -- is
+// released immediately (its ComPtr going out of scope), which is what
+// returns the buffer to the pool, so a "drop" costs nothing beyond the
+// Release.
 
 #include <napi.h>
 
@@ -38,7 +66,8 @@
 #include <winstring.h>
 #include <inspectable.h>
 #include <wrl/client.h>
-#include <timeapi.h>  // timeBeginPeriod/timeEndPeriod -- see CaptureThread
+#include <wrl/implements.h>  // Microsoft::WRL::RuntimeClass/MakeAndInitialize -- see FrameArrivedHandler
+#include <timeapi.h>  // timeBeginPeriod/timeEndPeriod -- see CaptureThread (fallback path only, now)
 
 #include <d3d11.h>
 #include <dxgi.h>
@@ -54,6 +83,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -84,15 +114,61 @@ namespace {
 
 // ---------------------------------------------------------------------------
 // Capture session state -- all of it lives only between Start() and the
-// capture thread's teardown, and is only ever touched from that one thread
-// (the JS-facing Start/Stop/LastError calls only set flags/join it).
+// capture thread's teardown, and (g_lastError aside) is only ever touched
+// from that one thread; the JS-facing Start()/Stop()/LastError() calls only
+// set flags, create/close g_stopEvent, or (Stop(), via StopWorker) join it.
+// g_lastError is the one exception: it is written by the capture thread but
+// also read AND written from the JS thread (IsSupported()), so it alone
+// needs the mutex below -- see its own comment for why.
 // ---------------------------------------------------------------------------
 
 std::thread g_thread;
 std::atomic<bool> g_running{false};
+// Set the instant a stop is requested (signalStop, or the AddCleanupHook
+// path) and cleared only once the join has actually completed (StopWorker::
+// OnOK/OnError). g_thread itself cannot serve as that flag once Stop()
+// std::move()s it into the worker -- joinable() goes false the moment the
+// move happens, well before the join it names has finished -- so this is
+// the one thing Start() can check to refuse "previous capture still
+// shutting down" for the whole window the async join is in flight.
+std::atomic<bool> g_stopping{false};
 HANDLE g_stopEvent = nullptr;
 Napi::ThreadSafeFunction g_tsfn;
+// stop() calls that arrived while g_stopping was already true -- i.e. while
+// an earlier stop()'s StopWorker join was still in flight. Resolved (or
+// rejected, on the OnError path) alongside the primary deferred once that
+// join actually completes -- see Stop()'s own comment for why this exists.
+// JS-thread-only: Stop() and StopWorker::OnOK/OnError both run there, so no
+// lock is needed.
+std::vector<Napi::Promise::Deferred> g_pendingStopDeferreds;
+
+// g_lastError is written by the capture thread (SetError, and the dropped-
+// death-signal message in Emit) while the JS/main thread both reads it
+// (LastError()) and writes it (IsSupported(), which buildState() in the JS
+// layer reaches on every broadcastState() -- so this races on essentially
+// every frame). std::string is not safe to read/write concurrently without
+// this: a torn SSO-to-heap transition is real UB, not just a stale-value
+// nuisance. The mutex is intentionally the least clever fix available --
+// every access goes through GetErrorText()/SetErrorText() below, never the
+// bare variable.
+//
+// Named GetErrorText/SetErrorText, not GetLastError/SetLastError: those are
+// Win32 API functions (windows.h, above), and a same-named helper in this
+// anonymous namespace shadows them for every unqualified call below it in
+// this translation unit -- IsSupported()'s GetLastError() calls a few
+// hundred lines down need the real Win32 one back.
+std::mutex g_lastErrorMutex;
 std::string g_lastError;
+
+std::string GetErrorText() {
+  std::lock_guard<std::mutex> lock(g_lastErrorMutex);
+  return g_lastError;
+}
+
+void SetErrorText(std::string message) {
+  std::lock_guard<std::mutex> lock(g_lastErrorMutex);
+  g_lastError = std::move(message);
+}
 
 /**
  * Buffers in the WGC frame pool.
@@ -111,13 +187,24 @@ std::string g_lastError;
  * this costs real GPU memory for no measured gain.
  *
  * Recorded here so the next person does not spend the same afternoon on it.
- * The ~49.5fps ceiling at a 60fps target remains unexplained; see the notes
- * on the polling loop in CaptureThread.
+ * The ~49.5fps ceiling at a 60fps target was the poll-vs-present aliasing
+ * the file header now describes -- see there, and lastDeliveredTs's comment
+ * in CaptureThread, for the fix (event-driven capture, paced on real frame
+ * timestamps) rather than a buffer-count workaround.
  */
 constexpr int kFramePoolBuffers = 2;
 
-UINT32 g_targetW = 0;
-UINT32 g_targetH = 0;
+/**
+ * Target bounding box frames are scaled to fit inside -- see EnsurePipeline's
+ * fit-inside comment for the exact math. Atomic for the same reason as g_fps
+ * just below, and changed the same way (SetTarget(), item 1 of PR C3): the
+ * web client's screen-share quality picker resolves *after* the share has
+ * already started, so a box fixed at Start() would strand every later preset
+ * change (1080p -> 720p) the same way a rate fixed at Start() used to strand
+ * a framerate change -- see SetTarget()'s own doc comment.
+ */
+std::atomic<UINT32> g_targetW{0};
+std::atomic<UINT32> g_targetH{0};
 /**
  * Delivery cadence, changeable while capture is running.
  *
@@ -147,13 +234,53 @@ ComPtr<WGC::IGraphicsCaptureSession> g_session;
 // resize.
 ComPtr<ID3D11VideoProcessorEnumerator> g_vpEnum;
 ComPtr<ID3D11VideoProcessor> g_videoProcessor;
-ComPtr<ID3D11Texture2D> g_outputTex;   // D3D11_USAGE_DEFAULT, NV12, VP output target
-ComPtr<ID3D11Texture2D> g_stagingTex;  // D3D11_USAGE_STAGING, CPU-readable copy of the above
+ComPtr<ID3D11Texture2D> g_outputTex;  // D3D11_USAGE_DEFAULT, NV12, VP output target
 ComPtr<ID3D11VideoProcessorOutputView> g_outputView;
 UINT32 g_srcW = 0;  // dimensions EnsurePipeline last built the VP/textures for
 UINT32 g_srcH = 0;
 UINT32 g_outW = 0;
 UINT32 g_outH = 0;
+UINT32 g_lastTargetW = 0;  // g_targetW/g_targetH EnsurePipeline last built the above for
+UINT32 g_lastTargetH = 0;
+
+/**
+ * Staging texture ring depth (item 2 of PR C3).
+ *
+ * Was a single D3D11_USAGE_STAGING texture: CopyResource into it, then
+ * Map(D3D11_MAP_READ) with no flags, which -- CopyResource only *starts* the
+ * GPU copy, it does not wait for it -- forced a full CPU/GPU pipeline stall
+ * on every single frame. Under game-GPU contention that stall was real time,
+ * not free synchronisation.
+ *
+ * Now: CopyResource into the NEXT slot, and Map the PREVIOUS one with
+ * D3D11_MAP_FLAG_DO_NOT_WAIT (see ProcessFrame). Whatever GPU work is still
+ * outstanding for the previous slot started a whole frame interval ago, so
+ * by the time this call reaches it, it is normally done; DO_NOT_WAIT turns
+ * "normally" into a guarantee -- Map() returns immediately either way,
+ * DXGI_ERROR_WAS_STILL_DRAWING if the GPU is for some reason still behind,
+ * in which case that frame is skipped exactly like any other pacing drop
+ * rather than blocked on.
+ *
+ * 2 is the minimum that works (one slot being written, one being read) and
+ * is what the plan asks for. A deeper ring would tolerate the GPU falling
+ * further behind before a frame gets skipped, at the cost of more latency
+ * and memory per extra slot -- not worth it unless 2 is measured to skip
+ * often in practice, which C3's own verification (grabMs, dropped-before-
+ * encode) will show if it ever needs revisiting.
+ */
+constexpr int kStagingRingSize = 2;
+struct StagingSlot {
+  ComPtr<ID3D11Texture2D> tex;  // D3D11_USAGE_STAGING, CPU-readable copy of g_outputTex
+  // This slot's own frame timestamp, captured at CopyResource time and read
+  // back out one call later alongside the pixels -- see ProcessFrame. Without
+  // this, the ring's one-frame delivery lag would pair frame N's own
+  // timestampUs with frame N-1's pixels, silently reintroducing the kind of
+  // timestamp/content mismatch PR C2 removed.
+  double timestampUs = 0;
+};
+StagingSlot g_stagingRing[kStagingRingSize];
+int g_stagingRingIndex = 0;   // next slot ProcessFrame will CopyResource into
+int g_stagingRingFilled = 0;  // slots written at least once since the last EnsurePipeline rebuild, capped at kStagingRingSize
 
 // The frame pool's own buffer size, tracked separately from g_srcW/g_srcH --
 // see EnsurePool.
@@ -163,7 +290,7 @@ UINT32 g_poolH = 0;
 void SetError(const char* stage, HRESULT hr) {
   char buf[192];
   snprintf(buf, sizeof(buf), "%s failed (hr=0x%08lX)", stage, static_cast<unsigned long>(hr));
-  g_lastError = buf;
+  SetErrorText(buf);
 }
 
 // desktopCapturer hands window ids out as strings; accept either form, same
@@ -231,7 +358,17 @@ bool EnsurePool(UINT32 w, UINT32 h) {
 // ---------------------------------------------------------------------------
 
 bool EnsurePipeline(UINT32 srcW, UINT32 srcH) {
-  if (srcW == g_srcW && srcH == g_srcH && g_vpEnum) return true;
+  // Re-keyed on the TARGET as well as the source size, since PR C3 item 1:
+  // SetTarget() can change g_targetW/g_targetH while this pipeline is
+  // otherwise perfectly valid for the current source size (a mid-share
+  // 1080p -> 720p preset change on a window that never resized), and that
+  // must rebuild the video processor and output/staging textures for the new
+  // output box exactly the way a source resize already does.
+  const UINT32 targetW = g_targetW.load(std::memory_order_relaxed);
+  const UINT32 targetH = g_targetH.load(std::memory_order_relaxed);
+  if (srcW == g_srcW && srcH == g_srcH && targetW == g_lastTargetW && targetH == g_lastTargetH && g_vpEnum) {
+    return true;
+  }
 
   HRESULT hr;
 
@@ -245,8 +382,8 @@ bool EnsurePipeline(UINT32 srcW, UINT32 srcH) {
   // 800x600 window against the 1920x1080 target) gets scale > 1 here and is
   // blown up to fill the box, spending bitrate on invented pixels instead of
   // the real ones. Fit-inside should only ever shrink.
-  const double scale = (std::min)({static_cast<double>(g_targetW) / srcW,
-                                    static_cast<double>(g_targetH) / srcH,
+  const double scale = (std::min)({static_cast<double>(targetW) / srcW,
+                                    static_cast<double>(targetH) / srcH,
                                     1.0});
   UINT32 outW = static_cast<UINT32>(std::lround(srcW * scale));
   UINT32 outH = static_cast<UINT32>(std::lround(srcH * scale));
@@ -293,15 +430,22 @@ bool EnsurePipeline(UINT32 srcW, UINT32 srcH) {
     return false;
   }
 
+  // Ring of kStagingRingSize staging textures -- see the struct/array's own
+  // declaration for why. Built as a local array first, same pattern as
+  // outTex/vp/vpEnum above, so a failure partway through (slot 1 of 2) never
+  // touches the globals and leaves the previous, still-valid pipeline in
+  // place for EnsurePipeline's caller to keep using.
   D3D11_TEXTURE2D_DESC stagingDesc = outDesc;
   stagingDesc.Usage = D3D11_USAGE_STAGING;
   stagingDesc.BindFlags = 0;
   stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-  ComPtr<ID3D11Texture2D> stagingTex;
-  hr = g_device->CreateTexture2D(&stagingDesc, nullptr, &stagingTex);
-  if (FAILED(hr)) {
-    SetError("CreateTexture2D(staging)", hr);
-    return false;
+  ComPtr<ID3D11Texture2D> stagingTex[kStagingRingSize];
+  for (int i = 0; i < kStagingRingSize; i++) {
+    hr = g_device->CreateTexture2D(&stagingDesc, nullptr, &stagingTex[i]);
+    if (FAILED(hr)) {
+      SetError("CreateTexture2D(staging)", hr);
+      return false;
+    }
   }
 
   D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC outViewDesc{};
@@ -317,12 +461,29 @@ bool EnsurePipeline(UINT32 srcW, UINT32 srcH) {
   g_vpEnum = vpEnum;
   g_videoProcessor = vp;
   g_outputTex = outTex;
-  g_stagingTex = stagingTex;
   g_outputView = outView;
   g_srcW = srcW;
   g_srcH = srcH;
   g_outW = outW;
   g_outH = outH;
+  g_lastTargetW = targetW;
+  g_lastTargetH = targetH;
+
+  // Every texture just built above is a fresh, never-copied-into resource,
+  // regardless of whether this rebuild was the very first one this session
+  // or a later resize/setTarget() -- so the ring's write/read bookkeeping
+  // must restart from empty here too, on the same trigger, or ProcessFrame
+  // could try to Map a "primed" slot from before this rebuild that no longer
+  // exists (a resize replaces the ComPtrs entirely, it does not reuse them).
+  // See ProcessFrame's own comment on g_stagingRingFilled for the other half
+  // of this contract, and the struct's declaration above for why the first
+  // kStagingRingSize-1 frames after any rebuild have nothing to read yet.
+  for (int i = 0; i < kStagingRingSize; i++) {
+    g_stagingRing[i].tex = stagingTex[i];
+    g_stagingRing[i].timestampUs = 0;
+  }
+  g_stagingRingIndex = 0;
+  g_stagingRingFilled = 0;
   return true;
 }
 
@@ -332,11 +493,92 @@ bool EnsurePipeline(UINT32 srcW, UINT32 srcH) {
 // shrink.
 struct FramePayload {
   std::vector<uint8_t> nv12;
-  UINT32 width;
-  UINT32 height;
-  double bltMs;
-  double grabMs;
+  UINT32 width = 0;
+  UINT32 height = 0;
+  double bltMs = 0;
+  double grabMs = 0;
+  // frame->get_SystemRelativeTime(), converted to microseconds (100ns units
+  // / 10) -- see CaptureThread's pacing comment above lastDeliveredTs. Real
+  // per-frame time, not wall-clock delivery time; the page patch uses this
+  // directly for VideoFrame.timestamp and its own delta for duration (see
+  // appAudioPatch.ts), replacing a fixed duration computed once at build
+  // time. Unset (0) for a death-signal payload, same as width/height/bltMs/
+  // grabMs below.
+  double timestampUs = 0;
+  // Set only for the one death-signal payload CaptureThread emits on loop
+  // exit (see its teardown, below) -- frame arrives as null in JS and
+  // `reason` carries lastError() at that moment. See index.d.ts.
+  bool isDeath = false;
+  std::string reason;
 };
+
+// Pool of live-frame payloads (PR A4 item 3), sized to match the TSFN queue
+// depth argued for in Start()'s g_tsfn comment (3) -- a `new`/`delete`
+// FramePayload per frame was a ~3MB heap alloc/dealloc pair at up to 60fps,
+// on top of the memcpy this whole module already exists to shrink. This is a
+// fixed global array, not per-session: it survives across Start()/Stop()
+// cycles untouched (nothing about it needs resetting -- see the doc comment
+// on AcquirePooledPayload for why that is safe), the same way the staging
+// texture ring's slots do.
+//
+// Does NOT cover the death-signal payload (Emit()'s other caller, in
+// CaptureThread's teardown) -- that one stays a plain `new`/`delete`,
+// deliberately. It happens at most once per session, so pooling it buys
+// nothing, and pooling it WOULD introduce a real hazard: the death payload
+// goes through Emit()'s bounded retry loop specifically because the queue
+// can legitimately be full at that moment (see kDeathRetries' comment), and
+// a payload drawn from this same 3-slot pool could still be sitting
+// queued-but-not-yet-drained from an ordinary frame at that exact moment --
+// there is no guarantee a free slot exists to hand the death signal in the
+// first place, which would turn "retry until the queue has room" into
+// "retry until a *pool slot* frees up AND the queue has room", a strictly
+// harder and unnecessary problem for a payload this module can afford to
+// heap-allocate once per session.
+constexpr int kFramePoolSize = 3;
+FramePayload g_framePayloadPool[kFramePoolSize];
+std::atomic<bool> g_framePayloadInUse[kFramePoolSize] = {};
+
+// Only the capture thread ever calls this (the same single-writer invariant
+// documented on g_tsfn's New() call in Start() -- Emit() is CaptureThread's
+// alone to call), so the linear scan below needs no producer-side lock: at
+// most one thread is ever racing the *consumer* side (the JS thread, via
+// ReleasePooledPayload below), never itself.
+//
+// Returns nullptr when all kFramePoolSize slots are still owned by a
+// payload the JS thread has not yet finished reading -- the caller (
+// ProcessFrame) treats that exactly like Emit()'s own full-queue drop: bump
+// g_framesRefused and skip the frame, never blocking. A free slot found here
+// is not a guarantee the *TSFN queue* itself has room -- Emit() still
+// separately handles that with its own drop path -- so a frame can still be
+// refused by Emit() even after successfully acquiring a slot here; see that
+// refusal branch for why the slot is released, not leaked, when that
+// happens.
+FramePayload* AcquirePooledPayload() {
+  for (int i = 0; i < kFramePoolSize; i++) {
+    bool expected = false;
+    if (g_framePayloadInUse[i].compare_exchange_strong(expected, true, std::memory_order_acquire)) {
+      return &g_framePayloadPool[i];
+    }
+  }
+  return nullptr;
+}
+
+// Marks a slot free again. Called from two places: Emit(), when
+// NonBlockingCall refuses a live payload outright (it was never queued, so
+// nothing else can be reading it), and EmitToJs, on the JS thread, once
+// Napi::Buffer::Copy has taken its own copy of `nv12` and every scalar field
+// has been read into `meta` -- i.e. once nothing downstream still needs this
+// slot's contents, not only once the JS callback has returned. Releasing
+// that early (rather than after `cb.Call`) keeps this pool's "in use" window
+// as close as possible to the TSFN's own internal queue-occupancy window;
+// see EmitToJs for the exact ordering. The release-store here is
+// AcquirePooledPayload's compare_exchange's pairing acquire, which is what
+// makes it safe for the capture thread to start overwriting this slot's
+// `nv12` for a new frame the instant this returns, without a data race.
+void ReleasePooledPayload(FramePayload* payload) {
+  const auto index = payload - g_framePayloadPool;
+  g_framePayloadInUse[index].store(false, std::memory_order_release);
+}
 
 /**
  * Frames the JS side was not ready to receive, cumulative for this session.
@@ -371,40 +613,136 @@ std::atomic<uint64_t> g_framesRefused{0};
  */
 std::atomic<uint64_t> g_poolResizes{0};
 
-void Emit(FramePayload* payload) {
-  auto status = g_tsfn.NonBlockingCall(payload, [](Napi::Env env, Napi::Function cb, FramePayload* p) {
-    // Copy, and it has to be a copy: Napi::Buffer::New over our own memory
-    // (zero-copy, with a finalizer) is the obvious optimisation here -- it
-    // would save a ~3MB memcpy and a fresh 3MB V8 allocation per frame, some
-    // 180MB/s of allocation churn at 60fps -- but **Electron rejects external
-    // buffers outright**. V8's memory-cage/sandbox hardening means every such
-    // call throws `External buffers are not allowed` before the callback
-    // runs, delivering zero frames. Node swallows that exception by default
-    // (it only surfaces as a DEP0168 warning), so it fails silently and looks
-    // like a capture bug rather than an API misuse. Measured directly on
-    // Electron 43.4.0: 0 frames delivered at both 30 and 60fps.
-    //
-    // If this ever needs optimising, the route is a preallocated pool the JS
-    // side reads from, not an external Buffer.
-    auto buffer = Napi::Buffer<uint8_t>::Copy(env, p->nv12.data(), p->nv12.size());
-    auto meta = Napi::Object::New(env);
-    meta.Set("width", Napi::Number::New(env, p->width));
-    meta.Set("height", Napi::Number::New(env, p->height));
-    meta.Set("bltMs", Napi::Number::New(env, p->bltMs));
-    meta.Set("grabMs", Napi::Number::New(env, p->grabMs));
-    meta.Set("refused", Napi::Number::New(env, static_cast<double>(g_framesRefused.load())));
-    meta.Set("poolResizes", Napi::Number::New(env, static_cast<double>(g_poolResizes.load())));
-    // Safe before the call: Buffer::Copy above already took its own copy of
-    // the pixels, so nothing here outlives this scope. Leaking instead would
-    // cost a whole frame (~3MB) every time, ~180MB/s at 60fps.
+// Named (not an inline lambda at the call site) so Emit() below can pass it
+// to more than one NonBlockingCall attempt when retrying a death payload.
+void EmitToJs(Napi::Env env, Napi::Function cb, FramePayload* p) {
+  auto meta = Napi::Object::New(env);
+  meta.Set("refused", Napi::Number::New(env, static_cast<double>(g_framesRefused.load())));
+  meta.Set("poolResizes", Napi::Number::New(env, static_cast<double>(g_poolResizes.load())));
+  if (p->isDeath) {
+    // No pixel buffer for a death signal -- see FramePayload::isDeath.
+    meta.Set("reason", Napi::String::New(env, p->reason));
     delete p;
-    cb.Call({buffer, meta});
-  });
+    cb.Call({env.Null(), meta});
+    return;
+  }
+  // Copy, and it has to be a copy: Napi::Buffer::New over our own memory
+  // (zero-copy, with a finalizer) is the obvious optimisation here -- it
+  // would save a ~3MB memcpy and a fresh 3MB V8 allocation per frame, some
+  // 180MB/s of allocation churn at 60fps -- but **Electron rejects external
+  // buffers outright**. V8's memory-cage/sandbox hardening means every such
+  // call throws `External buffers are not allowed` before the callback
+  // runs, delivering zero frames. Node swallows that exception by default
+  // (it only surfaces as a DEP0168 warning), so it fails silently and looks
+  // like a capture bug rather than an API misuse. Measured directly on
+  // Electron 43.4.0: 0 frames delivered at both 30 and 60fps.
+  //
+  // If this ever needs optimising, the route is a preallocated pool the JS
+  // side reads from, not an external Buffer.
+  auto buffer = Napi::Buffer<uint8_t>::Copy(env, p->nv12.data(), p->nv12.size());
+  meta.Set("width", Napi::Number::New(env, p->width));
+  meta.Set("height", Napi::Number::New(env, p->height));
+  meta.Set("bltMs", Napi::Number::New(env, p->bltMs));
+  meta.Set("grabMs", Napi::Number::New(env, p->grabMs));
+  meta.Set("timestampUs", Napi::Number::New(env, p->timestampUs));
+  // Safe before the call: Buffer::Copy above already took its own copy of
+  // the pixels, and every scalar field has already been read into `meta` --
+  // nothing below this line still reads `p`. Released back to the pool
+  // (item 3) rather than deleted: `p` is one of g_framePayloadPool's
+  // kFramePoolSize slots, not a heap allocation, for every live frame (see
+  // ProcessFrame/AcquirePooledPayload) -- freeing it here would double-free
+  // the moment the capture thread next wrote into that same slot. Released
+  // *before* `cb.Call`, not after: see ReleasePooledPayload's doc comment
+  // for why that ordering matters.
+  ReleasePooledPayload(p);
+  cb.Call({buffer, meta});
+}
+
+/**
+ * Bounded retry for a dropped death payload alone -- see Emit() below for why
+ * a frame drop and a death drop are not the same risk. 10 attempts x 5ms caps
+ * the added delay at ~50ms, which is negligible next to how long the capture
+ * thread otherwise takes to unwind (D3D/WGC teardown) and unobservable by
+ * any caller -- since item 3, nothing blocks on this thread exiting any more
+ * (stop()'s join runs on the libuv threadpool; see StopWorker), so this bound
+ * is no longer trading against a blocked JS thread, just against how long
+ * the death signal can take to land after everything else has already wound
+ * down. Still a real cap worth keeping small: see Emit() for why retrying
+ * can occasionally still fail to land it at all, in which case 50ms is what
+ * this costs for nothing.
+ */
+constexpr int kDeathRetries = 10;
+constexpr DWORD kDeathRetryDelayMs = 5;
+
+void Emit(FramePayload* payload) {
+  auto status = g_tsfn.NonBlockingCall(payload, EmitToJs);
   // Drop, don't queue: once the queue is full NonBlockingCall fails fast
-  // instead of buffering, and we discard this frame rather than delivering a
-  // stale one late. See the queue size in Start() for why it is not 1.
-  if (status != napi_ok) {
+  // instead of buffering. For an ordinary frame that is correct as-is --
+  // delivering a stale frame late is worse than skipping it. See the queue
+  // size in Start() for why it is not 1.
+  if (status == napi_ok) return;
+  if (!payload->isDeath) {
     g_framesRefused.fetch_add(1, std::memory_order_relaxed);
+    // Never queued (NonBlockingCall refused it outright), so nothing else
+    // can be reading this slot -- released back to the pool (item 3), not
+    // deleted: this is one of g_framePayloadPool's slots, not a heap
+    // allocation.
+    ReleasePooledPayload(payload);
+    return;
+  }
+
+  // The death payload is not a frame: it's the only fatal signal left on the
+  // state-readable path in screenCapture.ts (the old FRAME_WATCHDOG_HARD_LEAK_MS
+  // hard-leak guard was deliberately removed on the assumption that this
+  // signal always lands -- see the REJECTED comment above startWatchdogs
+  // there). Dropping it silently the same way a frame is dropped would leave
+  // a session whose capture thread died, but whose window is still open,
+  // paused forever with nothing to notice. So retry a bounded number of times
+  // instead of giving up on the first full queue.
+  //
+  // UPDATED for item 3 (async stop): both paths that can reach here now
+  // leave the JS thread free to drain the queue for the whole retry window,
+  // so a retry should usually land on the first or second attempt:
+  //  - Abnormal death (nothing called stop()): always true -- the JS thread
+  //    was never blocked on this thread in this case.
+  //  - Ordinary stop(): stop()'s join no longer runs on the JS/main thread --
+  //    it runs on the libuv threadpool via StopWorker (see Stop() below), so
+  //    the JS thread is free to run its event loop, and this queue, for the
+  //    whole join. Before item 3, Stop() was synchronously blocked in
+  //    g_thread.join() right here, so every retry on this path was
+  //    guaranteed to exhaust -- that guarantee is gone now, which is why
+  //    this comment needed updating, not because the retry loop itself
+  //    changed.
+  //
+  // One path can still starve it: the AddCleanupHook added by item 5 (quit
+  // without an explicit stop() first) runs its own bounded
+  // WaitForSingleObject(thread.native_handle(), 3000) synchronously on the
+  // JS/main thread. If this NonBlockingCall lands while that hook is still
+  // waiting, the JS thread is once again not draining the queue -- so the
+  // retry can still legitimately exhaust, and that is fine for the same
+  // reason it always was: nothing JS-side is depending on this signal once
+  // shutdown has gone this far.
+  //
+  // This is exactly why Emit() must stay a NonBlockingCall retry loop and
+  // never become a BlockingCall: a call that blocks waiting for queue space
+  // only the JS thread can drain would deadlock that cleanup-hook wait the
+  // same way it used to deadlock Stop()'s old synchronous join.
+  //
+  // kDeathRetries x kDeathRetryDelayMs (10 x 5ms = 50ms) is kept as-is: it
+  // was already generous for a queue that now drains almost immediately in
+  // the common case, and it stays cheap insurance for the one path above
+  // that can still legitimately exhaust it.
+  for (int attempt = 0; attempt < kDeathRetries && status != napi_ok; attempt++) {
+    Sleep(kDeathRetryDelayMs);
+    status = g_tsfn.NonBlockingCall(payload, EmitToJs);
+  }
+  if (status != napi_ok) {
+    // Retries exhausted -- record the drop through the normal error channel
+    // instead of losing it silently. Overwrites whatever g_lastError held
+    // (the death payload's own `reason`, already lost with it); still
+    // surfaced through lastError(), e.g. in the FRAME_WATCHDOG_NO_STATE_MS
+    // log line in screenCapture.ts.
+    SetErrorText("death signal dropped: TSFN queue stayed full after retries");
     delete payload;
   }
 }
@@ -413,12 +751,13 @@ void Emit(FramePayload* payload) {
 // it back, pack it as tight NV12, and deliver it. srcW/srcH must be the
 // *texture's own* dimensions (srcTex->GetDesc), not the frame's ContentSize --
 // see the caller in CaptureThread for why those can briefly disagree and what
-// goes wrong if you pass ContentSize here instead. Called for every frame the
-// capture loop decides to process -- there is no resize case that skips this
-// call any more, only the pacing skips upstream of it (the drain loop and the
-// "nothing new since last poll" check). Returns false only on a hard D3D/WGC
-// failure.
-bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH) {
+// goes wrong if you pass ContentSize here instead. timestampUs is the frame's
+// own get_SystemRelativeTime(), already converted -- see FramePayload's field
+// of the same name. Called for every frame the capture loop decides to
+// process -- there is no resize case that skips this call any more, only the
+// pacing skips upstream of it (the drain loop and the pacing check against
+// lastDeliveredTs). Returns false only on a hard D3D/WGC failure.
+bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH, double timestampUs) {
   if (!EnsurePipeline(srcW, srcH)) return false;
 
   D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inDesc{};
@@ -454,20 +793,78 @@ bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH) {
   // path this Map() blocks on a ~20MB GPU->CPU copy under game-GPU
   // contention. Downscaling before this point (above) is what gets it to
   // ~1.5MB instead.
-  g_context->CopyResource(g_stagingTex.Get(), g_outputTex.Get());
+  //
+  // Staging ring (item 2 of PR C3): write this frame's blit result into the
+  // NEXT ring slot, but read back the PREVIOUS slot's -- already blitted a
+  // whole frame interval ago -- content, instead of the one just copied into.
+  // CopyResource only *starts* the GPU->CPU copy; it does not wait for it, so
+  // Map()'ing the slot just copied into would still pay the full pipeline
+  // stall this item exists to remove. Reading the other slot means whatever
+  // GPU work is still outstanding for it had a whole interval's head start,
+  // so D3D11_MAP_FLAG_DO_NOT_WAIT normally succeeds immediately; on the rare
+  // case it has not, Map() returns DXGI_ERROR_WAS_STILL_DRAWING right away
+  // instead of blocking, and this call skips the frame exactly like any
+  // other pacing drop -- see kStagingRingSize's declaration for more.
+  const int writeSlot = g_stagingRingIndex;
+  g_context->CopyResource(g_stagingRing[writeSlot].tex.Get(), g_outputTex.Get());
+  g_stagingRing[writeSlot].timestampUs = timestampUs;
+  g_stagingRingIndex = (writeSlot + 1) % kStagingRingSize;
+
+  // The first kStagingRingSize-1 frames after Start() or after EnsurePipeline
+  // resets this ring (a resize or a setTarget() -- see its own comment) have
+  // no N-1 slot with real content to read: every slot is a freshly created,
+  // never-copied-into STAGING texture. Returning true with nothing emitted is
+  // not a failure -- CaptureThread already treats "no Emit() this iteration"
+  // as an ordinary drop (the same path a too-fast frame or a still-drawing
+  // GPU takes), so the caller sees no difference from any other skipped
+  // frame; it is just guaranteed for a session's or a rebuild's first couple
+  // of frames instead of merely likely.
+  if (g_stagingRingFilled < kStagingRingSize) {
+    g_stagingRingFilled++;
+    return true;
+  }
+
+  const int readSlot = (writeSlot + kStagingRingSize - 1) % kStagingRingSize;
   D3D11_MAPPED_SUBRESOURCE mapped{};
-  hr = g_context->Map(g_stagingTex.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+  hr = g_context->Map(g_stagingRing[readSlot].tex.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
   const auto t2 = std::chrono::steady_clock::now();
+  if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+    // Not a failure -- see the comment above this block. The pixels are not
+    // lost, only this call's chance to read them; readSlot's own content
+    // gets another chance once the ring cycles back to it.
+    return true;
+  }
   if (FAILED(hr)) {
     SetError("Map(staging texture)", hr);
     return false;
   }
 
-  auto* payload = new FramePayload();
+  // Pooled (item 3), not `new`: see AcquirePooledPayload's doc comment for
+  // what a null return means and why it is handled exactly like Emit()'s own
+  // full-queue drop rather than falling back to a heap allocation -- this
+  // function must never block or grow unboundedly on a slow JS thread any
+  // more than the queue itself does.
+  auto* payload = AcquirePooledPayload();
+  if (!payload) {
+    g_framesRefused.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
   payload->width = g_outW;
   payload->height = g_outH;
   payload->bltMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+  // No longer a GPU-wait measurement now that Map() is DO_NOT_WAIT -- it
+  // normally reads near zero, which is the point of this item, not a bug.
+  // grabMs still exists as a field so the harness/renderer can tell a
+  // healthy near-zero value apart from the rare WAS_STILL_DRAWING skip above
+  // (which never reaches here to report one).
   payload->grabMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
+  // This slot's OWN timestamp, captured when it was written one call ago --
+  // not the `timestampUs` argument, which belongs to the frame just blitted
+  // into the OTHER (write) slot this same call. Using the argument here
+  // would pair this frame's pixels with the next frame's timestamp, silently
+  // undoing PR C2's real-per-frame-timestamp fix for the one-frame lag this
+  // ring adds.
+  payload->timestampUs = g_stagingRing[readSlot].timestampUs;
 
   // D3D11 maps an NV12 texture as one contiguous region: the Y plane
   // (height rows of RowPitch bytes) immediately followed by the half-height,
@@ -488,21 +885,135 @@ bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH) {
     memcpy(payload->nv12.data() + ySize + static_cast<size_t>(row) * g_outW,
            uvSrc + static_cast<size_t>(row) * mapped.RowPitch, g_outW);
   }
-  g_context->Unmap(g_stagingTex.Get(), 0);
+  g_context->Unmap(g_stagingRing[readSlot].tex.Get(), 0);
 
   Emit(payload);
   return true;
 }
 
 // ---------------------------------------------------------------------------
-// Capture thread: owns the whole session lifetime. Runs entirely as one
-// polling loop paced to the requested fps -- see the file header for why we
-// poll TryGetNextFrame() rather than subscribing to FrameArrived.
+// FrameArrived handler. Runs on a thread WinRT itself owns -- NOT the
+// capture thread -- so it must do nothing beyond SetEvent(). In particular
+// it must never touch g_tsfn: Start()'s ThreadSafeFunction::New() call seeds
+// initialThreadCount at 1 on the guarantee that exactly one thread (the
+// capture thread, via Emit()) ever calls NonBlockingCall and matches it with
+// the one Release() in CaptureThread's own teardown -- see the comment on
+// that New() call for what breaks if a second thread ever reaches g_tsfn.
+// SetEvent on a HANDLE is the one operation that's safe to do here from any
+// thread: no COM re-entrancy, and nothing shared with the capture thread
+// except the HANDLE value itself, which the capture thread guarantees stays
+// valid for as long as this handler could still be invoked (see
+// CaptureThread's teardown: remove_FrameArrived happens, and is given the
+// chance to finish any in-flight Invoke, before the event handle is ever
+// closed).
+//
+// Belt and braces on top of that: remove_FrameArrived is the standard WinRT
+// event-source contract for "no Invoke is still in flight once this
+// returns", but nothing here depends on that guarantee being ironclad across
+// every WinRT implementation. If a straggler Invoke ever did land after
+// CaptureThread closed frameEvent, SetEvent on a stale HANDLE value is not
+// just wrong, it is dangerous: Windows recycles HANDLE values, so it could
+// signal a completely unrelated kernel object created after this one closed.
+// ClearEvent() (called from CaptureThread's teardown, strictly before the
+// close) makes that provably harmless instead: frameEvent_ is an atomic, so
+// a straggler reads nullptr and calls SetEvent(nullptr), which fails benignly
+// (returns 0, GetLastError() ERROR_INVALID_HANDLE) rather than touching
+// anything real.
+// ---------------------------------------------------------------------------
+
+class FrameArrivedHandler
+    : public Microsoft::WRL::RuntimeClass<
+          Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
+          ABI::Windows::Foundation::ITypedEventHandler<WGC::Direct3D11CaptureFramePool*, IInspectable*>> {
+ public:
+  HRESULT RuntimeClassInitialize(HANDLE frameEvent) {
+    frameEvent_.store(frameEvent, std::memory_order_release);
+    return S_OK;
+  }
+
+  IFACEMETHODIMP Invoke(WGC::IDirect3D11CaptureFramePool*, IInspectable*) override {
+    // Load once rather than SetEvent(frameEvent_.load()) inline -- not for
+    // correctness (both read it exactly once either way), just so the value
+    // actually being signalled is visible in a debugger/crash dump.
+    HANDLE h = frameEvent_.load(std::memory_order_acquire);
+    if (h) SetEvent(h);  // null after ClearEvent() -- see the class comment above
+    return S_OK;
+  }
+
+  // Called by CaptureThread's teardown, after remove_FrameArrived and before
+  // frameEvent is closed -- see the class comment above for why this exists
+  // as a second line of defence rather than trusting remove_FrameArrived
+  // alone. Atomic: written from the capture thread, read from whatever
+  // thread WinRT happens to run Invoke() on.
+  void ClearEvent() { frameEvent_.store(nullptr, std::memory_order_release); }
+
+ private:
+  std::atomic<HANDLE> frameEvent_{nullptr};  // not owned; CaptureThread owns and closes it
+};
+
+// ---------------------------------------------------------------------------
+// Capture thread: owns the whole session lifetime. FrameArrived (subscribed
+// below, once the frame pool exists) wakes this thread the instant WGC has a
+// new surface -- see the file header for why this replaced polling
+// TryGetNextFrame() on a fixed cadence. All D3D/WGC work still happens here,
+// on this one thread, exactly as before: FrameArrivedHandler's own Invoke()
+// (a WinRT-owned thread) does nothing but SetEvent() the handle this thread
+// waits on.
 // ---------------------------------------------------------------------------
 
 void CaptureThread(HWND hwnd) {
   HRESULT hr = RoInitialize(RO_INIT_MULTITHREADED);
   const bool roInitialised = SUCCEEDED(hr) || hr == S_FALSE;
+
+  // Thread-owned for this session's whole life: created here, closed in this
+  // function's own teardown below, and touched by no other thread except
+  // FrameArrivedHandler::Invoke() calling SetEvent on frameEvent -- see that
+  // class's comment for why that is the only safe thing it does. Locals, not
+  // globals like g_stopEvent: nothing outside this thread ever needs to see
+  // or signal them. g_stopEvent has to be a global because Stop() (JS thread)
+  // creates/signals/closes it before this thread even exists, on the first
+  // two counts; the frame-arrived event and its registration token have no
+  // such cross-thread requirement.
+  HANDLE frameEvent = nullptr;
+  EventRegistrationToken frameArrivedToken{};
+  bool frameArrivedRegistered = false;
+  // Function-scope, not the nested block it used to be built in below --
+  // kept alive here, deliberately, through the ClearEvent()/CloseHandle(
+  // frameEvent) pair in this function's teardown, so the FrameArrivedHandler
+  // object itself cannot be destroyed out from under a straggler Invoke()
+  // either -- see ClearEvent()'s own comment on the class for the handle
+  // half of this defence; this is the object-lifetime half. add_FrameArrived
+  // below takes its own reference too (the standard WinRT event-source
+  // contract), so this ComPtr is redundant in the common case -- it only
+  // matters if that reference is ever dropped before this thread expects.
+  ComPtr<FrameArrivedHandler> frameArrivedHandler;
+
+  // High-resolution pacing/heartbeat timer (item 3 of this PR). Not the
+  // delivery-pacing decision any more -- see lastDeliveredTs below -- just
+  // what wakes this loop close to every requested interval when FrameArrived
+  // alone would not: a static window legitimately produces no FrameArrived
+  // events at all, and without some periodic wake this thread would never
+  // re-check IsWindow(hwnd) or g_stopEvent until content changed again, which
+  // could be never. Needs Windows 10 1803+ (build 17134) for
+  // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION; CreateWaitableTimerExW returns
+  // NULL below that, in which case this falls back to timeBeginPeriod(1) + a
+  // plain millisecond WaitForMultipleObjects timeout -- the same ~1ms-of-
+  // slack this file always paid on those systems before this PR. Created
+  // once here and closed once in the unconditional teardown below,
+  // deliberately not paired tightly around the while loop the way the old
+  // timeBeginPeriod/timeEndPeriod calls were -- so an early `break` out of
+  // the setup steps just below can never leave it unclosed or leave
+  // timeBeginPeriod uncompensated. See the teardown for where that happens.
+  HANDLE pacingTimer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+  const bool haveHighResTimer = pacingTimer != nullptr;
+  if (!haveHighResTimer) {
+    // Windows' default system timer resolution is ~15.6ms, so without this,
+    // a millisecond-granularity wait actually wakes up on the next ~15.6ms
+    // tick after the requested duration. Only needed on this fallback path --
+    // the high-resolution timer above does not depend on the global system
+    // timer resolution at all.
+    timeBeginPeriod(1);
+  }
 
   do {
     if (!roInitialised) {
@@ -578,6 +1089,31 @@ void CaptureThread(HWND hwnd) {
     if (!EnsurePool(static_cast<UINT32>(itemSize.Width), static_cast<UINT32>(itemSize.Height))) break;
     if (!EnsurePipeline(static_cast<UINT32>(itemSize.Width), static_cast<UINT32>(itemSize.Height))) break;
 
+    // Subscribe before StartCapture() below so no frame can arrive
+    // un-observed. Keyed off the pool's creation, not every EnsurePool call:
+    // EnsurePool's Recreate() branch (buffer size/format/count change on a
+    // resize) reuses the same frame-pool COM object and therefore the same
+    // subscription, so this only needs to run once per session -- the
+    // EnsurePool call just above always takes its creation branch here,
+    // since g_framePool was reset to null by the previous session's own
+    // teardown (see below) before this thread ever started.
+    frameEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!frameEvent) {
+      SetError("CreateEvent(frameEvent)", HRESULT_FROM_WIN32(GetLastError()));
+      break;
+    }
+    hr = Microsoft::WRL::MakeAndInitialize<FrameArrivedHandler>(&frameArrivedHandler, frameEvent);
+    if (FAILED(hr)) {
+      SetError("MakeAndInitialize(FrameArrivedHandler)", hr);
+      break;
+    }
+    hr = g_framePool->add_FrameArrived(frameArrivedHandler.Get(), &frameArrivedToken);
+    if (FAILED(hr)) {
+      SetError("Direct3D11CaptureFramePool::add_FrameArrived", hr);
+      break;
+    }
+    frameArrivedRegistered = true;
+
     hr = g_framePool->CreateCaptureSession(g_item.Get(), &g_session);
     if (FAILED(hr)) {
       SetError("CreateCaptureSession", hr);
@@ -589,49 +1125,90 @@ void CaptureThread(HWND hwnd) {
       break;
     }
 
+    // Real per-frame timestamps (item 2 of this PR): pace and deliver on
+    // frame->get_SystemRelativeTime() -- a 100ns-unit, monotonically
+    // increasing clock WGC stamps on the frame itself -- not on wall-clock
+    // time this thread happens to observe the frame at. That distinction is
+    // what actually removes the poll-vs-present aliasing the file header
+    // describes: FrameArrived alone only fixes *when* this thread wakes up,
+    // not *which* frame it is looking at relative to the source's own
+    // cadence. A source presenting faster than the requested delivery rate
+    // (a 144Hz desktop feeding a 30fps share) still needs frames dropped
+    // deliberately, not accidentally by whichever one happened to be newest
+    // when a fixed-cadence poll landed.
+    double lastDeliveredTs = -1.0;  // 100ns units; negative = "always take the first frame"
 
-    // Windows' default system timer resolution is ~15.6ms, so without this,
-    // WaitForSingleObject(..., 33) actually wakes up on the next ~15.6ms tick
-    // after the requested duration -- i.e. closer to 48ms, not 33ms. That
-    // alone was enough to cap this loop at ~21fps when asked for 30 (measured
-    // directly: harness showed ~47ms actual inter-frame spacing against a
-    // 33ms request). timeBeginPeriod(1) asks the scheduler for ~1ms
-    // resolution for as long as this thread runs; timeEndPeriod(1) below
-    // gives it back.
-    timeBeginPeriod(1);
-
-    // Fixed-cadence scheduling: target the next tick at a constant offset
-    // from the *previous target*, not from "now" -- a plain fixed-length
-    // sleep would add each iteration's own processing time (CreateVideoProcessorInputView,
-    // the Blt, the grab, the NV12 packing copy) on top of the wait, drifting
-    // the achieved rate below the requested one by roughly that amount every
-    // frame. Computing the wait as "time until the next scheduled tick"
-    // instead absorbs that processing time into the interval rather than
-    // adding to it.
-    auto nextTick = std::chrono::steady_clock::now() +
-                    std::chrono::duration<double>(1.0 / g_fps.load(std::memory_order_relaxed));
+    // nextTick now only drives pacingTimer -- see that HANDLE's own comment
+    // above for why it no longer has any say in which frames get delivered.
+    auto nextTick = std::chrono::steady_clock::now();
 
     while (g_running.load()) {
       const auto now = std::chrono::steady_clock::now();
-      const auto waitFor = std::chrono::duration_cast<std::chrono::milliseconds>(nextTick - now);
-      const DWORD waitMs = waitFor.count() > 0 ? static_cast<DWORD>(waitFor.count()) : 0;
-      // Re-read every iteration so a mid-share rate change takes effect on the
-      // very next frame instead of the next capture session.
-      const auto interval =
-          std::chrono::duration<double>(1.0 / g_fps.load(std::memory_order_relaxed));
+      // Re-read every iteration, same reasoning as before this PR: a
+      // mid-share setFps() must take effect on the very next wait, not the
+      // next session.
+      const double fps = g_fps.load(std::memory_order_relaxed);
+      const auto interval = std::chrono::duration<double>(1.0 / fps);
+      const double interval100ns = 1.0e7 / fps;
+
+      // Resync, not accumulate, when behind: if this loop has fallen more
+      // than one whole interval behind schedule (a slow VideoProcessorBlt/
+      // Map, the process itself getting descheduled, ...), snapping nextTick
+      // forward to now avoids the old failure mode this exact pattern used to
+      // have here -- repeatedly adding one interval to a nextTick that is
+      // already in the past computes a wait of 0 on every following
+      // iteration until the deficit is paid off one interval at a time, i.e.
+      // a busy spin. The stakes are lower now than before this PR --
+      // pacingTimer no longer paces delivery, only wakes the liveness checks
+      // below -- but the failure mode is exactly as easy to reintroduce, so
+      // it gets the same fix.
+      if (now - nextTick > interval) nextTick = now;
       nextTick += std::chrono::duration_cast<std::chrono::steady_clock::duration>(interval);
 
-      // WaitForSingleObject IS the pacing: whatever WGC produced during this
-      // sleep beyond the single frame we grab below is simply left in the
-      // pool to be dropped by the drain loop, never queued up for later.
-      if (WaitForSingleObject(g_stopEvent, waitMs) == WAIT_OBJECT_0) break;
+      DWORD waitResult;
+      if (haveHighResTimer) {
+        const auto waitDuration = nextTick - now;
+        const LONGLONG wait100ns = (std::max)(
+            static_cast<LONGLONG>(0),
+            std::chrono::duration_cast<std::chrono::duration<LONGLONG, std::ratio<1, 10000000>>>(waitDuration)
+                .count());
+        LARGE_INTEGER dueTime;
+        dueTime.QuadPart = -wait100ns;  // negative = relative to now, 100ns units
+        if (!SetWaitableTimerEx(pacingTimer, &dueTime, 0, nullptr, nullptr, nullptr, 0)) {
+          SetError("SetWaitableTimerEx", HRESULT_FROM_WIN32(GetLastError()));
+          break;
+        }
+        HANDLE handles[3] = {g_stopEvent, frameEvent, pacingTimer};
+        waitResult = WaitForMultipleObjects(3, handles, FALSE, INFINITE);
+      } else {
+        // Fallback: the coarse millisecond wait this file used exclusively
+        // before this PR, now racing frameEvent too instead of being the
+        // sole pacing mechanism -- see the file header.
+        const auto waitFor = std::chrono::duration_cast<std::chrono::milliseconds>(nextTick - now);
+        const DWORD waitMs = waitFor.count() > 0 ? static_cast<DWORD>(waitFor.count()) : 0;
+        HANDLE handles[2] = {g_stopEvent, frameEvent};
+        waitResult = WaitForMultipleObjects(2, handles, FALSE, waitMs);
+      }
+
+      if (waitResult == WAIT_OBJECT_0) break;  // g_stopEvent
+      if (waitResult == WAIT_FAILED) {
+        SetError("WaitForMultipleObjects", HRESULT_FROM_WIN32(GetLastError()));
+        break;
+      }
+      // Anything else -- frameEvent, pacingTimer, or WAIT_TIMEOUT on the
+      // fallback path -- all fall through to the same check-and-drain below.
+      // Which one woke this iteration does not matter: draining to the
+      // newest frame and pacing on its own timestamp behaves correctly
+      // whether this wait was satisfied by new content, the heartbeat, or a
+      // coarse timeout.
       if (!IsWindow(hwnd)) {
         SetError("captured window", HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE));
         break;
       }
 
       // Drain the pool, keeping only the newest frame -- under load WGC can
-      // have queued more than one since our last poll.
+      // still have queued more than one since our last wait (the event tells
+      // us "at least one", not "exactly one").
       ComPtr<WGC::IDirect3D11CaptureFrame> frame;
       for (;;) {
         ComPtr<WGC::IDirect3D11CaptureFrame> next;
@@ -639,7 +1216,22 @@ void CaptureThread(HWND hwnd) {
         if (FAILED(frHr) || !next) break;
         frame = next;  // the previously-held frame (if any) is Released here
       }
-      if (!frame) continue;  // nothing new since last poll
+      if (!frame) continue;  // nothing new since last wait
+
+      // Pace on the frame's own timestamp -- see the comment above
+      // lastDeliveredTs's declaration for why wall-clock time would not do.
+      // 0.9x instead of a strict >= interval100ns leaves headroom for
+      // ordinary sub-frame jitter in exactly when WGC stamps (and this
+      // thread observes) each present -- without it, a delivery landing a
+      // hair under one full interval late would be pushed out to two
+      // intervals instead of one.
+      ABI::Windows::Foundation::TimeSpan relativeTime{};
+      hr = frame->get_SystemRelativeTime(&relativeTime);
+      const double ts = SUCCEEDED(hr) ? static_cast<double>(relativeTime.Duration) : 0.0;
+      if (lastDeliveredTs >= 0.0 && (ts - lastDeliveredTs) < 0.9 * interval100ns) {
+        continue;  // faster than the requested delivery rate -- drop (Release only, same as any other drop)
+      }
+      lastDeliveredTs = ts;
 
       WG::SizeInt32 contentSize{};
       frame->get_ContentSize(&contentSize);
@@ -717,14 +1309,14 @@ void CaptureThread(HWND hwnd) {
       // lived in.
       D3D11_TEXTURE2D_DESC srcDesc{};
       srcTex->GetDesc(&srcDesc);
-      ProcessFrame(srcTex.Get(), srcDesc.Width, srcDesc.Height);
+      ProcessFrame(srcTex.Get(), srcDesc.Width, srcDesc.Height, ts / 10.0);
 
       // Recreate the pool for the window's current content size if it has
       // drifted from what the pool was last built for. Deliberately after
       // ProcessFrame and gated on the POOL's own last size (g_poolW/g_poolH),
       // not on whether it differs from srcDesc -- this frame's texture came
       // from the pool as it was *before* any Recreate below, so it will
-      // legitimately still show a resize in progress on the very next poll
+      // legitimately still show a resize in progress on the very next wait
       // too; that is expected, not a bug, and is exactly what keeps this
       // converging (one Recreate per real size change) instead of every
       // frame re-deciding based on a comparison that's already stale by the
@@ -741,9 +1333,43 @@ void CaptureThread(HWND hwnd) {
         }
       }
     }
-
-    timeEndPeriod(1);
   } while (false);
+
+  // Signal exit to JS, once, whatever kind of exit this was -- including an
+  // ordinary JS-driven stop() (g_lastError may be empty, or stale from an
+  // earlier transient hiccup this session survived; the JS side already
+  // discards this signal correctly for a normal stop, since `active` is null
+  // there by the time it arrives). This is what lets screenCapture.ts's
+  // onFrame react immediately instead of waiting out the watchdog. See A3
+  // item 5.
+  {
+    auto* death = new FramePayload();
+    death->isDeath = true;
+    death->reason = GetErrorText();
+    Emit(death);
+  }
+
+  // Revoke the FrameArrived subscription before closing the frame pool --
+  // required ordering, not just tidiness: Close() below tells WGC to stop
+  // capturing immediately, and revoking first guarantees no Invoke can land
+  // on a handler this thread is about to outlive. remove_FrameArrived is the
+  // standard WinRT event-source contract for this: it does not return until
+  // any in-flight Invoke on another thread has finished, and guarantees no
+  // future one is dispatched -- which is exactly what makes it safe to close
+  // frameEvent, below, once teardown reaches it. See FrameArrivedHandler's
+  // own comment for the other half of this guarantee.
+  if (frameArrivedRegistered && g_framePool) {
+    g_framePool->remove_FrameArrived(frameArrivedToken);
+    frameArrivedRegistered = false;
+  }
+  // Second line of defence, ordered strictly after remove_FrameArrived and
+  // strictly before CloseHandle(frameEvent) below -- see ClearEvent()'s own
+  // comment on the FrameArrivedHandler class for why this exists even though
+  // remove_FrameArrived already claims to guarantee the same thing. Guarded,
+  // not unconditional: frameArrivedHandler is still null if
+  // MakeAndInitialize itself never succeeded (an early break above), in
+  // which case there was never a subscription for a straggler to invoke.
+  if (frameArrivedHandler) frameArrivedHandler->ClearEvent();
 
   // Teardown, in reverse order of acquisition. Closing the session/pool
   // (rather than only Releasing them) tells WGC to stop capturing
@@ -758,7 +1384,7 @@ void CaptureThread(HWND hwnd) {
   }
 
   g_outputView.Reset();
-  g_stagingTex.Reset();
+  for (auto& slot : g_stagingRing) slot.tex.Reset();
   g_outputTex.Reset();
   g_videoProcessor.Reset();
   g_vpEnum.Reset();
@@ -773,6 +1399,35 @@ void CaptureThread(HWND hwnd) {
   g_device.Reset();
   g_srcW = g_srcH = g_outW = g_outH = 0;
   g_poolW = g_poolH = 0;
+  g_lastTargetW = g_lastTargetH = 0;
+  g_stagingRingIndex = 0;
+  g_stagingRingFilled = 0;
+
+  // frameEvent is safe to close now regardless of how CaptureThread got here
+  // (a clean stop, a mid-setup failure, an unrecoverable per-frame error) --
+  // remove_FrameArrived above already guarantees the one other thread that
+  // could ever touch it (FrameArrivedHandler::Invoke) can no longer be
+  // invoked, and ClearEvent() just above means even a straggler that beat
+  // that guarantee reads nullptr instead of this about-to-be-closed value.
+  // frameArrivedHandler itself is still alive here too (it does not go out
+  // of scope until this function returns), so there is no window where the
+  // handler object exists with a dangling frameEvent_ pointing at a closed
+  // handle. If a break happened before frameEvent was even created (an
+  // early device/session setup failure), it is still nullptr here and this
+  // is a no-op.
+  if (frameEvent) {
+    CloseHandle(frameEvent);
+    frameEvent = nullptr;
+  }
+  // Paired with the unconditional creation at the top of this function, not
+  // with any single point inside the loop -- see pacingTimer's own comment
+  // there for why it is closed once here instead of immediately after the
+  // while loop the way the old timeBeginPeriod/timeEndPeriod pair was.
+  if (pacingTimer) {
+    CloseHandle(pacingTimer);
+  } else {
+    timeEndPeriod(1);
+  }
 
   if (roInitialised) RoUninitialize();
 
@@ -858,6 +1513,18 @@ Napi::Value IsSupported(const Napi::CallbackInfo& info) {
 
 Napi::Value Start(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  // Checked before g_running: once Stop() below moves g_thread into a
+  // StopWorker, g_thread.joinable() goes false immediately even though the
+  // join it names is still running on the threadpool, so g_running/joinable
+  // alone cannot tell "idle" from "still shutting down" for that whole
+  // window. g_stopping is the flag that covers it (set in Stop(), cleared
+  // only once StopWorker::OnOK/OnError actually runs). g_thread.joinable()
+  // is kept here too as a belt-and-braces check for any future path that
+  // might leave g_thread set without going through g_stopping.
+  if (g_stopping.load() || g_thread.joinable()) {
+    Napi::Error::New(env, "previous capture still shutting down").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
   if (g_running.load()) {
     Napi::Error::New(env, "capture already running").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -875,18 +1542,23 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  g_targetW = info[1].As<Napi::Number>().Uint32Value();
-  g_targetH = info[2].As<Napi::Number>().Uint32Value();
+  const UINT32 targetW = info[1].As<Napi::Number>().Uint32Value();
+  const UINT32 targetH = info[2].As<Napi::Number>().Uint32Value();
   const double startFps = info[3].As<Napi::Number>().DoubleValue();
   g_fps.store(startFps > 0 ? startFps : 30.0);
-  if (g_targetW < 2 || g_targetH < 2) {
+  if (targetW < 2 || targetH < 2) {
     Napi::Error::New(env, "targetWidth/targetHeight must be >= 2").ThrowAsJavaScriptException();
     return env.Undefined();
   }
+  g_targetW.store(targetW, std::memory_order_relaxed);
+  g_targetH.store(targetH, std::memory_order_relaxed);
 
-  g_lastError.clear();
+  SetErrorText(std::string());
   g_srcW = g_srcH = g_outW = g_outH = 0;
   g_poolW = g_poolH = 0;
+  g_lastTargetW = g_lastTargetH = 0;
+  g_stagingRingIndex = 0;
+  g_stagingRingFilled = 0;
   if (g_stopEvent) CloseHandle(g_stopEvent);
   g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
@@ -903,7 +1575,24 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
   // Three slots absorb that jitter while still bounding latency to two extra
   // frames (~33ms at 60fps) and still dropping rather than growing without
   // limit, so Emit()'s drop path stays real.
-  g_tsfn = Napi::ThreadSafeFunction::New(env, info[4].As<Napi::Function>(), "winCapture", 1, 3);
+  //
+  // New()'s signature is (env, callback, resourceName, maxQueueSize,
+  // initialThreadCount) -- the "3" below is the queue depth just argued for
+  // above, NOT a thread count. initialThreadCount is 1 because exactly one
+  // native thread ever touches g_tsfn: CaptureThread does every
+  // NonBlockingCall (via Emit(), woken by its own WaitForMultipleObjects
+  // wait loop -- see the file header for the FrameArrived-subscription model
+  // and FrameArrivedHandler's own comment for why that WinRT-owned callback
+  // thread does nothing but SetEvent() and never reaches g_tsfn itself) and
+  // also owns the one and only Release() in its own teardown further down
+  // this file. initialThreadCount has to equal the
+  // number of Release() calls that will ever happen: N-API seeds the TSFN's
+  // reference count at this value instead of requiring N separate Acquire()
+  // calls, and the TSFN only finalises -- freeing its libuv handle -- once
+  // that count is released back to zero. Set this above the number of
+  // Release() calls actually made and the count never reaches zero: the TSFN
+  // is never finalised and a libuv handle leaks every session.
+  g_tsfn = Napi::ThreadSafeFunction::New(env, info[4].As<Napi::Function>(), "winCapture", 3, 1);
   // Per-session, so a later share does not inherit an earlier one's count.
   g_framesRefused.store(0);
   g_poolResizes.store(0);
@@ -912,21 +1601,116 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
   return Napi::Boolean::New(env, true);
 }
 
-Napi::Value Stop(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
-  if (!g_running.load() && !g_thread.joinable()) return env.Undefined();
+// Sets the flags that ask the capture thread to exit and returns
+// immediately -- never blocks, never touches g_thread. Split out of Stop()
+// so both Stop() and the AddCleanupHook registered in Init() (process exit
+// without an explicit stop() first -- see R5) can request the same
+// shutdown without duplicating it.
+void SignalStop() {
   g_running.store(false);
   if (g_stopEvent) SetEvent(g_stopEvent);
-  if (g_thread.joinable()) g_thread.join();
-  if (g_stopEvent) {
-    CloseHandle(g_stopEvent);
-    g_stopEvent = nullptr;
+}
+
+// Joins the capture thread off the main thread and resolves stop()'s
+// promise once that join completes. This is item 3's whole point: the old
+// synchronous Stop() ran g_thread.join() directly on the JS/Electron main
+// thread, which could block it for as long as one CaptureThread iteration
+// takes to notice g_stopEvent and unwind (WGC session close, D3D device
+// teardown) -- exactly the main-thread freeze this PR exists to remove
+// (R4).
+//
+// g_thread is moved in, not referenced: Execute() below runs on a libuv
+// threadpool thread, so this worker needs its own copy of the std::thread
+// handle rather than touching the global from two threads at once. The
+// move also makes g_thread.joinable() go false the instant Stop() returns,
+// which is exactly what lets a concurrent Start() tell "idle" from "still
+// shutting down" via g_stopping instead (see Start()'s guard above).
+class StopWorker : public Napi::AsyncWorker {
+ public:
+  StopWorker(Napi::Env env, Napi::Promise::Deferred deferred, std::thread thread)
+      : Napi::AsyncWorker(env), deferred_(deferred), thread_(std::move(thread)) {}
+
+  // Runs on the libuv threadpool -- must not touch any Napi:: type (env,
+  // values, the deferred) from here; that is exactly what OnOK/OnError
+  // (called back on the JS thread once this returns) are for.
+  void Execute() override {
+    if (thread_.joinable()) thread_.join();
   }
-  return env.Undefined();
+
+  // Back on the JS thread. Handle close happens here, not in Execute(), per
+  // item 5's instruction -- keeping every mutation of g_stopEvent on this
+  // one thread (as opposed to split across two) keeps its lifetime story
+  // simple: exactly one thread (JS) ever creates or closes it, exactly one
+  // thread (the capture thread, via WaitForSingleObject) ever waits on it.
+  void OnOK() override {
+    if (g_stopEvent) {
+      CloseHandle(g_stopEvent);
+      g_stopEvent = nullptr;
+    }
+    g_stopping.store(false);
+    deferred_.Resolve(Env().Undefined());
+    // Any stop() calls that arrived while this join was still in flight
+    // (see Stop()'s comment) resolve now too, alongside the primary
+    // deferred -- same outcome, same tick.
+    for (auto& d : g_pendingStopDeferreds) d.Resolve(Env().Undefined());
+    g_pendingStopDeferreds.clear();
+  }
+
+  void OnError(const Napi::Error& e) override {
+    // Execute() above only calls std::thread::join(), which does not throw
+    // for a joinable thread, so this path is not expected to run in
+    // practice. It exists so g_stopping cannot get stuck true forever (and
+    // Start() permanently refuse) if AsyncWorker's own machinery ever
+    // reports a failure some other way; reject rather than resolve so a
+    // caller who somehow hits this sees it instead of believing stop()
+    // silently succeeded.
+    g_stopping.store(false);
+    deferred_.Reject(e.Value());
+    for (auto& d : g_pendingStopDeferreds) d.Reject(e.Value());
+    g_pendingStopDeferreds.clear();
+  }
+
+ private:
+  Napi::Promise::Deferred deferred_;
+  std::thread thread_;
+};
+
+Napi::Value Stop(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  Napi::Promise::Deferred deferred = Napi::Promise::Deferred::New(env);
+  // A stop is already in flight: g_stopping is set below and only cleared
+  // once StopWorker::OnOK/OnError actually runs. By the time it is true,
+  // g_running is already false (SignalStop cleared it) and g_thread is
+  // already non-joinable (std::move()'d into the worker below) -- so the
+  // "nothing to stop" check just past this one would otherwise resolve a
+  // second stop() immediately, before the in-flight join has actually
+  // finished. That breaks the contract Start() relies on (it throws
+  // "previous capture still shutting down" for the whole g_stopping
+  // window): a caller doing `await stop(); start()` would see this stop()
+  // resolve early and then hit that throw anyway. Queue this deferred
+  // instead and let the in-flight StopWorker's OnOK/OnError resolve/reject
+  // it alongside the primary one.
+  if (g_stopping.load()) {
+    g_pendingStopDeferreds.push_back(std::move(deferred));
+    return g_pendingStopDeferreds.back().Promise();
+  }
+  if (!g_running.load() && !g_thread.joinable()) {
+    // Nothing to stop -- resolve immediately. Matches the stub's
+    // already-resolved promise (see stub.cc) so callers see the same shape
+    // on every platform regardless of whether anything was actually
+    // running.
+    deferred.Resolve(env.Undefined());
+    return deferred.Promise();
+  }
+  SignalStop();
+  g_stopping.store(true);
+  auto* worker = new StopWorker(env, deferred, std::move(g_thread));
+  worker->Queue();
+  return deferred.Promise();
 }
 
 Napi::Value LastError(const Napi::CallbackInfo& info) {
-  return Napi::String::New(info.Env(), g_lastError);
+  return Napi::String::New(info.Env(), GetErrorText());
 }
 
 /**
@@ -948,12 +1732,86 @@ Napi::Value SetFps(const Napi::CallbackInfo& info) {
   return Napi::Boolean::New(env, true);
 }
 
+/**
+ * Change the target bounding box of the capture already running (item 1 of
+ * PR C3: a mid-share preset change, e.g. 1080p -> 720p).
+ *
+ * Cheap and safe at any time, same reasoning as SetFps just above: the
+ * capture thread's own EnsurePipeline call re-reads g_targetW/g_targetH
+ * every frame (see its re-key check) and rebuilds the video processor and
+ * output/staging textures for the new box on the very next frame -- there is
+ * no session to tear down and no pipeline to rebuild here on the JS thread.
+ * Returns false when nothing is capturing or the values are not usable, so
+ * the caller can log rather than assume it took, same contract as SetFps.
+ */
+Napi::Value SetTarget(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (!g_running.load()) return Napi::Boolean::New(env, false);
+  if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsNumber()) return Napi::Boolean::New(env, false);
+  const double w = info[0].As<Napi::Number>().DoubleValue();
+  const double h = info[1].As<Napi::Number>().DoubleValue();
+  // Same >= 2 floor Start() enforces (NV12's 2x2 chroma subsampling), and an
+  // upper bound generous enough to never be the limiting factor for any real
+  // preset -- EnsurePipeline's own fit-inside clamp-to-1 is what actually
+  // stops a source from being upscaled, this is only a sanity check against
+  // a clearly-wrong value crossing IPC from a remote page.
+  if (!(w >= 2) || !(h >= 2) || w > 8192 || h > 8192) return Napi::Boolean::New(env, false);
+  g_targetW.store(static_cast<UINT32>(w), std::memory_order_relaxed);
+  g_targetH.store(static_cast<UINT32>(h), std::memory_order_relaxed);
+  return Napi::Boolean::New(env, true);
+}
+
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("isSupported", Napi::Function::New(env, IsSupported));
   exports.Set("start", Napi::Function::New(env, Start));
   exports.Set("stop", Napi::Function::New(env, Stop));
   exports.Set("setFps", Napi::Function::New(env, SetFps));
+  exports.Set("setTarget", Napi::Function::New(env, SetTarget));
   exports.Set("lastError", Napi::Function::New(env, LastError));
+
+  // Item 5 / R5: nothing previously stopped native capture on quit. Left
+  // alone, an in-progress g_thread reaches static destruction as a still-
+  // joinable std::thread, which is std::terminate() -- or, if teardown
+  // order goes the other way, a deadlock in DLL detach instead. This hook
+  // runs synchronously on the JS/main thread as the environment is torn
+  // down (Electron quit, or a plain process exit), so it is the last
+  // chance to request an orderly stop before that.
+  //
+  // Bounded, not join()-forever: a wedged capture thread must not hang
+  // process exit. 3000ms is generous against how long CaptureThread's own
+  // teardown actually takes (WGC session/pool Close(), a handful of D3D
+  // Release() calls) while still bounding the worst case. On timeout,
+  // detach rather than join -- a detached thread that outlives the process
+  // by a few more milliseconds while the OS is tearing everything down
+  // anyway is harmless; destroying a still-joinable std::thread is not.
+  //
+  // If stop() was already called and is mid-flight (StopWorker joining on
+  // the threadpool), g_thread was already std::move()'d out of and is not
+  // joinable here, so this is a no-op -- correctly: that join is already
+  // in progress and Node keeps the loop alive for it regardless.
+  env.AddCleanupHook([]() {
+    if (!g_thread.joinable()) return;
+    SignalStop();
+    HANDLE handle = g_thread.native_handle();
+    if (WaitForSingleObject(handle, 3000) == WAIT_OBJECT_0) {
+      g_thread.join();
+      // Safe here, and ONLY here: the one thread that ever waits on
+      // g_stopEvent has now fully exited (join() would not have returned
+      // otherwise), so nothing can touch this handle again. In the detach
+      // branch below the thread may still be running -- possibly not yet
+      // as far as its own WaitForSingleObject(g_stopEvent, ...) call --
+      // closing the handle there would hand that call an invalid handle.
+      // Leaking it in that one case is deliberate: the process is exiting
+      // either way, and the OS reclaims the handle regardless.
+      if (g_stopEvent) {
+        CloseHandle(g_stopEvent);
+        g_stopEvent = nullptr;
+      }
+    } else {
+      g_thread.detach();
+    }
+  });
+
   return exports;
 }
 

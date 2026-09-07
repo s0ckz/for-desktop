@@ -150,6 +150,18 @@ constexpr DWORD kSampleRate = 48000;
 constexpr WORD kChannels = 2;
 constexpr WORD kBitsPerSample = 16;
 
+// Item 2: bound on ActivateAudioInterfaceAsync's completion wait, shared by
+// CaptureThread's (Single mode) and ActivateStream's (Mix mode) activation
+// blocks -- both used INFINITE. A wedged audio-engine/driver combination
+// left either wait with no way out short of killing the process; on the
+// Single-mode path that wait ran wherever CaptureThread ran (already off
+// the JS thread), but it still meant a share could never be started,
+// stopped, or retried. 5000ms mirrors the reasoning already used for
+// StartSystemExcluding()'s bounded first-scan wait further down this file
+// (generous against real activation latency, typically tens of ms, while
+// still bounding the worst case).
+constexpr DWORD kActivationTimeoutMs = 5000;
+
 // --- Mixer tuning constants -------------------------------------------------
 // Grouped here, all named, so the reasoning for each number lives in one
 // place instead of scattered as magic literals through the mixer below.
@@ -212,15 +224,55 @@ std::atomic<CaptureMode> g_mode{CaptureMode::Idle};
 
 std::thread g_thread;
 std::atomic<bool> g_running{false};
+// Set the instant a stop is requested and cleared only once the join has
+// actually completed -- see win-capture's addon.cc for the full reasoning
+// (identical shape). Shared by both Single mode (g_thread) and Mix mode
+// (the three mixer threads below): either path sets this in Stop(), either
+// path's StopWorker clears it in OnOK/OnError.
+std::atomic<bool> g_stopping{false};
 HANDLE g_stopEvent = nullptr;
 Napi::ThreadSafeFunction g_tsfn;
+// stop() calls that arrived while g_stopping was already true -- i.e. while
+// an earlier stop()'s StopWorker join was still in flight, for either
+// mode. Resolved (or rejected, on the OnError path) alongside the primary
+// deferred once that join actually completes -- see Stop()'s own comment,
+// and win-capture's addon.cc for the identical shape. JS-thread-only:
+// Stop() and StopWorker::OnOK/OnError both run there, so no lock is
+// needed.
+std::vector<Napi::Promise::Deferred> g_pendingStopDeferreds;
 std::atomic<int> g_outstanding{0};
+
+// g_lastError (Single-mode) is written by CaptureThread (SetError) while
+// the JS/main thread reads it via lastError() -- concurrent unsynchronized
+// access to a std::string is undefined behaviour (a torn SSO-to-heap
+// transition is real, not theoretical). Same fix as win-capture: a mutex
+// around every access, least-clever option on purpose. g_mixLastError
+// (Mix mode, further down) gets its own instance of the same pattern --
+// see its declaration near the mixer state.
+//
+// Named GetErrorText/SetErrorText, not GetLastError/SetLastError: those are
+// Win32 API functions (windows.h, above), and a same-named helper in this
+// anonymous namespace would shadow them for every unqualified call below it
+// in this translation unit. Nothing here calls the real one today, but
+// win-capture's addon.cc hit exactly that landmine, so the two addons keep
+// the same naming rather than leaving it armed here too.
+std::mutex g_lastErrorMutex;
 std::string g_lastError;
+
+std::string GetErrorText() {
+  std::lock_guard<std::mutex> lock(g_lastErrorMutex);
+  return g_lastError;
+}
+
+void SetErrorText(std::string message) {
+  std::lock_guard<std::mutex> lock(g_lastErrorMutex);
+  g_lastError = std::move(message);
+}
 
 void SetError(const char* stage, HRESULT hr) {
   char buf[160];
   snprintf(buf, sizeof(buf), "%s failed (hr=0x%08lX)", stage, static_cast<unsigned long>(hr));
-  g_lastError = buf;
+  SetErrorText(buf);
 }
 
 // Emits one PCM chunk to JavaScript. `tsfn`/`outstanding` are passed in
@@ -228,12 +280,20 @@ void SetError(const char* stage, HRESULT hr) {
 // one implementation (see the backpressure comment below).
 //
 // The ThreadSafeFunction queue itself is created with size 0 (unbounded) in
-// both Start() and StartSystemExcluding() -- and must stay that way. Stop()
-// joins the producing thread from the JS thread; if the queue were bounded,
-// BlockingCall could park that producer thread waiting for room, and it
-// would never get it, because the only thread that drains the queue (the JS
-// thread) is the one sitting in join(). That is a guaranteed deadlock, not a
-// theoretical one.
+// both Start() and StartSystemExcluding() -- and must stay that way. If the
+// queue were bounded, BlockingCall could park the calling (producer) thread
+// waiting for room, and that room only ever opens up when the JS thread
+// drains the queue. UPDATED for item 3: an ordinary stop() no longer parks
+// the JS thread in join() while this producer thread is still running --
+// that join moved to the libuv threadpool (StopWorker) precisely so the
+// JS thread stays free. But the AddCleanupHook registered in Init() (item
+// 5: process exit without an explicit stop() first) still runs its own
+// bounded wait synchronously on the JS thread while a producer thread may
+// still be emptying its last few chunks -- so the same deadlock (a
+// BlockingCall parked on room only the JS thread can free, while the JS
+// thread is itself parked waiting on this producer thread) is still very
+// much reachable on that path. The queue stays unbounded for exactly that
+// reason.
 //
 // An unbounded queue trades that deadlock for a different risk: if the JS
 // event loop stalls, chunks queue up without limit. `outstanding` is a
@@ -290,7 +350,23 @@ void CaptureThread(DWORD pid, bool includeTree) {
       break;
     }
 
-    WaitForSingleObject(handler->done_, INFINITE);
+    // Item 2: bounded, not INFINITE. On timeout, handler->client_/result_
+    // are NOT read or written here: ActivateCompleted can still fire after
+    // we give up (it holds its own COM-mandated reference, independent of
+    // ours -- see ActivationHandler's Release()/AddRef()), and it writes
+    // those members with no synchronization against this thread beyond
+    // done_. Touching them without that completion signal would be a data
+    // race, not just a stale read. handler->Release() below only drops OUR
+    // reference; it is never a second decrement of anything
+    // ActivateCompleted itself does, on either path. See ActivateStream()
+    // further down for the identical shape.
+    if (WaitForSingleObject(handler->done_, kActivationTimeoutMs) != WAIT_OBJECT_0) {
+      SetError("process loopback activation timed out", HRESULT_FROM_WIN32(ERROR_TIMEOUT));
+      handler->Release();
+      if (op) op->Release();
+      break;
+    }
+
     hr = handler->result_;
     client = handler->client_;
     handler->client_ = nullptr;
@@ -520,9 +596,11 @@ Napi::Value WindowState(const Napi::CallbackInfo& info) {
 //
 // Threading: three long-lived threads once StartSystemExcluding() returns.
 //   - MixControlThread: owns activation and the 2s rescan. Activation blocks
-//     on WaitForSingleObject(handler->done_, INFINITE) exactly like
-//     CaptureThread above; putting that wait on its own thread means one
-//     wedged activation stalls only the rescan, never audio delivery.
+//     on WaitForSingleObject(handler->done_, kActivationTimeoutMs) exactly
+//     like CaptureThread above (item 2: bounded, not INFINITE, on both);
+//     putting that wait on its own thread means one wedged activation
+//     stalls only the rescan, never audio delivery, even before item 2's
+//     bound is considered.
 //   - MixCaptureThread: WaitForMultipleObjects across every live client's
 //     sample-ready event (100ms timeout) and drains whichever ones are
 //     signalled -- on ANY wake, including a timeout, ALL clients are
@@ -938,10 +1016,11 @@ struct Stream {
 // not by varying the mode here.
 //
 // Mirrors CaptureThread's activation block above almost verbatim on
-// purpose, including the INFINITE activation wait -- this function only
-// ever runs on MixControlThread, which exists specifically so a wedged
-// activation stalls a rescan, not audio delivery (see the mixer section
-// header). It deliberately does NOT call client->Start(): the caller
+// purpose, including the bounded (kActivationTimeoutMs, item 2) activation
+// wait -- this function only ever runs on MixControlThread, which exists
+// specifically so a wedged activation stalls a rescan, not audio delivery
+// (see the mixer section header), even before item 2's bound is factored
+// in. It deliberately does NOT call client->Start(): the caller
 // (RunScanPass) must publish the new Stream into g_live and signal
 // g_refreshEvent before starting the client, so MixCaptureThread's wait
 // array already includes this stream's sampleReady handle by the time
@@ -968,7 +1047,18 @@ bool ActivateStream(DWORD pid, const std::wstring& baseName, std::shared_ptr<Str
     return false;
   }
 
-  WaitForSingleObject(handler->done_, INFINITE);
+  // Item 2: bounded, not INFINITE. Same hazard as CaptureThread's block
+  // above on timeout -- handler->client_/result_ must not be touched, since
+  // ActivateCompleted can still fire afterward and write them with no
+  // synchronization beyond done_. handler->Release() here only drops OUR
+  // reference.
+  if (WaitForSingleObject(handler->done_, kActivationTimeoutMs) != WAIT_OBJECT_0) {
+    if (outError) *outError = "process loopback activation timed out";
+    handler->Release();
+    if (op) op->Release();
+    return false;
+  }
+
   hr = handler->result_;
   IAudioClient* client = handler->client_;
   handler->client_ = nullptr;
@@ -1123,7 +1213,29 @@ HANDLE g_refreshEvent = nullptr;   // set by MixControlThread whenever g_live ch
 HANDLE g_firstScanDone = nullptr;  // set once, after the first rescan completes
 Napi::ThreadSafeFunction g_mixTsfn;
 std::atomic<int> g_mixOutstanding{0};
+
+// Same race as g_lastError above, same fix: written by MixControlThread
+// (RunScanPass) while the JS/main thread reads it (mixState()) and clears
+// it (startSystemExcluding()) -- a dedicated mutex rather than sharing
+// g_lastErrorMutex, since the two strings belong to unrelated capture modes
+// and there is no reason to serialize one mode's error reporting behind the
+// other's.
+//
+// Named GetMixErrorText/SetMixErrorText, symmetric with GetErrorText/
+// SetErrorText above -- see that pair's comment for why "LastError" can't
+// be part of either name.
+std::mutex g_mixLastErrorMutex;
 std::string g_mixLastError;
+
+std::string GetMixErrorText() {
+  std::lock_guard<std::mutex> lock(g_mixLastErrorMutex);
+  return g_mixLastError;
+}
+
+void SetMixErrorText(std::string message) {
+  std::lock_guard<std::mutex> lock(g_mixLastErrorMutex);
+  g_mixLastError = std::move(message);
+}
 
 std::mutex g_liveMutex;
 std::vector<std::shared_ptr<Stream>> g_live;
@@ -1163,7 +1275,7 @@ void RunScanPass() {
   if (!ok) {
     // A transient COM/device failure must never silently mute a live
     // share -- leave g_live exactly as it is and try again next rescan.
-    g_mixLastError = "audio session enumeration failed";
+    SetMixErrorText("audio session enumeration failed");
     return;
   }
 
@@ -1243,7 +1355,7 @@ void RunScanPass() {
     std::string error;
     if (!ActivateStream(c.pid, c.baseName, &stream, &error)) {
       report.failed.push_back({c.pid, c.baseName, error});
-      g_mixLastError = error;
+      SetMixErrorText(error);
       auto& backoff = g_backoff[c.pid];
       backoff.failCount++;
       // Capped exponential backoff -- a permanently un-activatable process
@@ -1273,7 +1385,7 @@ void RunScanPass() {
         g_liveVersion.fetch_add(1, std::memory_order_release);
       }
       report.failed.push_back({c.pid, c.baseName, "IAudioClient::Start failed"});
-      g_mixLastError = "IAudioClient::Start failed";
+      SetMixErrorText("IAudioClient::Start failed");
       continue;
     }
 
@@ -1314,7 +1426,7 @@ void MixControlThread() {
 
   // Drop this thread's references to every live Stream -- i.e. clear the
   // global g_live -- here, before CoUninitialize() below, and NOT in
-  // StopMix() on the JS thread. Stream::~Stream() releases raw
+  // StopWorker::OnOK on the JS thread. Stream::~Stream() releases raw
   // IAudioClient/IAudioCaptureClient pointers that were activated under
   // this thread's own CoInitializeEx(MTA); releasing an MTA-activated COM
   // interface from a different apartment (Electron's JS/main thread is a
@@ -1324,9 +1436,10 @@ void MixControlThread() {
   // CoInitializeEx/CoUninitialize bracket guarantees that if g_live holds
   // the last shared_ptr to a Stream, it is destroyed on an MTA thread.
   // MixCaptureThread and MixerThread apply the same rule to their own local
-  // snapshot vectors below, for the same reason. StopMix()'s own
-  // g_live.clear() (on the JS thread) is a defensive no-op that runs after
-  // all three threads have already been joined and have already done this.
+  // snapshot vectors below, for the same reason. StopWorker::OnOK's own
+  // g_live.clear() (on the JS thread, once Execute() has joined all three
+  // mixer threads) is a defensive no-op that runs after this has already
+  // happened.
   {
     std::lock_guard<std::mutex> lock(g_liveMutex);
     g_live.clear();
@@ -1548,6 +1661,19 @@ Napi::Value ListAudioProcesses(const Napi::CallbackInfo& info) {
 
 Napi::Value StartSystemExcluding(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  // Checked before g_mode: once Stop() below moves the relevant thread(s)
+  // into a StopWorker, their joinable() goes false immediately even though
+  // the join(s) they name are still running on the threadpool, so g_mode/
+  // joinable alone cannot tell "idle" from "still shutting down" for that
+  // whole window (g_mode itself is not reset to Idle until the join
+  // completes -- see StopWorker::OnOK -- but a caller must not be able to
+  // race a new start against a shutdown still in flight, hence the
+  // dedicated flag). See win-capture's addon.cc for the identical shape.
+  if (g_stopping.load() || g_thread.joinable() || g_mixControlThread.joinable() || g_mixCaptureThread.joinable() ||
+      g_mixerThread.joinable()) {
+    Napi::Error::New(env, "previous capture still shutting down").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
   if (g_mode.load() != CaptureMode::Idle) {
     Napi::Error::New(env, "capture already running").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -1568,7 +1694,7 @@ Napi::Value StartSystemExcluding(const Napi::CallbackInfo& info) {
     g_blockedLower.push_back(w);
   }
 
-  g_mixLastError.clear();
+  SetMixErrorText(std::string());
   g_scans.store(0);
   g_backoff.clear();
   g_missedScans.clear();
@@ -1577,12 +1703,12 @@ Napi::Value StartSystemExcluding(const Napi::CallbackInfo& info) {
     g_lastReport = ScanReport{};
   }
   // g_live is already guaranteed empty here (Idle mode -- checked above --
-  // is only reached once StopMix() has run its teardown, which is the only
-  // place that touches g_live on the JS thread and is documented there).
-  // This is therefore the same defensive no-op as StopMix()'s: it must
+  // is only reached once StopWorker::OnOK has run its teardown, which is
+  // the only place that touches g_live on the JS thread and is documented
+  // there). This is therefore the same defensive no-op as OnOK's: it must
   // never be what actually destroys a Stream, because that would release
   // MTA-activated COM interfaces from the JS thread's apartment. See
-  // StopMix()'s comment for the full reasoning.
+  // StopWorker::OnOK's comment for the full reasoning.
   {
     std::lock_guard<std::mutex> lock(g_liveMutex);
     g_live.clear();
@@ -1638,56 +1764,152 @@ Napi::Value MixState(const Napi::CallbackInfo& info) {
   }
   out.Set("clients", clients);
   out.Set("scans", Napi::Number::New(env, g_scans.load()));
-  out.Set("lastError", Napi::String::New(env, g_mixLastError));
+  out.Set("lastError", Napi::String::New(env, GetMixErrorText()));
   return out;
 }
 
-void StopMix() {
-  if (!g_mixRunning.load() && !g_mixControlThread.joinable()) return;
+// Sets the flags that ask the running capture to exit and returns
+// immediately -- never blocks, never joins. Split from Stop() so both
+// Stop() and the AddCleanupHook registered in Init() (process exit without
+// an explicit stop() first -- see R5) can request the same shutdown
+// without duplicating it. Two variants because Single and Mix mode each
+// own their own running-flag/stop-event pair.
+void SignalStopSingle() {
+  g_running.store(false);
+  if (g_stopEvent) SetEvent(g_stopEvent);
+}
+
+void SignalStopMix() {
   g_mixRunning.store(false);
   if (g_mixStopEvent) SetEvent(g_mixStopEvent);
-
-  // Join order matches the mixer section header: control, then capture,
-  // then mixer. Control must stop enumerating/activating first so nothing
-  // new gets published into g_live while capture and mixer are winding
-  // down; capture must stop touching stream rings before the mixer (the
-  // last reader) exits and releases its tsfn.
-  if (g_mixControlThread.joinable()) g_mixControlThread.join();
-  if (g_mixCaptureThread.joinable()) g_mixCaptureThread.join();
-  if (g_mixerThread.joinable()) g_mixerThread.join();  // releases g_mixTsfn just before returning
-
-  if (g_mixStopEvent) { CloseHandle(g_mixStopEvent); g_mixStopEvent = nullptr; }
-  if (g_refreshEvent) { CloseHandle(g_refreshEvent); g_refreshEvent = nullptr; }
-  if (g_firstScanDone) { CloseHandle(g_firstScanDone); g_firstScanDone = nullptr; }
-
-  // Defensive no-op, not the real teardown -- every Stream's last
-  // shared_ptr reference must be dropped on one of the three mixer threads
-  // (each CoInitializeEx(MTA)'d), never here. This function runs on the JS
-  // thread, which in Electron's main process is a GUI thread already in a
-  // different COM apartment (an STA), or under ELECTRON_RUN_AS_NODE may
-  // never have called CoInitializeEx at all; releasing an MTA-activated
-  // IAudioClient/IAudioCaptureClient from that thread is undefined
-  // behaviour and segfaults in practice (this was exactly that bug).
-  // MixControlThread clears the global g_live, and MixCaptureThread/
-  // MixerThread each clear their own local snapshot, as their own last act
-  // before their own CoUninitialize -- all three have already been joined
-  // by the time we get here, so g_live should already be empty and every
-  // Stream already gone. This clear only guards against that invariant
-  // somehow not holding (e.g. a future change upstream) and must never be
-  // the call that actually destroys a Stream.
-  {
-    std::lock_guard<std::mutex> lock(g_liveMutex);
-    g_live.clear();
-    g_liveVersion.fetch_add(1, std::memory_order_release);
-  }
-  g_backoff.clear();
-  g_missedScans.clear();
 }
+
+// Joins whichever thread(s) the running capture mode owns, off the main
+// thread, and resolves stop()'s promise once the join(s) complete. One
+// worker class handles both Single mode (one thread) and Mix mode (three,
+// joined in the order the mixer section header documents: control, then
+// capture, then mixer) rather than two nearly-identical ones -- the two
+// modes are mutually exclusive by construction (g_mode gates Start() and
+// StartSystemExcluding()), and sharing keeps the "close handles / clear
+// g_live in OnOK, never in Execute()" rule in exactly one place instead of
+// two copies that could drift apart.
+//
+// This is item 3's whole point: the old synchronous Stop() ran every join
+// directly on the JS/Electron main thread -- for Mix mode, three of them
+// back to back via StopMix() -- which could block it for as long as the
+// slowest of the three took to notice its stop event and unwind. That is
+// exactly the main-thread freeze this PR exists to remove (R4).
+class StopWorker : public Napi::AsyncWorker {
+ public:
+  StopWorker(Napi::Env env, Napi::Promise::Deferred deferred, CaptureMode mode, std::thread single,
+             std::thread control, std::thread capture, std::thread mixer)
+      : Napi::AsyncWorker(env),
+        deferred_(deferred),
+        mode_(mode),
+        single_(std::move(single)),
+        control_(std::move(control)),
+        capture_(std::move(capture)),
+        mixer_(std::move(mixer)) {}
+
+  // Runs on the libuv threadpool -- must not touch any Napi:: type (env,
+  // values, the deferred) from here; that is exactly what OnOK/OnError
+  // (called back on the JS thread once this returns) are for.
+  void Execute() override {
+    if (mode_ == CaptureMode::Single) {
+      if (single_.joinable()) single_.join();
+      return;
+    }
+    // Mix: control first (stops enumerating/activating, so nothing new
+    // lands in g_live while the other two wind down), then capture (stops
+    // touching stream rings before the mixer, the last reader, exits and
+    // releases g_mixTsfn), then mixer -- the exact order StopMix() used to
+    // enforce synchronously on the JS thread.
+    if (control_.joinable()) control_.join();
+    if (capture_.joinable()) capture_.join();
+    if (mixer_.joinable()) mixer_.join();
+  }
+
+  // Back on the JS thread. Every handle this mode owns is closed here, not
+  // in Execute() (item 5's instruction), and the same applies to g_live's
+  // clear below -- which, exactly as it was in the old synchronous
+  // StopMix(), is a DEFENSIVE no-op, not the real teardown. Every Stream's
+  // last shared_ptr reference must be dropped on one of the three mixer
+  // threads themselves (each still inside its own CoInitializeEx(MTA)
+  // bracket at that point) -- releasing an MTA-activated IAudioClient/
+  // IAudioCaptureClient from the JS thread's own apartment (an STA in
+  // Electron's main process, or possibly no apartment at all under
+  // ELECTRON_RUN_AS_NODE) is undefined behaviour and segfaults in
+  // practice. By the time Execute() above returns, all three mixer threads
+  // have already done that clear as their own last act before their own
+  // CoUninitialize, so g_live should already be empty; this clear only
+  // guards against that invariant somehow not holding.
+  void OnOK() override {
+    if (mode_ == CaptureMode::Single) {
+      if (g_stopEvent) {
+        CloseHandle(g_stopEvent);
+        g_stopEvent = nullptr;
+      }
+    } else {
+      if (g_mixStopEvent) {
+        CloseHandle(g_mixStopEvent);
+        g_mixStopEvent = nullptr;
+      }
+      if (g_refreshEvent) {
+        CloseHandle(g_refreshEvent);
+        g_refreshEvent = nullptr;
+      }
+      if (g_firstScanDone) {
+        CloseHandle(g_firstScanDone);
+        g_firstScanDone = nullptr;
+      }
+      {
+        std::lock_guard<std::mutex> lock(g_liveMutex);
+        g_live.clear();
+        g_liveVersion.fetch_add(1, std::memory_order_release);
+      }
+      g_backoff.clear();
+      g_missedScans.clear();
+    }
+    g_mode.store(CaptureMode::Idle);
+    g_stopping.store(false);
+    deferred_.Resolve(Env().Undefined());
+    // Any stop() calls that arrived while this join was still in flight
+    // (see Stop()'s comment) resolve now too, alongside the primary
+    // deferred -- same outcome, same tick.
+    for (auto& d : g_pendingStopDeferreds) d.Resolve(Env().Undefined());
+    g_pendingStopDeferreds.clear();
+  }
+
+  void OnError(const Napi::Error& e) override {
+    // Execute() above only calls std::thread::join(), which does not throw
+    // for a joinable thread, so this path is not expected to run in
+    // practice -- see win-capture's addon.cc for the identical reasoning.
+    // Still handled so g_stopping/g_mode cannot get stuck and permanently
+    // refuse every later start()/startSystemExcluding() call.
+    g_mode.store(CaptureMode::Idle);
+    g_stopping.store(false);
+    deferred_.Reject(e.Value());
+    for (auto& d : g_pendingStopDeferreds) d.Reject(e.Value());
+    g_pendingStopDeferreds.clear();
+  }
+
+ private:
+  Napi::Promise::Deferred deferred_;
+  CaptureMode mode_;
+  std::thread single_, control_, capture_, mixer_;
+};
 
 // ===========================================================================
 
 Napi::Value Start(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  // See the identical guard in StartSystemExcluding() above for why this
+  // has to be checked ahead of, and separately from, g_mode.
+  if (g_stopping.load() || g_thread.joinable() || g_mixControlThread.joinable() || g_mixCaptureThread.joinable() ||
+      g_mixerThread.joinable()) {
+    Napi::Error::New(env, "previous capture still shutting down").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
   if (g_mode.load() != CaptureMode::Idle) {
     Napi::Error::New(env, "capture already running").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -1700,7 +1922,7 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
   const DWORD pid = static_cast<DWORD>(info[0].As<Napi::Number>().Uint32Value());
   const bool includeTree = info[1].ToBoolean().Value();
 
-  g_lastError.clear();
+  SetErrorText(std::string());
   if (g_stopEvent) CloseHandle(g_stopEvent);
   g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
@@ -1714,37 +1936,79 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
 
 Napi::Value Stop(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
-  switch (g_mode.load()) {
-    case CaptureMode::Idle:
-      break;
+  Napi::Promise::Deferred deferred = Napi::Promise::Deferred::New(env);
 
-    case CaptureMode::Single: {
-      if (!g_running.load() && !g_thread.joinable()) {
-        g_mode.store(CaptureMode::Idle);
-        break;
-      }
-      g_running.store(false);
-      if (g_stopEvent) SetEvent(g_stopEvent);
-      if (g_thread.joinable()) g_thread.join();
-      if (g_stopEvent) {
-        CloseHandle(g_stopEvent);
-        g_stopEvent = nullptr;
-      }
-      g_mode.store(CaptureMode::Idle);
-      break;
-    }
-
-    case CaptureMode::Mix: {
-      StopMix();
-      g_mode.store(CaptureMode::Idle);
-      break;
-    }
+  // A stop is already in flight: g_stopping is set below (for either mode)
+  // and only cleared once StopWorker::OnOK/OnError actually runs. By the
+  // time it is true, singlePending/mixPending below already read false --
+  // SignalStopSingle/SignalStopMix cleared the running flags, and the
+  // relevant thread(s) are already non-joinable, std::move()'d into the
+  // worker -- so the "nothing to stop" check further down would otherwise
+  // resolve a second stop() immediately, before the in-flight join has
+  // actually finished. That breaks the contract Start()/
+  // StartSystemExcluding() rely on (both throw "previous capture still
+  // shutting down" for the whole g_stopping window): a caller doing
+  // `await stop(); start()` would see this stop() resolve early and then
+  // hit that throw anyway. Queue this deferred instead and let the
+  // in-flight StopWorker's OnOK/OnError resolve/reject it alongside the
+  // primary one. See win-capture's addon.cc for the identical shape.
+  if (g_stopping.load()) {
+    g_pendingStopDeferreds.push_back(std::move(deferred));
+    return g_pendingStopDeferreds.back().Promise();
   }
-  return env.Undefined();
+
+  // Deliberately branches on the thread handles' own joinable() state, NOT
+  // on g_mode: CaptureThread resets g_mode to CaptureMode::Idle as its very
+  // last act on self-termination (e.g. an activation failure), but that
+  // happens before anyone has joined it, so g_thread can still be joinable
+  // (finished running, just not yet reaped) even while g_mode already
+  // reads Idle. Branching on g_mode here would read that as "nothing to
+  // stop" and skip straight to the resolve-immediately path below without
+  // ever joining g_thread -- which would then permanently trip Start()'s
+  // "previous capture still shutting down" guard above (g_thread.joinable()
+  // would stay true forever, since nothing else ever joins it) for a
+  // session that is not actually shutting down at all, just abandoned.
+  // Checking the thread/running state directly instead makes this correct
+  // regardless of whether g_mode has already been reset.
+  const bool singlePending = g_running.load() || g_thread.joinable();
+  const bool mixPending = g_mixRunning.load() || g_mixControlThread.joinable() || g_mixCaptureThread.joinable() ||
+                          g_mixerThread.joinable();
+
+  if (!singlePending && !mixPending) {
+    // Nothing to stop -- resolve immediately. Matches the stub's
+    // already-resolved promise (see stub.cc) so callers see the same shape
+    // on every platform regardless of whether anything was actually
+    // running.
+    g_mode.store(CaptureMode::Idle);
+    deferred.Resolve(env.Undefined());
+    return deferred.Promise();
+  }
+
+  // The two pending flags are never both true in practice -- Start() and
+  // StartSystemExcluding() each refuse to begin a new session while any
+  // thread from the other mode is still joinable (their "previous capture
+  // still shutting down" guard), so one mode's threads are always fully
+  // reaped before the other's can exist. singlePending is simply checked
+  // first.
+  if (singlePending) {
+    SignalStopSingle();
+    g_stopping.store(true);
+    auto* worker = new StopWorker(env, deferred, CaptureMode::Single, std::move(g_thread), std::thread(),
+                                   std::thread(), std::thread());
+    worker->Queue();
+    return deferred.Promise();
+  }
+
+  SignalStopMix();
+  g_stopping.store(true);
+  auto* worker = new StopWorker(env, deferred, CaptureMode::Mix, std::thread(), std::move(g_mixControlThread),
+                                 std::move(g_mixCaptureThread), std::move(g_mixerThread));
+  worker->Queue();
+  return deferred.Promise();
 }
 
 Napi::Value LastError(const Napi::CallbackInfo& info) {
-  return Napi::String::New(info.Env(), g_lastError);
+  return Napi::String::New(info.Env(), GetErrorText());
 }
 
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
@@ -1759,6 +2023,99 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("mixState", Napi::Function::New(env, MixState));
   exports.Set("sampleRate", Napi::Number::New(env, kSampleRate));
   exports.Set("channels", Napi::Number::New(env, kChannels));
+
+  // Item 5 / R5: nothing previously stopped native capture on quit. Left
+  // running, any of these threads reaches static destruction as a still-
+  // joinable std::thread, which is std::terminate() -- or, if teardown
+  // order goes the other way, a deadlock in DLL detach instead. This hook
+  // runs synchronously on the JS/main thread as the environment is torn
+  // down (Electron quit, or a plain process exit), so it is the last
+  // chance to request an orderly stop before that.
+  //
+  // Covers all four threads this addon can leave running: g_thread
+  // (Single mode) and the three mixer threads (Mix mode). The two modes
+  // are mutually exclusive by construction, so only one branch below ever
+  // has anything to do; both are checked unconditionally because this hook
+  // has no other way to know which mode, if either, was active. g_thread
+  // is included even though this item's brief named only "the three mixer
+  // threads" -- it is the identical joinable-std::thread-at-static-
+  // destruction hazard, just for Single mode, and leaving it out would
+  // mean a Single-mode share still running at quit reproduces R5
+  // unchanged. Flagged in the PR report for this call.
+  //
+  // Each thread gets its own bounded wait rather than one shared deadline
+  // across all of them: native_handle() must be read before join()/
+  // detach() consumes it, so there is no way to wait on several
+  // std::thread objects at once the way the mixer's own threads wait on
+  // several *event* handles with one WaitForSingleObject. 3000ms per
+  // thread (not 3000ms total) is accepted here -- process exit already
+  // tends to have its own outer timeout (Electron's shutdown watchdog, or
+  // the OS terminating a process that overstays its welcome), and a
+  // wedged thread is the uncommon case this bounds, not the common one.
+  // On timeout: detach, not join -- a detached thread that outlives the
+  // process by a few more milliseconds while the OS tears everything down
+  // anyway is harmless; destroying a still-joinable std::thread is not.
+  env.AddCleanupHook([]() {
+    // Returns true if the thread actually joined (so it is now guaranteed
+    // gone and can never touch a handle again), false if it had to be
+    // detached instead (timeout -- it may still be running). Callers below
+    // use this to decide whether the handle(s) that thread waits on are
+    // safe to close: closing one out from under a still-running detached
+    // thread that has not yet reached its own WaitForSingleObject on it
+    // would hand that call an invalid handle.
+    auto stopThread = [](std::thread& thread) -> bool {
+      if (!thread.joinable()) return true;  // never started, or already reaped
+      HANDLE handle = thread.native_handle();
+      if (WaitForSingleObject(handle, 3000) == WAIT_OBJECT_0) {
+        thread.join();
+        return true;
+      }
+      thread.detach();
+      return false;
+    };
+
+    if (g_thread.joinable()) {
+      SignalStopSingle();
+      // Safe here, and ONLY here: stopThread() returning true means the
+      // one thread that ever waits on g_stopEvent has fully exited. See
+      // win-capture's addon.cc for the identical reasoning; leaking the
+      // handle on the detach branch is deliberate, not an oversight -- the
+      // process is exiting either way and the OS reclaims it regardless.
+      if (stopThread(g_thread) && g_stopEvent) {
+        CloseHandle(g_stopEvent);
+        g_stopEvent = nullptr;
+      }
+    }
+    if (g_mixControlThread.joinable() || g_mixCaptureThread.joinable() || g_mixerThread.joinable()) {
+      // Same join order as StopWorker::Execute() and the old StopMix():
+      // control, then capture, then mixer.
+      SignalStopMix();
+      const bool controlJoined = stopThread(g_mixControlThread);
+      const bool captureJoined = stopThread(g_mixCaptureThread);
+      const bool mixerJoined = stopThread(g_mixerThread);
+      // g_mixStopEvent/g_refreshEvent/g_firstScanDone are shared across all
+      // three mixer threads (see the mixer section header), so none of them
+      // is safe to close unless every one of the three actually joined --
+      // same handle-outlives-a-still-running-detached-thread hazard as the
+      // Single-mode case above, just with three potential waiters instead
+      // of one.
+      if (controlJoined && captureJoined && mixerJoined) {
+        if (g_mixStopEvent) {
+          CloseHandle(g_mixStopEvent);
+          g_mixStopEvent = nullptr;
+        }
+        if (g_refreshEvent) {
+          CloseHandle(g_refreshEvent);
+          g_refreshEvent = nullptr;
+        }
+        if (g_firstScanDone) {
+          CloseHandle(g_firstScanDone);
+          g_firstScanDone = nullptr;
+        }
+      }
+    }
+  });
+
   return exports;
 }
 

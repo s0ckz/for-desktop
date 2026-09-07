@@ -25,6 +25,7 @@
 // and the `--allow-system-audio-mix` escape hatch that fallback now lives
 // behind.
 import { appendFileSync, mkdirSync, statSync, unlinkSync } from "node:fs";
+import { appendFile } from "node:fs/promises";
 import { release } from "node:os";
 import { join } from "node:path";
 
@@ -86,6 +87,76 @@ export function appAudioLogPath() {
   return logPath;
 }
 
+// Buffered, async-flushed logging (plan PR A5 item 1).
+//
+// This used to be a statSync + appendFileSync pair on every single log()
+// call, synchronously, on the main thread -- at up to 60fps once the C4
+// per-frame health summary (screenCapture.ts's onFrame) started calling this,
+// that is two blocking syscalls per frame competing with everything else the
+// main thread does (IPC, window events, the display-media handler). Lines are
+// now buffered in memory and flushed with async fs.appendFile, either every
+// LOG_FLUSH_INTERVAL_MS or once LOG_FLUSH_BYTES of pending text piles up,
+// whichever comes first -- so a burst still reaches disk promptly instead of
+// waiting out the full interval.
+//
+// The obvious risk with buffering is losing the tail on quit, or corrupting
+// the file by letting two writes race each other. Both are handled below:
+// see {@link logFlushChain}'s doc comment for the anti-interleaving story and
+// {@link flushAppAudioLogSync}'s for what runs on `before-quit`.
+const LOG_FLUSH_INTERVAL_MS = 250;
+const LOG_FLUSH_BYTES = 64 * 1024;
+/** Keep it small; this is a diagnostic aid, not an audit trail. */
+const LOG_MAX_BYTES = 512 * 1024;
+/**
+ * The statSync/truncate check used to run before every single line. Now it
+ * runs every LOG_STAT_EVERY_N_WRITES lines instead -- the file can overshoot
+ * LOG_MAX_BYTES by up to that many lines between checks, which is noise
+ * against a 512KB budget, in exchange for one syscall per ~100 lines instead
+ * of per line.
+ */
+const LOG_STAT_EVERY_N_WRITES = 100;
+
+let logBuffer: string[] = [];
+let logBufferBytes = 0;
+let logFlushTimer: ReturnType<typeof setTimeout> | null = null;
+let logWriteCount = 0;
+/**
+ * Every async flush chains onto this instead of firing its own fs.appendFile
+ * call directly. Two independent appendFile calls to the same path can
+ * interleave their writes (each is its own open/append/close under the
+ * hood), which would corrupt or reorder lines if a size-triggered flush ever
+ * raced a timer-triggered one; chaining onto a single promise makes that
+ * structurally impossible; there is only ever one appendFile in flight for
+ * this file at a time; the next one always waits for the previous one to
+ * settle first. `.catch(() => {})` on the chain itself, not on each link,
+ * so one failed write cannot poison every flush after it.
+ */
+let logFlushChain: Promise<void> = Promise.resolve();
+/**
+ * The exact bytes handed to the fs.appendFile call `logFlushChain` is
+ * currently waiting on, or null when nothing is in flight. This is the other
+ * half of the quit guarantee: `before-quit` cannot await `logFlushChain`
+ * (see {@link flushAppAudioLogSync}'s doc comment for why), so instead of
+ * hoping the in-flight async write lands before the process exits, the sync
+ * flush re-sends this same data with appendFileSync. In the rare case both
+ * end up landing, the cost is a duplicate line in a diagnostic log -- cheap
+ * insurance against losing the line outright.
+ */
+let logInFlightData: string | null = null;
+/**
+ * Identifies which flush {@link logInFlightData} belongs to, so the
+ * `.finally()` in {@link flushLogBuffer} that clears it can tell "my own
+ * write landed" apart from "a later write's data happens to be
+ * byte-identical to mine". Two batches CAN be byte-identical in principle --
+ * e.g. two flush cycles that each contain exactly one repeated log line --
+ * and `string === string` compares by value, so comparing against
+ * `logInFlightData` directly would let an earlier write's completion clear a
+ * later, still-in-flight write's marker out from under it. A monotonic
+ * counter compared by identity has no such collision.
+ */
+let logFlushSeq = 0;
+let logInFlightSeq = 0;
+
 export function log(...parts: unknown[]) {
   const line =
     new Date().toISOString() +
@@ -94,17 +165,160 @@ export function log(...parts: unknown[]) {
   console.log("[appAudio]", line);
   const file = appAudioLogPath();
   if (!file) return;
-  try {
-    // Keep it small; this is a diagnostic aid, not an audit trail.
+
+  logWriteCount++;
+  if (logWriteCount % LOG_STAT_EVERY_N_WRITES === 0) {
     try {
-      if (statSync(file).size > 512 * 1024) unlinkSync(file);
+      if (statSync(file).size > LOG_MAX_BYTES) unlinkSync(file);
     } catch {
-      /* first run */
+      /* first run, or file already gone -- fine either way */
     }
-    appendFileSync(file, line + "\n", "utf8");
-  } catch {
-    /* logging must never break screen sharing */
   }
+
+  logBuffer.push(line);
+  // +1 for the "\n" flushLogBuffer joins in; counted here rather than after
+  // the join so this stays O(1) per call instead of re-measuring the whole
+  // buffer on every line.
+  logBufferBytes += Buffer.byteLength(line, "utf8") + 1;
+  if (logBufferBytes >= LOG_FLUSH_BYTES) {
+    flushLogBuffer();
+    return;
+  }
+  if (!logFlushTimer) {
+    logFlushTimer = setTimeout(() => {
+      logFlushTimer = null;
+      flushLogBuffer();
+    }, LOG_FLUSH_INTERVAL_MS);
+    // Must never be the reason the process stays alive -- a quit with
+    // nothing else pending should not wait around for a log flush timer.
+    // `before-quit`'s sync flush (see flushAppAudioLogSync) is what actually
+    // guarantees delivery, not this timer surviving to fire.
+    logFlushTimer.unref?.();
+  }
+}
+
+function flushLogBuffer() {
+  if (logFlushTimer) {
+    clearTimeout(logFlushTimer);
+    logFlushTimer = null;
+  }
+  if (logBuffer.length === 0) return;
+  const file = appAudioLogPath();
+  const data = logBuffer.join("\n") + "\n";
+  logBuffer = [];
+  logBufferBytes = 0;
+  if (!file) return;
+
+  const seq = ++logFlushSeq;
+  logInFlightData = data;
+  logInFlightSeq = seq;
+  logFlushChain = logFlushChain
+    .then(() => appendFile(file, data, "utf8"))
+    .catch(() => {
+      /* logging must never break screen sharing */
+    })
+    .finally(() => {
+      // Only clear it if it's still THIS write's turn -- see logFlushSeq's
+      // doc comment for why identity (the sequence number), not the data
+      // itself, is what's compared. A sync quit flush (flushAppAudioLogSync)
+      // can also grab and null this out from under a still-pending promise,
+      // and a later write must not clobber that either.
+      if (logInFlightSeq === seq) logInFlightData = null;
+    });
+}
+
+/**
+ * Last-chance synchronous flush for `before-quit` (plan PR A5 item 1).
+ *
+ * Buffering plus async fs.appendFile means a line can sit unwritten for up
+ * to LOG_FLUSH_INTERVAL_MS, or an already-started appendFile can still be
+ * in flight, at the exact moment the process quits. `before-quit` has no
+ * mechanism to await anything -- see window.ts's handler, which is
+ * fire-and-forget for the native capture stop calls for the same reason --
+ * and nothing here can assume the event loop survives long enough to let a
+ * pending fs.appendFile finish once quit actually proceeds. So this bypasses
+ * the buffer and the async chain entirely: it re-sends whatever write was in
+ * flight (see {@link logInFlightData}'s doc comment for why that can produce
+ * a harmless duplicate line rather than a lost one) and then appendFileSync's
+ * whatever is still sitting in the buffer, synchronously, on the main
+ * thread -- exactly what every line paid before this change, just once at
+ * quit instead of once per line.
+ *
+ * Called from window.ts's `before-quit` handler, deliberately last in that
+ * handler's body, so it also catches whatever that handler itself logged
+ * (e.g. "quit: native capture stop requested") on its way out.
+ */
+export function flushAppAudioLogSync() {
+  if (logFlushTimer) {
+    clearTimeout(logFlushTimer);
+    logFlushTimer = null;
+  }
+  const file = appAudioLogPath();
+  if (!file) {
+    logBuffer = [];
+    logBufferBytes = 0;
+    logInFlightData = null;
+    return;
+  }
+  try {
+    if (logInFlightData) appendFileSync(file, logInFlightData, "utf8");
+  } catch {
+    /* logging must never break screen sharing, not even at quit */
+  } finally {
+    logInFlightData = null;
+  }
+  if (logBuffer.length === 0) return;
+  const data = logBuffer.join("\n") + "\n";
+  logBuffer = [];
+  logBufferBytes = 0;
+  try {
+    appendFileSync(file, data, "utf8");
+  } catch {
+    /* logging must never break screen sharing, not even at quit */
+  }
+}
+
+/**
+ * Caps how often a chattering, page-controlled log source can write to
+ * app-audio.log (plan PR A5 item 2) -- the injected patch's forwarded
+ * console (`screenCapture:pageLog`) and the raw `console-message` event in
+ * window.ts both read from a remote page we do not control, so a page bug
+ * that logs in a tight loop must not get to flood a 512KB-capped file (see
+ * LOG_MAX_BYTES) with nothing else ever making it in edgewise.
+ *
+ * A plain drop would fix the flood but hide it -- the log would just go
+ * quiet with no sign anything was suppressed. Instead this returns whether
+ * THIS call may log, and counts every call it refuses; the moment the
+ * one-second window rolls over, one marker line reports how many were
+ * suppressed since the last one got through, so a flood is visible in the
+ * log instead of an unexplained gap.
+ *
+ * A fixed one-second bucket, not a sliding window -- simpler, and "roughly
+ * 50/s" is all a diagnostic-log cap needs to be; nothing here bills by it.
+ */
+export function createLogRateLimiter(label: string, maxPerSecond: number) {
+  let windowStartMs = Date.now();
+  let countThisWindow = 0;
+  let suppressedThisWindow = 0;
+  return (): boolean => {
+    const now = Date.now();
+    if (now - windowStartMs >= 1000) {
+      if (suppressedThisWindow > 0) {
+        log(
+          `${label}: suppressed ${suppressedThisWindow} line(s) over the ${maxPerSecond}/s cap`,
+        );
+      }
+      windowStartMs = now;
+      countThisWindow = 0;
+      suppressedThisWindow = 0;
+    }
+    if (countThisWindow >= maxPerSecond) {
+      suppressedThisWindow++;
+      return false;
+    }
+    countThisWindow++;
+    return true;
+  };
 }
 
 type NativeModule = typeof import("win-app-audio");
@@ -135,6 +349,31 @@ function loadNative(): NativeModule | null {
   return native;
 }
 
+/**
+ * Cached answer from the native isSupported() probe (item 6). Each call does
+ * a full RoInitialize plus a factory activation, and buildState() calls this
+ * on every appAudio:getState round-trip and every broadcastState(), so an
+ * uncached call turns "just report state" into "reprobe the OS" on a hot
+ * path -- mirrors screenCapture.ts's identical cache; see its comment for
+ * why re-probing is pointless (hardware/OS support cannot change
+ * mid-process). Null means "not probed yet", not "unsupported".
+ */
+let cachedSupported: boolean | null = null;
+
+function isAppAudioSupported(): boolean {
+  if (cachedSupported !== null) return cachedSupported;
+  const mod = loadNative();
+  // Not cached: same reasoning as screenCapture.ts -- `!mod` is already a
+  // cheap check on its own.
+  if (!mod) return false;
+  try {
+    cachedSupported = mod.isSupported();
+  } catch {
+    cachedSupported = false;
+  }
+  return cachedSupported;
+}
+
 /** One process's audio, formatted for a log line. */
 function describeProcess(p: AudioProcess): string {
   return p.name ? `${p.name}(${p.pid})` : `pid:${p.pid}`;
@@ -152,6 +391,13 @@ let active: {
    * screenCapture.ts's HEALTHY_SESSION_MS.
    */
   attemptStartedAt: number;
+  /**
+   * Identity of the request that started this session -- mirrors
+   * screenCapture.ts's `active.sessionId` (A3 item 4). Preserved, not
+   * reassigned, across an in-place watchdog restart (`handleSystemStall`),
+   * since that is still the same logical session.
+   */
+  sessionId: number;
 } | null = null;
 
 /**
@@ -267,16 +513,60 @@ export function windowStateForSourceId(
 
 type CapturePlan = { mode: "include"; pid: number } | { mode: "system" };
 
-/** Stops whatever native capture is running, without touching our own
- *  bookkeeping. Used both by the public stop() and by beginCapture itself
- *  before starting anew (a plain restart, or switching modes). */
-function stopNative() {
+/**
+ * Whether an earlier stop()'s native join is still running past
+ * {@link NATIVE_STOP_TIMEOUT_MS} -- mirrors screenCapture.ts's identical
+ * flag; see that file's doc comment on `nativeBusy` and `stopNative()` for
+ * the full reasoning (the two modules share the same native stop() contract
+ * and the same timeout-vs-join race). While true, native start() /
+ * startSystemExcluding() would throw "previous capture still shutting
+ * down", so beginCapture() checks this instead of finding out the hard way.
+ * A stuck `true` here would disable both capture modes for the rest of the
+ * process's life (item 4), so every path that sets it has a matching path
+ * that clears it below.
+ */
+let nativeBusy = false;
+
+/** Mirrors screenCapture.ts's identical constant. */
+const NATIVE_STOP_TIMEOUT_MS = 3000;
+
+/**
+ * Stops whatever native capture is running, without touching our own
+ * bookkeeping. Used both by the public stop() and by beginCapture itself
+ * before starting anew (a plain restart, or switching modes).
+ *
+ * Returns a promise that resolves once it is safe to call mod.start() /
+ * mod.startSystemExcluding() again -- either because the native join
+ * actually finished, or because NATIVE_STOP_TIMEOUT_MS elapsed first, in
+ * which case {@link nativeBusy} is set. See screenCapture.ts's stopNative()
+ * for the full reasoning on the race, the explicit `clearTimeout` (without
+ * it a fast join would still leave a stray timer to wrongly flip nativeBusy
+ * back on minutes later), and why this can never reject.
+ */
+function stopNative(): Promise<void> {
   const mod = loadNative();
-  try {
-    mod?.stop();
-  } catch {
-    /* nothing to do */
-  }
+  if (!mod) return Promise.resolve();
+
+  const settle = Promise.resolve(mod.stop())
+    .catch(() => {
+      /* already stopped, or the native side reported an error tearing down
+         -- either way the thread has been reaped by the time this runs. */
+    })
+    .then(() => {
+      nativeBusy = false;
+    });
+
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      log(`native stop still pending after ${NATIVE_STOP_TIMEOUT_MS}ms`);
+      nativeBusy = true;
+      resolve();
+    }, NATIVE_STOP_TIMEOUT_MS);
+    void settle.then(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
 }
 
 /**
@@ -289,10 +579,31 @@ function stopNative() {
  * bookkeeping lives in exactly one place. The include path's behaviour and
  * log wording are unchanged from before this generalisation, so old logs
  * still grep.
+ * @param sessionId Stamped onto `active` -- see its doc comment. Callers
+ *   restarting the *same* session in place (handleSystemStall) pass the
+ *   existing id back; a genuinely new share passes a fresh one.
  */
-function beginCapture(plan: CapturePlan, sourceId: string): boolean {
+async function beginCapture(
+  plan: CapturePlan,
+  sourceId: string,
+  sessionId: number,
+): Promise<boolean> {
   const mod = loadNative();
   if (!mod) return false;
+
+  // A previous stop() (this share's own pre-start stop in startForSource, a
+  // watchdog restart, ...) may still be joining a thread on the libuv
+  // threadpool -- see nativeBusy's doc comment above stopNative(). This is
+  // the ONE place that matters for that check: stop()'s own `if (!active)`
+  // fast path means a second stop() call after the first already cleared
+  // `active` never re-invokes stopNative() at all, so nativeBusy set by an
+  // earlier stopNative() call would otherwise never be consulted before the
+  // native start()/startSystemExcluding() below throws "previous capture
+  // still shutting down" the hard way.
+  if (nativeBusy) {
+    log("capture not started: previous native stop still in flight");
+    return false;
+  }
 
   // Unconditionally, not `if (active)`. Native stop() is a no-op when nothing
   // is capturing, so this is free in the common case -- and `active` is not a
@@ -300,8 +611,18 @@ function beginCapture(plan: CapturePlan, sourceId: string): boolean {
   // mod.stop(), so a capture can survive an exported stop() that already
   // cleared `active`. Skipping the call there would leave the addon running,
   // every later start throwing "capture already running", and screen-share
-  // audio dead for the rest of the session.
-  stopNative();
+  // audio dead for the rest of the session. Awaited (item 4): the native
+  // start calls below must never run while the native side still considers
+  // itself mid-teardown.
+  await stopNative();
+
+  // stopNative() above may itself be the call that just timed out --
+  // nativeBusy can only be known for certain once it returns, so it's
+  // checked again here rather than trusting the pre-check alone.
+  if (nativeBusy) {
+    log("capture not started: native stop did not finish in time");
+    return false;
+  }
 
   if (plan.mode === "include") {
     try {
@@ -326,6 +647,7 @@ function beginCapture(plan: CapturePlan, sourceId: string): boolean {
       mode: "include",
       pid: plan.pid,
       attemptStartedAt: Date.now(),
+      sessionId,
     };
     includeSession = { startedAt: Date.now(), bytes: 0 };
     log(`capturing include pid ${plan.pid} for ${sourceId}`);
@@ -347,7 +669,13 @@ function beginCapture(plan: CapturePlan, sourceId: string): boolean {
     return false;
   }
 
-  active = { sourceId, mode: "system", pid: 0, attemptStartedAt: Date.now() };
+  active = {
+    sourceId,
+    mode: "system",
+    pid: 0,
+    attemptStartedAt: Date.now(),
+    sessionId,
+  };
   // Only a genuinely new share (systemSession still null, because stop()
   // cleared it) resets the failure budget and the running totals -- an
   // in-place watchdog restart must preserve both, or the receipt in stop()
@@ -428,7 +756,16 @@ function tickSystemWatchdog() {
   if (!active || active.mode !== "system") return;
 
   if (Date.now() - lastSystemChunkAt > SYSTEM_STALL_MS) {
-    handleSystemStall();
+    // handleSystemStall is async (it awaits beginCapture -- item 4), but
+    // this is a sync setInterval tick wrapped in startSystemWatchdog's own
+    // try/catch, which only catches synchronous throws. Fire it and attach
+    // our own catch so a rejection here can't become an unhandled one; the
+    // rest of this file's promises are designed to never reject, but this
+    // one guards the boundary anyway since handleSystemStall's failure
+    // paths are more involved than a single stopNative() call.
+    void handleSystemStall().catch((err) => {
+      log("system mix watchdog: stall handler failed, ignoring:", String(err));
+    });
     return;
   }
 
@@ -441,9 +778,10 @@ function tickSystemWatchdog() {
  * renegotiate and no share-recovery budget to spend. Only if the restart
  * also stalls -- or fails to start at all -- do we give up.
  */
-function handleSystemStall() {
+async function handleSystemStall() {
   if (!active || active.mode !== "system") return;
   const sourceId = active.sourceId;
+  const sessionId = active.sessionId;
   consecutiveSystemFailures++;
   log(
     `system mix stalled: no chunks for over ${SYSTEM_STALL_MS}ms (failure ${consecutiveSystemFailures}/${MAX_SYSTEM_FAILURES})`,
@@ -453,16 +791,16 @@ function handleSystemStall() {
     log(
       "system mix: giving up after repeated stalls - sharing continues with no audio rather than falling back to the raw system mix",
     );
-    stop();
+    await stop();
     return;
   }
 
   log("system mix: attempting an in-place restart");
   if (systemSession) systemSession.restarts++;
-  const restarted = beginCapture({ mode: "system" }, sourceId);
+  const restarted = await beginCapture({ mode: "system" }, sourceId, sessionId);
   if (!restarted) {
     log("system mix: restart failed to start at all, giving up");
-    stop();
+    await stop();
   }
 }
 
@@ -531,17 +869,31 @@ function checkSystemMembership() {
 /**
  * Try to start per-application capture for a desktopCapturer source.
  * Returns true only when audio is actually flowing from that process.
+ * @param sessionId Identity of the request starting this session -- see
+ *   `active`'s doc comment and screenCapture.ts's identical parameter for
+ *   why (A3 item 4).
  */
-export function startForSource(sourceId: string): boolean {
+export async function startForSource(
+  sourceId: string,
+  sessionId: number,
+): Promise<boolean> {
   const mod = loadNative();
   if (!mod) {
     log("no per-app capture: native module not loaded:", nativeLoadError);
     return false;
   }
-  if (!mod.isSupported()) {
+  if (!isAppAudioSupported()) {
     log("no per-app capture: OS reports process loopback unsupported");
     return false;
   }
+
+  // Clear whatever was running before this attempt -- a no-op if a still
+  // newer session has already taken over, mirroring screenCapture.ts's
+  // identical pre-start guard. Awaited (item 4): beginCapture()'s own
+  // nativeBusy check right below relies on this having already kicked off
+  // (and possibly finished) the native reap for whatever this call is
+  // superseding.
+  await stop(sessionId);
 
   const handle = windowHandleFromSourceId(sourceId);
 
@@ -552,7 +904,7 @@ export function startForSource(sourceId: string): boolean {
     log(
       "whole-screen share: mixing every audible process except the blocklist",
     );
-    return beginCapture({ mode: "system" }, sourceId);
+    return await beginCapture({ mode: "system" }, sourceId, sessionId);
   }
 
   // A window share must never be widened to the system mix: that is how the
@@ -570,7 +922,7 @@ export function startForSource(sourceId: string): boolean {
 
   // Include the process *tree*: browsers and Electron apps render audio from
   // a child process, so targeting the visible window's pid alone is silent.
-  if (!beginCapture({ mode: "include", pid }, sourceId)) {
+  if (!(await beginCapture({ mode: "include", pid }, sourceId, sessionId))) {
     log(
       `window share: include capture failed for pid ${pid} - no audio for this share`,
     );
@@ -580,10 +932,32 @@ export function startForSource(sourceId: string): boolean {
   return true;
 }
 
-export function stop() {
+/**
+ * Ends whatever per-app/system-mix audio capture is running, if any.
+ * @param sessionId When given, this call only takes effect against the
+ *   session it names (or an older one) -- see `active`'s doc comment.
+ *   Omitted by callers that mean "stop whatever is active right now,
+ *   unconditionally" (the page's own `appAudio:stop`). Mirrors
+ *   screenCapture.ts's `stop()` (A3 item 4).
+ * @returns A promise resolving once the native reap has settled (or
+ *   NATIVE_STOP_TIMEOUT_MS has elapsed -- see stopNative()). Same ordering
+ *   choice as screenCapture.ts's stop(): every JS-visible bookkeeping step
+ *   below (`active`, the session receipts, `broadcastState()`) runs
+ *   synchronously before this function returns, so the renderer is never
+ *   told a stale "still active" story while a join finishes in the
+ *   background -- only the native reap itself is async. Sync-context callers
+ *   in this file (the ipcMain handler) fire this with `void`; startForSource
+ *   and handleSystemStall, which need to know when it's safe to start again,
+ *   await it.
+ */
+export function stop(sessionId?: number): Promise<void> {
+  if (sessionId !== undefined && active && sessionId < active.sessionId) {
+    log(`stop ignored: stale session ${sessionId}`);
+    return Promise.resolve();
+  }
   stopSystemWatchdog();
-  if (!active) return;
-  stopNative();
+  if (!active) return Promise.resolve();
+  const nativeStopPromise = stopNative();
 
   if (active.mode === "system" && systemSession) {
     const durationS = ((Date.now() - systemSession.startedAt) / 1000).toFixed(
@@ -624,6 +998,7 @@ export function stop() {
   knownClientPids = new Set();
   refusedPidsLogged = new Set();
   broadcastState();
+  return nativeStopPromise;
 }
 
 function broadcastState() {
@@ -642,13 +1017,15 @@ function buildState() {
     // "include" = just the shared app, "system" = every audible process
     // except the blocklist and our own tree, mixed together.
     mode: active?.mode ?? null,
-    supported: Boolean(mod?.isSupported()),
+    supported: isAppAudioSupported(),
     sampleRate: mod?.sampleRate ?? 48000,
     channels: mod?.channels ?? 2,
     // Diagnostics only -- the injected page patch reads just `active` and
     // `sampleRate` (see appAudioPatch.ts), nothing here is load-bearing.
     sources: active?.mode === "system" ? systemSources : active ? 1 : 0,
     blocked: active?.mode === "system" ? systemBlockedNames.slice() : [],
+    // Diagnostic only -- see active's doc comment (item 4).
+    sessionId: active?.sessionId ?? 0,
   };
 }
 
@@ -662,7 +1039,7 @@ export function initAppAudio() {
     Boolean(mod),
     nativeLoadError ? `(${nativeLoadError})` : "",
   );
-  log("per-process capture supported:", Boolean(mod?.isSupported()));
+  log("per-process capture supported:", isAppAudioSupported());
   log("voice-app blocklist:", VOICE_APP_BLOCKLIST);
   if (mod) {
     try {
@@ -683,5 +1060,8 @@ export function initAppAudio() {
   // decide whether to swap in our track. Answering from the main process avoids
   // any race with the IPC notification.
   ipcMain.handle("appAudio:getState", () => buildState());
-  ipcMain.on("appAudio:stop", () => stop());
+  // Sync ipcMain handler -- same "fire and let stop() settle its own
+  // bookkeeping synchronously" reasoning as screenCapture.ts's identical
+  // handler.
+  ipcMain.on("appAudio:stop", () => void stop());
 }

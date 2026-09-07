@@ -87,6 +87,41 @@ if (process.platform === "win32") {
   }
 }
 
+// The web client's codec probe only trusts hardware H.264 Constrained
+// Baseline (CBP); anything else is treated as "no hardware H.264" and the
+// probe falls back to vp9 libvpx software encoding with forced L1T3, which
+// cannot sustain 1080p60. On Windows, Chromium only advertises a hardware
+// CBP encoder once `PlatformH264CbpEncoding` is enabled -- without it the
+// platform encoder is still there, just never offered as CBP, so the probe
+// never sees it and every affected machine silently downgrades to software.
+//
+// Confirmed present in this project's pinned Electron: the literal string
+// "PlatformH264CbpEncoding" is compiled into electron.exe for
+// electron@43.4.0 (Chrome/150.0.7871.224), found alongside the same blink
+// media-constraints strings that also list "H265" -- i.e. it is a real
+// base::Feature name in this build, not something we're guessing at.
+//
+// Same appendSwitch caveat as `disable-features` above applies here too:
+// build the whole list and pass it in one call, since a second
+// enable-features call would replace this one instead of adding to it. As of
+// this change nothing else in src/ calls enable-features (grepped before
+// adding this), but if that ever changes, merge into this array rather than
+// adding a second appendSwitch("enable-features", ...) call elsewhere.
+//
+// Risk: an unknown or misspelled feature name passed to enable-features is
+// silently ignored by Chromium -- there is no error, no warning, nothing --
+// so a typo here would be invisible at runtime and just quietly keep
+// everyone on the software fallback. To confirm this actually took effect on
+// a given machine, log RTCRtpSender.getStats()'s `encoderImplementation` (or
+// check the ScreenShareStats overlay's "Encoder" row) during a share and
+// look for `MediaFoundationVideoEncodeAccelerator`; seeing `libvpx` there
+// instead means either this flag didn't take or the machine genuinely lacks
+// a hardware CBP encoder.
+if (process.platform === "win32") {
+  const enabled: string[] = ["PlatformH264CbpEncoding"];
+  app.commandLine.appendSwitch("enable-features", enabled.join(","));
+}
+
 // ensure only one copy of the application can run
 const acquiredLock = app.requestSingleInstanceLock();
 
@@ -97,14 +132,14 @@ if (acquiredLock) {
   // start auto update logic -- see native/update.ts for the toast, the tray
   // fallback, and the diagnostic logging around both.
   //
-  // NOT covered by `didInitialise` below: that guard lives inside the
-  // `app.on("ready", ...)` callback, and this call is outside it. That's not
-  // a new problem -- the `updateElectronApp()` call this replaced was outside
-  // it too -- but it does mean that if this module is ever evaluated twice
-  // (see the `didInitialise` comment for the confirmed case of that), you get
-  // two updaters, two polling intervals, and two `onNotifyUser` calls per
-  // download. Read a duplicated `update:` line in app-audio.log as a sign of
-  // that, not as Squirrel retrying the download.
+  // Deliberately outside the `app.on("ready", ...)` callback below, and so
+  // NOT covered by `didInitialise` -- an update can in principle land before
+  // `ready` even fires, and this starts the check as early as possible
+  // rather than wait on it (see `onNotifyUser`'s own comment in update.ts).
+  // If this module is ever evaluated twice (see the `didInitialise` comment
+  // for the confirmed case of that), initUpdater() no longer needs a second
+  // guard here: it has its own once-flag now (plan PR A5 item 5) precisely
+  // because it sits outside `didInitialise`'s reach.
   initUpdater();
 
   // create and configure the app when electron is ready

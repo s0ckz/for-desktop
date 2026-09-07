@@ -4,6 +4,7 @@ import {
   BrowserWindow,
   Menu,
   MenuItem,
+  MessageChannelMain,
   app,
   desktopCapturer,
   ipcMain,
@@ -16,6 +17,8 @@ import { DEFAULT_SERVER } from "../constants";
 
 import {
   log as appAudioLog,
+  createLogRateLimiter,
+  flushAppAudioLogSync,
   pidForSourceId,
   startForSource,
   stop as stopAppAudio,
@@ -24,7 +27,9 @@ import {
 import { APP_AUDIO_PATCH } from "./appAudioPatch";
 import { config, getPersistedServer } from "./config";
 import {
+  SCREEN_CAPTURE_FRAME_PORT,
   resetNativeFailures,
+  setFramePort,
   setLiveFps as setScreenCaptureFps,
   startForSource as startScreenCapture,
   stop as stopScreenCapture,
@@ -95,6 +100,17 @@ let lastShare: {
   pid: number;
   name: string;
   audio: boolean;
+  /**
+   * The Display API's own stable id for a *screen* share (empty string for a
+   * window share, or if Electron could not report one) -- plan PR A5 item 3.
+   * `sourceId`'s `screen:ZZ:0` form encodes ZZ as a sequential enumeration
+   * index, not a persistent identifier, so unplugging/replugging a monitor
+   * (or it simply waking up in a different enumeration order) can renumber
+   * it out from under a straight sourceId comparison. See
+   * `findRememberedScreen` below, the counterpart to `findRememberedWindow`'s
+   * pid/name matching for windows.
+   */
+  displayId: string;
 } | null = null;
 
 /**
@@ -145,6 +161,142 @@ const REACQUIRE_TIMEOUT_MS = 90 * 1000;
 const ARMED_TTL_MS = 3_000;
 
 /**
+ * Identifies one display-media request, assigned at the very top of the
+ * handler below, before any `await`. Threaded through to
+ * `stopScreenCapture`/`stopAppAudio` and into `startForSource` in both
+ * native modules so a request that gets delayed by an await (e.g.
+ * `--window-shares-as-screen`'s screen lookup) and resumes after a later,
+ * faster request has already started can never stop or clobber that newer
+ * session -- both modules' `stop()` refuse a stale id instead. See A3 item 4.
+ */
+let nextRequestId = 0;
+
+/**
+ * Wrap Electron's display-media callback so it can be answered at most once,
+ * from whichever of several paths gets there first (a direct answer, a
+ * picker response, a supersede, a leak-guard timeout, or an error fallback)
+ * without each of them having to coordinate with the others. Electron throws
+ * if the callback runs after the request is already gone (e.g. the renderer
+ * reloaded mid-picker); every path here gets that for free instead of
+ * needing its own try/catch. See A3 item 1.
+ */
+function answerOnce(callback: DisplayMediaCallback) {
+  let answered = false;
+  const guard = (respond: () => void) => {
+    if (answered) return;
+    answered = true;
+    try {
+      respond();
+    } catch (err) {
+      appAudioLog(
+        "display media: callback threw answering request (request likely already gone):",
+        String(err),
+      );
+    }
+  };
+  return {
+    answer: (streams: Electron.Streams) => guard(() => callback(streams)),
+    // Electron's typings insist on an argument, but the documented way to
+    // cancel is calling back with none: that is what turns into a clean
+    // NotAllowedError in the renderer instead of an unexpected rejection.
+    cancel: () => guard(() => (callback as unknown as () => void)()),
+  };
+}
+
+type PendingPicker = {
+  id: number;
+  sources: Electron.DesktopCapturerSource[];
+  /** idx < 0 (or out of range) cancels; otherwise answers with sources[idx]. */
+  answer: (idx: number, audio: boolean) => void;
+  timer: ReturnType<typeof setTimeout>;
+};
+
+/**
+ * The picker currently awaiting the renderer's `screenPickerCallback`, if
+ * any. Backs a single `ipcMain.on` handler registered once in
+ * `createMainWindow`, replacing the old `ipcMain.once` registered fresh per
+ * request -- which stacked across overlapping requests and could answer the
+ * wrong one. See A3 item 3.
+ */
+let pendingPicker: PendingPicker | null = null;
+let nextPickerId = 0;
+
+/**
+ * Backstop for a picker that never gets a renderer response at all (a crash,
+ * or a reload that drops the IPC round-trip entirely) -- `did-finish-load`,
+ * `render-process-gone` and window `closed` already cover the ordinary ways
+ * that happens, so this is only for whatever those don't catch.
+ */
+const PICKER_LEAK_GUARD_MS = 10 * 60 * 1000;
+
+/**
+ * Supersede whatever picker is currently pending, answering it with a cancel
+ * so the renderer gets a clean NotAllowedError instead of a request that
+ * never resolves. Safe to call when nothing is pending.
+ */
+function cancelPendingPicker(reason: string) {
+  // Captured into a local first, not narrowed-and-reused: `pendingPicker` is
+  // reassigned inside closures elsewhere in this module, so TS cannot narrow
+  // it across the appAudioLog() call below and neither can we rely on it.
+  const picker = pendingPicker;
+  if (!picker) return;
+  appAudioLog("screen picker: cancelling pending request:", reason);
+  picker.answer(-1, false);
+}
+
+/**
+ * Arm the picker for one request: supersedes into `pendingPicker`, wires the
+ * leak-guard timer, and dispatches the renderer's eventual response (or a
+ * supersede/timeout) through `respondToDisplayMedia`.
+ */
+function registerPendingPicker(
+  sources: Electron.DesktopCapturerSource[],
+  respond: (streams: Electron.Streams) => void,
+  cancelRequest: () => void,
+  requestId: number,
+) {
+  const id = ++nextPickerId;
+  const timer = setTimeout(() => {
+    const picker = pendingPicker;
+    if (!picker || picker.id !== id) return;
+    appAudioLog(
+      "screen picker: leak guard fired after",
+      PICKER_LEAK_GUARD_MS,
+      "ms with no response; cancelling",
+    );
+    picker.answer(-1, false);
+  }, PICKER_LEAK_GUARD_MS);
+
+  pendingPicker = {
+    id,
+    sources,
+    answer: (idx, audio) => {
+      clearTimeout(timer);
+      pendingPicker = null;
+      if (idx < 0 || idx >= sources.length) {
+        // Electron's typings insist on an argument, but the documented way
+        // to cancel is calling back with none -- that is what turns into a
+        // clean NotAllowedError in the renderer instead of an unexpected
+        // rejection.
+        lastShare = null;
+        cancelRequest();
+        return;
+      }
+      void respondToDisplayMedia(sources[idx], audio, respond, requestId).catch(
+        (err) => {
+          appAudioLog(
+            "respondToDisplayMedia failed, answering with video-only fallback:",
+            String(err),
+          );
+          respond({ video: sources[idx] });
+        },
+      );
+    },
+    timer,
+  };
+}
+
+/**
  * `--capture-fps=N` caps the frame rate the page may ask for. WGC brokers each
  * frame through CaptureService, so the rate is a direct lever on how hard that
  * service is driven -- and this fork raised the requested rate when it removed
@@ -183,7 +335,8 @@ function captureFpsCap(): number | null {
 async function respondToDisplayMedia(
   source: Electron.DesktopCapturerSource,
   audio: boolean,
-  callback: DisplayMediaCallback,
+  answer: (streams: Electron.Streams) => void,
+  sessionId: number,
 ) {
   const isWindow = source.id.startsWith("window:");
   lastShare = {
@@ -191,6 +344,10 @@ async function respondToDisplayMedia(
     pid: pidForSourceId(source.id),
     name: source.name,
     audio,
+    // Only meaningful for a screen source -- see lastShare's own doc comment
+    // on this field. `display_id` is "" rather than absent for a window
+    // source, per Electron's own typing, so this needs no isWindow branch.
+    displayId: source.display_id,
   };
 
   // Window capture is hard-wired to WGC and WGC is brokered by CaptureService,
@@ -235,7 +392,13 @@ async function respondToDisplayMedia(
     const requestedFps = takeNextRequestedFps() ?? 30;
     const fpsCap = captureFpsCap();
     const fps = fpsCap !== null ? Math.min(requestedFps, fpsCap) : requestedFps;
-    if (startScreenCapture(source.id, fps)) {
+    // Awaited (item 4): startScreenCapture is now async (it awaits its own
+    // pre-start stop() before touching mod.start()) -- respondToDisplayMedia
+    // is already async, so this just needed the keyword added; without it,
+    // `if` would test a Promise object, which is always truthy, and this
+    // branch would report "native GPU capture" even when start ultimately
+    // failed or fell back.
+    if (await startScreenCapture(source.id, fps, sessionId)) {
       appAudioLog(
         "video path: native GPU capture (WGC + VideoProcessorBlt) for",
         source.id,
@@ -257,7 +420,7 @@ async function respondToDisplayMedia(
 
   if (!audio || app.commandLine.hasSwitch("no-per-app-audio")) {
     appAudioLog("sharing", videoSource.id, "without audio");
-    callback({ video: videoSource });
+    answer({ video: videoSource });
     return;
   }
   // For a screen source this calls into startSystemExcluding(), which blocks
@@ -269,11 +432,13 @@ async function respondToDisplayMedia(
   // at 5s, but the cap is a backstop for an activation that hangs, not a
   // figure this approaches -- a freeze here would be user-visible, so
   // re-measure before assuming it is still cheap.
-  if (startForSource(source.id)) {
+  // Awaited (item 4): appAudio's startForSource is now async for the same
+  // reason as startScreenCapture above -- same correctness note applies.
+  if (await startForSource(source.id, sessionId)) {
     // Audio arrives out-of-band and is stitched in by the renderer; asking
     // Chromium for loopback too would double up the sound.
     appAudioLog("sharing", videoSource.id, "with per-app audio");
-    callback({ video: videoSource });
+    answer({ video: videoSource });
     return;
   }
   if (isWindow) {
@@ -282,7 +447,7 @@ async function respondToDisplayMedia(
       source.id,
       "- sharing video only rather than the whole system mix",
     );
-    callback({ video: videoSource });
+    answer({ video: videoSource });
     return;
   }
   // Screen share, and appAudio's system-mix capture didn't come up (native
@@ -302,13 +467,13 @@ async function respondToDisplayMedia(
       "(it would rebroadcast any voice call the sharer is on) - sharing video only;",
       "pass --allow-system-audio-mix to opt into the raw system mix instead",
     );
-    callback({ video: videoSource });
+    answer({ video: videoSource });
     return;
   }
   appAudioLog(
     "screen share falling back to Chromium loopback (whole system mix)",
   );
-  callback({ video: videoSource, audio: "loopback" });
+  answer({ video: videoSource, audio: "loopback" });
 }
 
 /**
@@ -351,6 +516,30 @@ async function findRememberedWindow(target: {
   );
   return (
     samePid.find((source) => source.name === target.name) ?? samePid[0] ?? null
+  );
+}
+
+/**
+ * The screen counterpart to {@link findRememberedWindow} (plan PR A5 item
+ * 3): a screen share used to be unre-acquirable at all -- the reacquire
+ * handler below refused anything whose sourceId did not start with
+ * `window:` -- so a monitor that WGC or the OS transiently dropped the
+ * share for had no recovery path a window share already had.
+ *
+ * Matched on `display_id`, the Display API's own stable id, not on
+ * `sourceId`: see `lastShare`'s doc comment on `displayId` for why the raw
+ * `screen:ZZ:0` id is not safe to compare directly.
+ */
+async function findRememberedScreen(target: {
+  displayId: string;
+}): Promise<Electron.DesktopCapturerSource | null> {
+  if (!target.displayId) return null;
+  const screens = await desktopCapturer.getSources({
+    types: ["screen"],
+    thumbnailSize: { width: 0, height: 0 },
+  });
+  return (
+    screens.find((source) => source.display_id === target.displayId) ?? null
   );
 }
 
@@ -408,8 +597,14 @@ ipcMain.handle("screenShare:reacquire", async () => {
     appAudioLog("reacquire: no remembered share");
     return false;
   }
-  if (!target.sourceId.startsWith("window:")) {
-    appAudioLog("reacquire: last share was a screen, not re-acquiring");
+  // Screens can re-arm too now (plan PR A5 item 3) -- see findRememberedScreen's
+  // doc comment for why this used to be window-only. A screen share with no
+  // displayId (Electron could not report one) still has no recovery path.
+  const isWindow = target.sourceId.startsWith("window:");
+  if (!isWindow && !target.displayId) {
+    appAudioLog(
+      "reacquire: last share was a screen with no display id, not re-acquiring",
+    );
     return false;
   }
 
@@ -417,12 +612,23 @@ ipcMain.handle("screenShare:reacquire", async () => {
   const deadline = Date.now() + REACQUIRE_TIMEOUT_MS;
   let pollMs = REACQUIRE_POLL_MS;
   appAudioLog(
-    "reacquire: waiting for window",
+    "reacquire: waiting for",
+    isWindow ? "window" : "screen",
     target.name,
     `(${target.sourceId}, pid ${target.pid})`,
   );
 
   while (Date.now() < deadline) {
+    // The window this poll is chasing is gone the moment the app quits --
+    // bail rather than keep polling desktopCapturer against a torn-down
+    // window/session (plan PR A5 item 3). before-quit also bumps
+    // reacquireGeneration (see that handler) for the same reason; this check
+    // catches it sooner than waiting for the next generation comparison
+    // below to notice, since a poll can be mid-`await` when quit fires.
+    if (mainWindow.isDestroyed()) {
+      appAudioLog("reacquire: main window destroyed, giving up");
+      return false;
+    }
     if (generation !== reacquireGeneration || lastShare !== target) {
       appAudioLog("reacquire: superseded, giving up");
       return false;
@@ -430,7 +636,9 @@ ipcMain.handle("screenShare:reacquire", async () => {
 
     let match: Electron.DesktopCapturerSource | null = null;
     try {
-      match = await findRememberedWindow(target);
+      match = isWindow
+        ? await findRememberedWindow(target)
+        : await findRememberedScreen(target);
     } catch (err) {
       appAudioLog("reacquire: could not list sources:", String(err));
     }
@@ -448,6 +656,16 @@ ipcMain.handle("screenShare:reacquire", async () => {
   appAudioLog("reacquire: window never came back");
   return false;
 });
+
+/**
+ * The remote page's raw `console-message` event, capped independently of
+ * screenCapture.ts's own `screenCapture:pageLog` limiter -- see
+ * createLogRateLimiter's doc comment for why a page-controlled log source
+ * needs one at all (plan PR A5 item 2). Module-scoped, not local to
+ * `createMainWindow`, so a reload/reload loop cannot reset the budget by
+ * re-running the function that would otherwise redeclare it.
+ */
+const consoleMessageRateLimit = createLogRateLimiter("console-message", 50);
 
 /**
  * Create the main application window
@@ -546,11 +764,14 @@ export function createMainWindow() {
       details.reason,
       `exitCode=${details.exitCode}`,
     );
+    console.error("RENDERER CRASHED:", details.reason, details.exitCode);
+    cancelPendingPicker("renderer process gone");
   });
 
-  mainWindow.webContents.on("unresponsive", () =>
-    appAudioLog("renderer became unresponsive"),
-  );
+  mainWindow.webContents.on("unresponsive", () => {
+    appAudioLog("renderer became unresponsive");
+    console.error("WINDOW UNRESPONSIVE");
+  });
 
   mainWindow.webContents.on("preload-error", (_event, preloadPath, error) =>
     appAudioLog("preload failed:", preloadPath, String(error)),
@@ -562,7 +783,9 @@ export function createMainWindow() {
     "console-message",
     (_event, level, message, line, sourceId) => {
       if (level < 3) return; // 3 = error
-      appAudioLog(`page error: ${message} (${sourceId}:${line})`);
+      if (consoleMessageRateLimit()) {
+        appAudioLog(`page error: ${message} (${sourceId}:${line})`);
+      }
     },
   );
 
@@ -570,6 +793,27 @@ export function createMainWindow() {
   // into its main world on every load (contextIsolation keeps the preload out).
   mainWindow.webContents.on("did-finish-load", () => {
     appAudioLog("page loaded:", mainWindow.webContents.getURL());
+    // The picker lived in the page that just went away; whatever answer it
+    // would have sent can never arrive now.
+    cancelPendingPicker("page reloaded");
+
+    // Fresh frame-delivery port (A4 item 2) for this page load. Deliberately
+    // re-created on every did-finish-load, including a reload: the previous
+    // port's other end lived in a page context that is now gone, and
+    // `setFramePort` closes whatever port it already held before taking this
+    // one, so a reload can never leave the old port dangling. `port2` crosses
+    // into the renderer via `postMessage` -- delivered to the preload's
+    // `ipcRenderer` (contextIsolation keeps it out of the page's main world
+    // directly, same reason every other native/world/window.ts bridge call
+    // needs the preload as a hop), which re-exposes it to the page through
+    // the existing `window.native.screenCapture.onFrame` bridge -- see that
+    // file's `FRAME_PORT_CHANNEL` handling for the renderer side.
+    const { port1, port2 } = new MessageChannelMain();
+    setFramePort(port1);
+    mainWindow.webContents.postMessage(SCREEN_CAPTURE_FRAME_PORT, null, [
+      port2,
+    ]);
+
     const prelude =
       "window.__stoatCaptureFps = " + JSON.stringify(captureFpsCap()) + ";\n";
     mainWindow.webContents
@@ -600,9 +844,19 @@ export function createMainWindow() {
   };
 
   // load the entrypoint
-  purgeCachedClient()
-    .then(() => mainWindow.loadURL(getBuildUrl().toString()))
-    .then(() => mainWindow.webContents.reload());
+  //
+  // Used to load, then immediately reload() again (plan PR A5 item 6): that
+  // predates purgeCachedClient() above and was itself a speculative "reload
+  // on every startup" attempt at the same grey-window bug the comment above
+  // explains -- see PR #269's own commit message, literally "what if we just
+  // reloaded every startup, would that kill cache?", with no evidence it
+  // actually did. purgeCachedClient() is the real fix: it clears the
+  // service worker and cache storage *before* this load even starts, which
+  // is what the comment above documents, and it does not depend on a second
+  // load to work. The leftover reload() only doubled did-finish-load (so
+  // the page patch above injects twice) and briefly re-flashed the window
+  // on every launch, with nothing behind it once the real fix landed.
+  purgeCachedClient().then(() => mainWindow.loadURL(getBuildUrl().toString()));
 
   // minimise window to tray
   mainWindow.on("close", (event) => {
@@ -611,6 +865,11 @@ export function createMainWindow() {
       mainWindow.hide();
     }
   });
+
+  // Unlike "close" above, this fires only once the window is actually gone
+  // (never on a minimise-to-tray hide), so a picker waiting on it truly has
+  // no answer coming.
+  mainWindow.on("closed", () => cancelPendingPicker("window closed"));
 
   // update tray menu when window is shown/hidden
   mainWindow.on("show", updateTrayMenu);
@@ -661,16 +920,6 @@ export function createMainWindow() {
 
   // send the config
   mainWindow.webContents.on("did-finish-load", () => config.sync());
-
-  // Log renderer crashes to terminal
-  mainWindow.webContents.on("render-process-gone", (_, details) => {
-    console.error("RENDERER CRASHED:", details.reason, details.exitCode);
-  });
-
-  // Log unresponsive events
-  mainWindow.on("unresponsive", () => {
-    console.error("WINDOW UNRESPONSIVE");
-  });
 
   // configure spellchecker context menu
   mainWindow.webContents.on("context-menu", (_, params) => {
@@ -725,19 +974,54 @@ export function createMainWindow() {
         String(request.audioRequested),
       );
 
+      const requestId = ++nextRequestId;
+      const { answer, cancel } = answerOnce(callback);
+
+      // Anything the user starts by hand ends whatever else was already
+      // waiting on an answer -- a picker still showing from an earlier
+      // request gets a clean NotAllowedError instead of being left to
+      // answer whichever request happens to still be listening. See item 3.
+      cancelPendingPicker("superseded by a new display media request");
+
       // A re-acquire that already found the window answers straight away, so
       // the recovered share does not make the user pick it again.
       const armed = armedShare;
       armedShare = null;
       if (armed && Date.now() - armed.at < ARMED_TTL_MS) {
         appAudioLog("answering with re-acquired source", armed.source.id);
-        stopAppAudio();
-        stopScreenCapture();
-        void respondToDisplayMedia(
-          armed.source,
-          armed.audio && request.audioRequested,
-          callback,
-        );
+        // Item 4: both stop()s now return a promise that only settles once
+        // the native reap has actually finished (or timed out) rather than
+        // blocking the main thread the old synchronous stop() did, so the
+        // video/audio start below (inside respondToDisplayMedia) must wait
+        // for both before it runs -- otherwise it can race a native
+        // start() against a still-in-flight teardown of the session it's
+        // replacing. This display-media handler is not itself async (it's
+        // Electron's plain callback signature), hence the IIFE.
+        void (async () => {
+          // "superseded", not the "stopped" default: this ends the previous
+          // native session because a new one (the re-acquired source) is
+          // about to replace it, not because the user asked to stop sharing.
+          // The companion for-web PR keys its recovery-budget accounting off
+          // this field, and a supersede must not look like a user stop --
+          // see StopReason's doc comment in screenCapture.ts. requestId
+          // scopes it to sessions older than this one -- see item 4.
+          await Promise.all([
+            stopAppAudio(requestId),
+            stopScreenCapture("superseded", requestId),
+          ]);
+          await respondToDisplayMedia(
+            armed.source,
+            armed.audio && request.audioRequested,
+            answer,
+            requestId,
+          );
+        })().catch((err) => {
+          appAudioLog(
+            "respondToDisplayMedia failed, answering with video-only fallback:",
+            String(err),
+          );
+          answer({ video: armed.source });
+        });
         return;
       }
       if (armed) {
@@ -761,10 +1045,23 @@ export function createMainWindow() {
           // opens. See the note in `findRememberedWindow`.
           thumbnailSize: { width: 0, height: 0 },
         })
-        .then((sources) => {
+        .then(async (sources) => {
           // Any previous share is over by the time a new one is requested.
-          stopAppAudio();
-          stopScreenCapture();
+          // "superseded", not "stopped" for the screen-capture side -- see
+          // the comment on the other stopScreenCapture() call above. Item 4:
+          // both stop()s now only resolve once their native reap has
+          // actually finished (or timed out), instead of blocking the main
+          // thread the way the old synchronous stop() did, so this awaits
+          // both rather than firing them and moving on -- the video/audio
+          // start further down must not race a native start() against a
+          // still-in-flight teardown of the session it's replacing. Making
+          // this `.then` callback async (rather than a nested IIFE, as the
+          // armed-fast-path branch above needs) is enough here since its
+          // caller is already a promise chain with its own `.catch` below.
+          await Promise.all([
+            stopAppAudio(requestId),
+            stopScreenCapture("superseded", requestId),
+          ]);
           // Everything past this point is a *new* share, not a recovery of
           // the one the armed fast path above would have answered -- the
           // Wayland single-source shortcut and a fresh picker answer both
@@ -774,16 +1071,15 @@ export function createMainWindow() {
           // resetNativeFailures's doc comment for why the armed path above
           // must never do this.
           //
-          // Placed here, right after stopScreenCapture() rather than
-          // synchronously before this getSources() call: getSources({
+          // Placed here, right after the awaited Promise.all above rather
+          // than synchronously before this getSources() call: getSources({
           // fetchWindowIcons: true }) is a visible stall (see the comment on
-          // it above), and stopScreenCapture() -- which stops the *previous*
-          // session's watchdog timers -- does not run until it resolves. A
-          // reset issued before that await would race the old session's own
-          // watchdog: if it was already stalled, it could still fire and
-          // increment consecutiveFailures in that gap, and the new share
-          // would inherit a failure count this reset was meant to have
-          // already cleared.
+          // it above), and the previous session's watchdog timers do not
+          // actually stop until that Promise.all resolves. A reset issued
+          // before that await would race the old session's own watchdog: if
+          // it was already stalled, it could still fire and increment
+          // consecutiveFailures in that gap, and the new share would inherit
+          // a failure count this reset was meant to have already cleared.
           resetNativeFailures();
           appAudioLog("sources offered:", String(sources.length));
 
@@ -792,34 +1088,18 @@ export function createMainWindow() {
             void respondToDisplayMedia(
               sources[0],
               request.audioRequested,
-              callback,
-            );
+              answer,
+              requestId,
+            ).catch((err) => {
+              appAudioLog(
+                "respondToDisplayMedia failed, answering with video-only fallback:",
+                String(err),
+              );
+              answer({ video: sources[0] });
+            });
             return;
           }
-          ipcMain.once(
-            "screenPickerCallback",
-            (_, idx: number, audio: boolean) => {
-              appAudioLog(
-                "picker chose index",
-                String(idx),
-                "audio =",
-                String(audio),
-                idx >= 0 && idx < sources.length
-                  ? sources[idx].id
-                  : "(out of range)",
-              );
-              if (idx < 0 || idx >= sources.length) {
-                // Electron's typings insist on an argument, but the documented
-                // way to cancel is calling back with none: that is what turns
-                // into a clean NotAllowedError in the renderer instead of an
-                // unexpected rejection.
-                lastShare = null;
-                (callback as unknown as () => void)();
-              } else {
-                void respondToDisplayMedia(sources[idx], audio, callback);
-              }
-            },
-          );
+          registerPendingPicker(sources, answer, cancel, requestId);
           mainWindow.webContents.send(
             "screenPicker",
             sources.map((source, idx) => {
@@ -839,10 +1119,39 @@ export function createMainWindow() {
               };
             }),
           );
+        })
+        .catch((err) => {
+          // No sources means no picker to show and no source to answer
+          // with -- cancel rather than leave the request hanging. See item 2.
+          appAudioLog(
+            "could not list sources for display media request:",
+            String(err),
+          );
+          cancel();
         });
     },
     { useSystemPicker: true },
   );
+
+  // A single handler for the whole app's life, dispatching to whichever
+  // picker is currently pending -- see `pendingPicker`'s doc comment (item 3).
+  ipcMain.on("screenPickerCallback", (_event, idx: number, audio: boolean) => {
+    const picker = pendingPicker;
+    if (!picker) {
+      appAudioLog("screen picker: response with no pending request; ignoring");
+      return;
+    }
+    appAudioLog(
+      "picker chose index",
+      String(idx),
+      "audio =",
+      String(audio),
+      idx >= 0 && idx < picker.sources.length
+        ? picker.sources[idx].id
+        : "(out of range)",
+    );
+    picker.answer(idx, audio);
+  });
 
   // push world events to the window
   ipcMain.on("minimise", () => mainWindow.minimize());
@@ -863,4 +1172,27 @@ export function quitApp() {
 // Ensure global app quit works properly
 app.on("before-quit", () => {
   shouldQuit = true;
+  // Abandon any in-flight screenShare:reacquire poll (plan PR A5 item 3):
+  // that loop already checks `mainWindow.isDestroyed()` on every iteration,
+  // but it can be mid-`await` (the poll's own setTimeout, or a desktopCapturer
+  // call) when quit fires, and bumping the generation here is what makes the
+  // very next generation check it takes -- not the isDestroyed check, which
+  // only runs at the top of the loop -- refuse to arm a share for a window
+  // that no longer exists.
+  reacquireGeneration++;
+  // Item 5: the cooperative path that runs first, ahead of whatever the
+  // native destructors do as a backstop once the process is actually
+  // exiting -- gives the capture thread(s) a chance to join cleanly instead
+  // of being torn down mid-flight. Fired and not awaited: before-quit has no
+  // mechanism to wait on this, and both stop()s' returned promises can never
+  // reject (see each file's stopNative() doc comment) or hang the process
+  // (NATIVE_STOP_TIMEOUT_MS bounds how long either can appear "busy" for).
+  appAudioLog("quit: native capture stop requested");
+  void stopScreenCapture("stopped");
+  void stopAppAudio();
+  // Last, deliberately: plan PR A5 item 1's synchronous quit flush (see its
+  // own doc comment in appAudio.ts) also catches whatever appAudioLog() call
+  // this handler itself just made, since it runs after every log() call
+  // above rather than racing them.
+  flushAppAudioLogSync();
 });
