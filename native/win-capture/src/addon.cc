@@ -1493,11 +1493,12 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
   // initialThreadCount) -- the "3" below is the queue depth just argued for
   // above, NOT a thread count. initialThreadCount is 1 because exactly one
   // native thread ever touches g_tsfn: CaptureThread does every
-  // NonBlockingCall (via Emit(), polling on its own loop -- see the file
-  // header for why this module polls instead of subscribing to WGC's
-  // FrameArrived event, which would hand us a callback on a WinRT-owned
-  // thread instead) and also owns the one and only Release() in its own
-  // teardown further down this file. initialThreadCount has to equal the
+  // NonBlockingCall (via Emit(), woken by its own WaitForMultipleObjects
+  // wait loop -- see the file header for the FrameArrived-subscription model
+  // and FrameArrivedHandler's own comment for why that WinRT-owned callback
+  // thread does nothing but SetEvent() and never reaches g_tsfn itself) and
+  // also owns the one and only Release() in its own teardown further down
+  // this file. initialThreadCount has to equal the
   // number of Release() calls that will ever happen: N-API seeds the TSFN's
   // reference count at this value instead of requiring N separate Acquire()
   // calls, and the TSFN only finalises -- freeing its libuv handle -- once

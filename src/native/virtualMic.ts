@@ -16,6 +16,17 @@ export const isWayland =
 
 ipcMain.handle("getIsWayland", () => isWayland);
 
+// Handle of the periodic pipewire-node sync below, kept so it can be
+// cancelled on quit instead of firing into a torn-down pipewire thread.
+let syncInterval: ReturnType<typeof setInterval> | undefined;
+
+app.on("before-quit", () => {
+  if (syncInterval !== undefined) {
+    clearInterval(syncInterval);
+    syncInterval = undefined;
+  }
+});
+
 export async function initVirtualMic() {
   // Only available on Wayland
   if (!isWayland) return;
@@ -70,7 +81,7 @@ export async function initVirtualMic() {
 
     linkNodesNameToId(sinkNode.name, sourceNode.id, false);
 
-    setInterval(() => {
+    syncInterval = setInterval(() => {
       const ourClients: Record<number, any> = {};
       const paClients: any[] = [];
 
@@ -121,7 +132,12 @@ export async function initVirtualMic() {
       for (const id in savedNodes) {
         const asNum = Number(id);
         if (!nodes.find((node) => node.id === asNum)) {
-          savedNodes[asNum] = void 0;
+          // delete, not `= void 0` -- an undefined value still passes the
+          // `!savedNodes[idAsNum]` truthiness check above for an id that
+          // never comes back, which is harmless (it just gets re-treated as
+          // "new" and re-linked), but leaves the key sitting in the object
+          // forever, growing it for the life of the process.
+          delete savedNodes[asNum];
         }
       }
     }, 1000);

@@ -17,6 +17,7 @@
 import { BrowserWindow, ipcMain } from "electron";
 
 import {
+  createLogRateLimiter,
   log as appAudioLog,
   windowHandleFromSourceId,
   windowStateForSourceId,
@@ -97,6 +98,17 @@ const FRAME_WATCHDOG_MS = 4000;
  * with no way here to prove otherwise.
  */
 const FRAME_WATCHDOG_NO_STATE_MS = 15000;
+/**
+ * How often {@link onFrame} writes a rolling health summary to app-audio.log
+ * for a session that is alive but degraded (plan PR C4 item 2). Before this,
+ * app-audio.log only ever heard from a session when it died -- the death
+ * branch in {@link onFrame} -- so a share that was merely slow (heavy
+ * refusal, a GPU-contended bltMs) left no trace at all short of a crash
+ * report. 10s is short enough to catch a share that degrades mid-call and
+ * long enough that the per-frame bookkeeping this adds (a few float adds,
+ * see {@link onFrame}) stays well under noise at up to 60fps.
+ */
+const SUMMARY_INTERVAL_MS = 10000;
 /**
  * Consecutive abnormal capture deaths before we stop attempting the native
  * path at all and leave the share on Chromium capture.
@@ -326,6 +338,24 @@ let active: {
    * the A3 plan.
    */
   sessionId: number;
+  /**
+   * Rolling-summary accumulators for {@link onFrame}'s live branch (plan PR
+   * C4 item 2) -- grouped here, not module-level, specifically so a fresh
+   * `active` object at the top of {@link startForSource} resets them for
+   * free, the same way every other per-session field above does. A
+   * module-level accumulator would otherwise let a share's tail numbers
+   * bleed into the next share's opening window.
+   */
+  summary: {
+    /** {@link Date.now} at the start of the window currently accumulating. */
+    windowStartMs: number;
+    frames: number;
+    bltMsSum: number;
+    grabMsSum: number;
+    /** `refused` as of the last emitted summary (or session start), so the
+     *  next one can log the delta rather than the running total. */
+    refusedAtWindowStart: number;
+  };
 } | null = null;
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
@@ -528,6 +558,13 @@ export async function startForSource(
     refused: 0,
     poolResizes: 0,
     sessionId,
+    summary: {
+      windowStartMs: Date.now(),
+      frames: 0,
+      bltMsSum: 0,
+      grabMsSum: 0,
+      refusedAtWindowStart: 0,
+    },
   };
   appAudioLog(
     `screen capture: native GPU path active for ${sourceId} (hwnd ${hwnd}), target ${CAPTURE_TARGET_WIDTH}x${CAPTURE_TARGET_HEIGHT}@${fps}fps`,
@@ -616,6 +653,35 @@ function onFrame(
       "screen capture: native capture healthy again, clearing failure count",
     );
     consecutiveFailures = 0;
+  }
+
+  // 10s rolling health summary (plan PR C4 item 2) -- see SUMMARY_INTERVAL_MS
+  // for why this exists. Cheap per frame on purpose: a bounds check and three
+  // float adds, no allocation, no string work until the window actually
+  // closes. bltMs/grabMs are summed here and divided once below rather than
+  // kept as a running mean, since a running mean needs the same divide (and
+  // more float error) on every frame for no benefit -- nothing reads the
+  // mean until the window closes.
+  const summary = active.summary;
+  summary.frames++;
+  summary.bltMsSum += live.bltMs;
+  summary.grabMsSum += live.grabMs;
+  const summaryElapsedMs = now - summary.windowStartMs;
+  if (summaryElapsedMs >= SUMMARY_INTERVAL_MS) {
+    const deliveredFps = (summary.frames / summaryElapsedMs) * 1000;
+    const refusedDelta = live.refused - summary.refusedAtWindowStart;
+    const meanBltMs = summary.bltMsSum / summary.frames;
+    // grabMs is a Map(DO_NOT_WAIT) poll now, not a blocking GPU wait -- see
+    // addon.cc's ProcessFrame -- so near-zero here means healthy, not idle.
+    const meanGrabMs = summary.grabMsSum / summary.frames;
+    appAudioLog(
+      `screen capture: 10s summary for ${active.sourceId}: ${deliveredFps.toFixed(1)}fps delivered, refused +${refusedDelta}, mean bltMs=${meanBltMs.toFixed(2)} grabMs=${meanGrabMs.toFixed(2)} (grabMs near zero is expected -- DO_NOT_WAIT readback, not a stall)`,
+    );
+    summary.windowStartMs = now;
+    summary.frames = 0;
+    summary.bltMsSum = 0;
+    summary.grabMsSum = 0;
+    summary.refusedAtWindowStart = live.refused;
   }
 
   const win = BrowserWindow.getAllWindows()[0];
@@ -1077,6 +1143,16 @@ function buildState() {
   };
 }
 
+/**
+ * screenCapture:pageLog is the injected page patch's own console, forwarded
+ * from a page we do not control -- see createLogRateLimiter's doc comment
+ * for why that needs a cap (plan PR A5 item 2). 50/s independently of
+ * window.ts's console-message limiter: these are two different log sources
+ * (this module's own diagnostic forwarding vs. Chromium's raw console-message
+ * event), and a flood on one should not eat the other's budget.
+ */
+const pageLogRateLimit = createLogRateLimiter("screenCapture:pageLog", 50);
+
 export function initScreenCapture() {
   const mod = loadNative();
   appAudioLog(
@@ -1144,7 +1220,7 @@ export function initScreenCapture() {
   // window.ts), so it reports which video path a share actually took --
   // MediaStreamTrackGenerator, the canvas fallback, or leaving Chromium's
   // capture untouched, and why -- through here instead.
-  ipcMain.on("screenCapture:pageLog", (_event, message: string) =>
-    appAudioLog("page:", message),
-  );
+  ipcMain.on("screenCapture:pageLog", (_event, message: string) => {
+    if (pageLogRateLimit()) appAudioLog("page:", message);
+  });
 }

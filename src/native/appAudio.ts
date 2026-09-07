@@ -25,6 +25,7 @@
 // and the `--allow-system-audio-mix` escape hatch that fallback now lives
 // behind.
 import { appendFileSync, mkdirSync, statSync, unlinkSync } from "node:fs";
+import { appendFile } from "node:fs/promises";
 import { release } from "node:os";
 import { join } from "node:path";
 
@@ -86,6 +87,76 @@ export function appAudioLogPath() {
   return logPath;
 }
 
+// Buffered, async-flushed logging (plan PR A5 item 1).
+//
+// This used to be a statSync + appendFileSync pair on every single log()
+// call, synchronously, on the main thread -- at up to 60fps once the C4
+// per-frame health summary (screenCapture.ts's onFrame) started calling this,
+// that is two blocking syscalls per frame competing with everything else the
+// main thread does (IPC, window events, the display-media handler). Lines are
+// now buffered in memory and flushed with async fs.appendFile, either every
+// LOG_FLUSH_INTERVAL_MS or once LOG_FLUSH_BYTES of pending text piles up,
+// whichever comes first -- so a burst still reaches disk promptly instead of
+// waiting out the full interval.
+//
+// The obvious risk with buffering is losing the tail on quit, or corrupting
+// the file by letting two writes race each other. Both are handled below:
+// see {@link logFlushChain}'s doc comment for the anti-interleaving story and
+// {@link flushAppAudioLogSync}'s for what runs on `before-quit`.
+const LOG_FLUSH_INTERVAL_MS = 250;
+const LOG_FLUSH_BYTES = 64 * 1024;
+/** Keep it small; this is a diagnostic aid, not an audit trail. */
+const LOG_MAX_BYTES = 512 * 1024;
+/**
+ * The statSync/truncate check used to run before every single line. Now it
+ * runs every LOG_STAT_EVERY_N_WRITES lines instead -- the file can overshoot
+ * LOG_MAX_BYTES by up to that many lines between checks, which is noise
+ * against a 512KB budget, in exchange for one syscall per ~100 lines instead
+ * of per line.
+ */
+const LOG_STAT_EVERY_N_WRITES = 100;
+
+let logBuffer: string[] = [];
+let logBufferBytes = 0;
+let logFlushTimer: ReturnType<typeof setTimeout> | null = null;
+let logWriteCount = 0;
+/**
+ * Every async flush chains onto this instead of firing its own fs.appendFile
+ * call directly. Two independent appendFile calls to the same path can
+ * interleave their writes (each is its own open/append/close under the
+ * hood), which would corrupt or reorder lines if a size-triggered flush ever
+ * raced a timer-triggered one; chaining onto a single promise makes that
+ * structurally impossible; there is only ever one appendFile in flight for
+ * this file at a time; the next one always waits for the previous one to
+ * settle first. `.catch(() => {})` on the chain itself, not on each link,
+ * so one failed write cannot poison every flush after it.
+ */
+let logFlushChain: Promise<void> = Promise.resolve();
+/**
+ * The exact bytes handed to the fs.appendFile call `logFlushChain` is
+ * currently waiting on, or null when nothing is in flight. This is the other
+ * half of the quit guarantee: `before-quit` cannot await `logFlushChain`
+ * (see {@link flushAppAudioLogSync}'s doc comment for why), so instead of
+ * hoping the in-flight async write lands before the process exits, the sync
+ * flush re-sends this same data with appendFileSync. In the rare case both
+ * end up landing, the cost is a duplicate line in a diagnostic log -- cheap
+ * insurance against losing the line outright.
+ */
+let logInFlightData: string | null = null;
+/**
+ * Identifies which flush {@link logInFlightData} belongs to, so the
+ * `.finally()` in {@link flushLogBuffer} that clears it can tell "my own
+ * write landed" apart from "a later write's data happens to be
+ * byte-identical to mine". Two batches CAN be byte-identical in principle --
+ * e.g. two flush cycles that each contain exactly one repeated log line --
+ * and `string === string` compares by value, so comparing against
+ * `logInFlightData` directly would let an earlier write's completion clear a
+ * later, still-in-flight write's marker out from under it. A monotonic
+ * counter compared by identity has no such collision.
+ */
+let logFlushSeq = 0;
+let logInFlightSeq = 0;
+
 export function log(...parts: unknown[]) {
   const line =
     new Date().toISOString() +
@@ -94,17 +165,160 @@ export function log(...parts: unknown[]) {
   console.log("[appAudio]", line);
   const file = appAudioLogPath();
   if (!file) return;
-  try {
-    // Keep it small; this is a diagnostic aid, not an audit trail.
+
+  logWriteCount++;
+  if (logWriteCount % LOG_STAT_EVERY_N_WRITES === 0) {
     try {
-      if (statSync(file).size > 512 * 1024) unlinkSync(file);
+      if (statSync(file).size > LOG_MAX_BYTES) unlinkSync(file);
     } catch {
-      /* first run */
+      /* first run, or file already gone -- fine either way */
     }
-    appendFileSync(file, line + "\n", "utf8");
-  } catch {
-    /* logging must never break screen sharing */
   }
+
+  logBuffer.push(line);
+  // +1 for the "\n" flushLogBuffer joins in; counted here rather than after
+  // the join so this stays O(1) per call instead of re-measuring the whole
+  // buffer on every line.
+  logBufferBytes += Buffer.byteLength(line, "utf8") + 1;
+  if (logBufferBytes >= LOG_FLUSH_BYTES) {
+    flushLogBuffer();
+    return;
+  }
+  if (!logFlushTimer) {
+    logFlushTimer = setTimeout(() => {
+      logFlushTimer = null;
+      flushLogBuffer();
+    }, LOG_FLUSH_INTERVAL_MS);
+    // Must never be the reason the process stays alive -- a quit with
+    // nothing else pending should not wait around for a log flush timer.
+    // `before-quit`'s sync flush (see flushAppAudioLogSync) is what actually
+    // guarantees delivery, not this timer surviving to fire.
+    logFlushTimer.unref?.();
+  }
+}
+
+function flushLogBuffer() {
+  if (logFlushTimer) {
+    clearTimeout(logFlushTimer);
+    logFlushTimer = null;
+  }
+  if (logBuffer.length === 0) return;
+  const file = appAudioLogPath();
+  const data = logBuffer.join("\n") + "\n";
+  logBuffer = [];
+  logBufferBytes = 0;
+  if (!file) return;
+
+  const seq = ++logFlushSeq;
+  logInFlightData = data;
+  logInFlightSeq = seq;
+  logFlushChain = logFlushChain
+    .then(() => appendFile(file, data, "utf8"))
+    .catch(() => {
+      /* logging must never break screen sharing */
+    })
+    .finally(() => {
+      // Only clear it if it's still THIS write's turn -- see logFlushSeq's
+      // doc comment for why identity (the sequence number), not the data
+      // itself, is what's compared. A sync quit flush (flushAppAudioLogSync)
+      // can also grab and null this out from under a still-pending promise,
+      // and a later write must not clobber that either.
+      if (logInFlightSeq === seq) logInFlightData = null;
+    });
+}
+
+/**
+ * Last-chance synchronous flush for `before-quit` (plan PR A5 item 1).
+ *
+ * Buffering plus async fs.appendFile means a line can sit unwritten for up
+ * to LOG_FLUSH_INTERVAL_MS, or an already-started appendFile can still be
+ * in flight, at the exact moment the process quits. `before-quit` has no
+ * mechanism to await anything -- see window.ts's handler, which is
+ * fire-and-forget for the native capture stop calls for the same reason --
+ * and nothing here can assume the event loop survives long enough to let a
+ * pending fs.appendFile finish once quit actually proceeds. So this bypasses
+ * the buffer and the async chain entirely: it re-sends whatever write was in
+ * flight (see {@link logInFlightData}'s doc comment for why that can produce
+ * a harmless duplicate line rather than a lost one) and then appendFileSync's
+ * whatever is still sitting in the buffer, synchronously, on the main
+ * thread -- exactly what every line paid before this change, just once at
+ * quit instead of once per line.
+ *
+ * Called from window.ts's `before-quit` handler, deliberately last in that
+ * handler's body, so it also catches whatever that handler itself logged
+ * (e.g. "quit: native capture stop requested") on its way out.
+ */
+export function flushAppAudioLogSync() {
+  if (logFlushTimer) {
+    clearTimeout(logFlushTimer);
+    logFlushTimer = null;
+  }
+  const file = appAudioLogPath();
+  if (!file) {
+    logBuffer = [];
+    logBufferBytes = 0;
+    logInFlightData = null;
+    return;
+  }
+  try {
+    if (logInFlightData) appendFileSync(file, logInFlightData, "utf8");
+  } catch {
+    /* logging must never break screen sharing, not even at quit */
+  } finally {
+    logInFlightData = null;
+  }
+  if (logBuffer.length === 0) return;
+  const data = logBuffer.join("\n") + "\n";
+  logBuffer = [];
+  logBufferBytes = 0;
+  try {
+    appendFileSync(file, data, "utf8");
+  } catch {
+    /* logging must never break screen sharing, not even at quit */
+  }
+}
+
+/**
+ * Caps how often a chattering, page-controlled log source can write to
+ * app-audio.log (plan PR A5 item 2) -- the injected patch's forwarded
+ * console (`screenCapture:pageLog`) and the raw `console-message` event in
+ * window.ts both read from a remote page we do not control, so a page bug
+ * that logs in a tight loop must not get to flood a 512KB-capped file (see
+ * LOG_MAX_BYTES) with nothing else ever making it in edgewise.
+ *
+ * A plain drop would fix the flood but hide it -- the log would just go
+ * quiet with no sign anything was suppressed. Instead this returns whether
+ * THIS call may log, and counts every call it refuses; the moment the
+ * one-second window rolls over, one marker line reports how many were
+ * suppressed since the last one got through, so a flood is visible in the
+ * log instead of an unexplained gap.
+ *
+ * A fixed one-second bucket, not a sliding window -- simpler, and "roughly
+ * 50/s" is all a diagnostic-log cap needs to be; nothing here bills by it.
+ */
+export function createLogRateLimiter(label: string, maxPerSecond: number) {
+  let windowStartMs = Date.now();
+  let countThisWindow = 0;
+  let suppressedThisWindow = 0;
+  return (): boolean => {
+    const now = Date.now();
+    if (now - windowStartMs >= 1000) {
+      if (suppressedThisWindow > 0) {
+        log(
+          `${label}: suppressed ${suppressedThisWindow} line(s) over the ${maxPerSecond}/s cap`,
+        );
+      }
+      windowStartMs = now;
+      countThisWindow = 0;
+      suppressedThisWindow = 0;
+    }
+    if (countThisWindow >= maxPerSecond) {
+      suppressedThisWindow++;
+      return false;
+    }
+    countThisWindow++;
+    return true;
+  };
 }
 
 type NativeModule = typeof import("win-app-audio");

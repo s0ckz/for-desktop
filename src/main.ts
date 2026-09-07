@@ -132,14 +132,14 @@ if (acquiredLock) {
   // start auto update logic -- see native/update.ts for the toast, the tray
   // fallback, and the diagnostic logging around both.
   //
-  // NOT covered by `didInitialise` below: that guard lives inside the
-  // `app.on("ready", ...)` callback, and this call is outside it. That's not
-  // a new problem -- the `updateElectronApp()` call this replaced was outside
-  // it too -- but it does mean that if this module is ever evaluated twice
-  // (see the `didInitialise` comment for the confirmed case of that), you get
-  // two updaters, two polling intervals, and two `onNotifyUser` calls per
-  // download. Read a duplicated `update:` line in app-audio.log as a sign of
-  // that, not as Squirrel retrying the download.
+  // Deliberately outside the `app.on("ready", ...)` callback below, and so
+  // NOT covered by `didInitialise` -- an update can in principle land before
+  // `ready` even fires, and this starts the check as early as possible
+  // rather than wait on it (see `onNotifyUser`'s own comment in update.ts).
+  // If this module is ever evaluated twice (see the `didInitialise` comment
+  // for the confirmed case of that), initUpdater() no longer needs a second
+  // guard here: it has its own once-flag now (plan PR A5 item 5) precisely
+  // because it sits outside `didInitialise`'s reach.
   initUpdater();
 
   // create and configure the app when electron is ready

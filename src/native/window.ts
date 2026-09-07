@@ -15,6 +15,8 @@ import windowIconAsset from "../../assets/desktop/icon.png?asset";
 import { DEFAULT_SERVER } from "../constants";
 
 import {
+  createLogRateLimiter,
+  flushAppAudioLogSync,
   log as appAudioLog,
   pidForSourceId,
   startForSource,
@@ -95,6 +97,17 @@ let lastShare: {
   pid: number;
   name: string;
   audio: boolean;
+  /**
+   * The Display API's own stable id for a *screen* share (empty string for a
+   * window share, or if Electron could not report one) -- plan PR A5 item 3.
+   * `sourceId`'s `screen:ZZ:0` form encodes ZZ as a sequential enumeration
+   * index, not a persistent identifier, so unplugging/replugging a monitor
+   * (or it simply waking up in a different enumeration order) can renumber
+   * it out from under a straight sourceId comparison. See
+   * `findRememberedScreen` below, the counterpart to `findRememberedWindow`'s
+   * pid/name matching for windows.
+   */
+  displayId: string;
 } | null = null;
 
 /**
@@ -328,6 +341,10 @@ async function respondToDisplayMedia(
     pid: pidForSourceId(source.id),
     name: source.name,
     audio,
+    // Only meaningful for a screen source -- see lastShare's own doc comment
+    // on this field. `display_id` is "" rather than absent for a window
+    // source, per Electron's own typing, so this needs no isWindow branch.
+    displayId: source.display_id,
   };
 
   // Window capture is hard-wired to WGC and WGC is brokered by CaptureService,
@@ -500,6 +517,30 @@ async function findRememberedWindow(target: {
 }
 
 /**
+ * The screen counterpart to {@link findRememberedWindow} (plan PR A5 item
+ * 3): a screen share used to be unre-acquirable at all -- the reacquire
+ * handler below refused anything whose sourceId did not start with
+ * `window:` -- so a monitor that WGC or the OS transiently dropped the
+ * share for had no recovery path a window share already had.
+ *
+ * Matched on `display_id`, the Display API's own stable id, not on
+ * `sourceId`: see `lastShare`'s doc comment on `displayId` for why the raw
+ * `screen:ZZ:0` id is not safe to compare directly.
+ */
+async function findRememberedScreen(target: {
+  displayId: string;
+}): Promise<Electron.DesktopCapturerSource | null> {
+  if (!target.displayId) return null;
+  const screens = await desktopCapturer.getSources({
+    types: ["screen"],
+    thumbnailSize: { width: 0, height: 0 },
+  });
+  return (
+    screens.find((source) => source.display_id === target.displayId) ?? null
+  );
+}
+
+/**
  * The first whole-screen source, used to keep a window share off WGC.
  */
 async function primaryScreenSource(): Promise<Electron.DesktopCapturerSource | null> {
@@ -553,8 +594,14 @@ ipcMain.handle("screenShare:reacquire", async () => {
     appAudioLog("reacquire: no remembered share");
     return false;
   }
-  if (!target.sourceId.startsWith("window:")) {
-    appAudioLog("reacquire: last share was a screen, not re-acquiring");
+  // Screens can re-arm too now (plan PR A5 item 3) -- see findRememberedScreen's
+  // doc comment for why this used to be window-only. A screen share with no
+  // displayId (Electron could not report one) still has no recovery path.
+  const isWindow = target.sourceId.startsWith("window:");
+  if (!isWindow && !target.displayId) {
+    appAudioLog(
+      "reacquire: last share was a screen with no display id, not re-acquiring",
+    );
     return false;
   }
 
@@ -562,12 +609,23 @@ ipcMain.handle("screenShare:reacquire", async () => {
   const deadline = Date.now() + REACQUIRE_TIMEOUT_MS;
   let pollMs = REACQUIRE_POLL_MS;
   appAudioLog(
-    "reacquire: waiting for window",
+    "reacquire: waiting for",
+    isWindow ? "window" : "screen",
     target.name,
     `(${target.sourceId}, pid ${target.pid})`,
   );
 
   while (Date.now() < deadline) {
+    // The window this poll is chasing is gone the moment the app quits --
+    // bail rather than keep polling desktopCapturer against a torn-down
+    // window/session (plan PR A5 item 3). before-quit also bumps
+    // reacquireGeneration (see that handler) for the same reason; this check
+    // catches it sooner than waiting for the next generation comparison
+    // below to notice, since a poll can be mid-`await` when quit fires.
+    if (mainWindow.isDestroyed()) {
+      appAudioLog("reacquire: main window destroyed, giving up");
+      return false;
+    }
     if (generation !== reacquireGeneration || lastShare !== target) {
       appAudioLog("reacquire: superseded, giving up");
       return false;
@@ -575,7 +633,9 @@ ipcMain.handle("screenShare:reacquire", async () => {
 
     let match: Electron.DesktopCapturerSource | null = null;
     try {
-      match = await findRememberedWindow(target);
+      match = isWindow
+        ? await findRememberedWindow(target)
+        : await findRememberedScreen(target);
     } catch (err) {
       appAudioLog("reacquire: could not list sources:", String(err));
     }
@@ -593,6 +653,16 @@ ipcMain.handle("screenShare:reacquire", async () => {
   appAudioLog("reacquire: window never came back");
   return false;
 });
+
+/**
+ * The remote page's raw `console-message` event, capped independently of
+ * screenCapture.ts's own `screenCapture:pageLog` limiter -- see
+ * createLogRateLimiter's doc comment for why a page-controlled log source
+ * needs one at all (plan PR A5 item 2). Module-scoped, not local to
+ * `createMainWindow`, so a reload/reload loop cannot reset the budget by
+ * re-running the function that would otherwise redeclare it.
+ */
+const consoleMessageRateLimit = createLogRateLimiter("console-message", 50);
 
 /**
  * Create the main application window
@@ -710,7 +780,9 @@ export function createMainWindow() {
     "console-message",
     (_event, level, message, line, sourceId) => {
       if (level < 3) return; // 3 = error
-      appAudioLog(`page error: ${message} (${sourceId}:${line})`);
+      if (consoleMessageRateLimit()) {
+        appAudioLog(`page error: ${message} (${sourceId}:${line})`);
+      }
     },
   );
 
@@ -751,9 +823,19 @@ export function createMainWindow() {
   };
 
   // load the entrypoint
-  purgeCachedClient()
-    .then(() => mainWindow.loadURL(getBuildUrl().toString()))
-    .then(() => mainWindow.webContents.reload());
+  //
+  // Used to load, then immediately reload() again (plan PR A5 item 6): that
+  // predates purgeCachedClient() above and was itself a speculative "reload
+  // on every startup" attempt at the same grey-window bug the comment above
+  // explains -- see PR #269's own commit message, literally "what if we just
+  // reloaded every startup, would that kill cache?", with no evidence it
+  // actually did. purgeCachedClient() is the real fix: it clears the
+  // service worker and cache storage *before* this load even starts, which
+  // is what the comment above documents, and it does not depend on a second
+  // load to work. The leftover reload() only doubled did-finish-load (so
+  // the page patch above injects twice) and briefly re-flashed the window
+  // on every launch, with nothing behind it once the real fix landed.
+  purgeCachedClient().then(() => mainWindow.loadURL(getBuildUrl().toString()));
 
   // minimise window to tray
   mainWindow.on("close", (event) => {
@@ -1069,6 +1151,14 @@ export function quitApp() {
 // Ensure global app quit works properly
 app.on("before-quit", () => {
   shouldQuit = true;
+  // Abandon any in-flight screenShare:reacquire poll (plan PR A5 item 3):
+  // that loop already checks `mainWindow.isDestroyed()` on every iteration,
+  // but it can be mid-`await` (the poll's own setTimeout, or a desktopCapturer
+  // call) when quit fires, and bumping the generation here is what makes the
+  // very next generation check it takes -- not the isDestroyed check, which
+  // only runs at the top of the loop -- refuse to arm a share for a window
+  // that no longer exists.
+  reacquireGeneration++;
   // Item 5: the cooperative path that runs first, ahead of whatever the
   // native destructors do as a backstop once the process is actually
   // exiting -- gives the capture thread(s) a chance to join cleanly instead
@@ -1079,4 +1169,9 @@ app.on("before-quit", () => {
   appAudioLog("quit: native capture stop requested");
   void stopScreenCapture("stopped");
   void stopAppAudio();
+  // Last, deliberately: plan PR A5 item 1's synchronous quit flush (see its
+  // own doc comment in appAudio.ts) also catches whatever appAudioLog() call
+  // this handler itself just made, since it runs after every log() call
+  // above rather than racing them.
+  flushAppAudioLogSync();
 });

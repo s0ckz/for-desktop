@@ -140,11 +140,33 @@ function showUpdateToast(info: IUpdateInfo) {
 }
 
 /**
+ * Guards {@link initUpdater} against running twice (plan PR A5 item 5).
+ *
+ * Not folded into main.ts's own `didInitialise` guard on purpose: that one
+ * lives inside `app.on("ready", ...)`, and this call is deliberately OUTSIDE
+ * it -- see `onNotifyUser`'s own comment below on `updateTrayMenu()` for why
+ * an update can in principle land before `ready` even fires, which is the
+ * point of starting this early. `didInitialise` only proves the module was
+ * evaluated twice starting from `ready`; this proves initUpdater() itself
+ * was only ever wired up once, which is the actual invariant that matters
+ * here (see the stale comment this replaces, which used to just document the
+ * gap: two updaters, two polling intervals, two `onNotifyUser` calls per
+ * download).
+ */
+let updaterInitialised = false;
+
+/**
  * Start the updater. Only called when the single-instance lock was
  * acquired -- a second instance quits immediately (see main.ts) and has no
  * business polling for or applying updates.
  */
 export function initUpdater() {
+  if (updaterInitialised) {
+    appAudioLog("update: initUpdater() called again; ignoring");
+    return;
+  }
+  updaterInitialised = true;
+
   // Logged once at startup rather than per-toast: if notifications are
   // unsupported on this machine at all, every "showing toast for version X"
   // line for the rest of the session is a known dead end rather than a
