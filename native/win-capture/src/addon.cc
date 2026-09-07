@@ -280,7 +280,11 @@ struct StagingSlot {
 };
 StagingSlot g_stagingRing[kStagingRingSize];
 int g_stagingRingIndex = 0;   // next slot ProcessFrame will CopyResource into
-int g_stagingRingFilled = 0;  // slots written at least once since the last EnsurePipeline rebuild, capped at kStagingRingSize
+// Priming counter, not a slot-written count: it only ever climbs to
+// kStagingRingSize - 1 (see ProcessFrame's priming check) -- the point at
+// which the slot about to be read next already has real content, one whole
+// frame interval old, not kStagingRingSize (every slot ever written).
+int g_stagingRingFilled = 0;
 
 // The frame pool's own buffer size, tracked separately from g_srcW/g_srcH --
 // see EnsurePool.
@@ -613,12 +617,40 @@ std::atomic<uint64_t> g_framesRefused{0};
  */
 std::atomic<uint64_t> g_poolResizes{0};
 
+/**
+ * Times ProcessFrame's Map(readSlot, D3D11_MAP_FLAG_DO_NOT_WAIT) returned
+ * DXGI_ERROR_WAS_STILL_DRAWING, cumulative for this session -- see the
+ * comment on that branch for why this is an ordinary pacing drop, not a
+ * failure. It used to be silent: the early `return true` reported nothing,
+ * so a run of these -- e.g. every frame, if the missing Flush() this counter
+ * was added alongside were ever reintroduced -- looked identical to a
+ * healthy session that simply had nothing to deliver. Reported alongside
+ * `refused`/`poolResizes` so the 10s summary in screenCapture.ts can name
+ * this specific stage instead of a share that produces nothing being
+ * indistinguishable from one that was never asked to produce anything.
+ */
+std::atomic<uint64_t> g_framesStillDrawing{0};
+
+/**
+ * Times CaptureThread's frame->get_SystemRelativeTime() read failed, or
+ * "succeeded" with Duration == 0, and pacing fell back to QpcNow100ns()
+ * instead -- cumulative for this session. See QpcNow100ns's own doc comment
+ * for why a failed read must never be treated as a genuine 0. Surfaced the
+ * same way as the other counters above so screenCapture.ts can log once, on
+ * the 0 -> nonzero edge, rather than the native side owning a log line of
+ * its own -- see this file's SetErrorText/lastError() split for why a
+ * transient, self-recovering condition like this one does not belong there.
+ */
+std::atomic<uint64_t> g_timestampFallbacks{0};
+
 // Named (not an inline lambda at the call site) so Emit() below can pass it
 // to more than one NonBlockingCall attempt when retrying a death payload.
 void EmitToJs(Napi::Env env, Napi::Function cb, FramePayload* p) {
   auto meta = Napi::Object::New(env);
   meta.Set("refused", Napi::Number::New(env, static_cast<double>(g_framesRefused.load())));
   meta.Set("poolResizes", Napi::Number::New(env, static_cast<double>(g_poolResizes.load())));
+  meta.Set("stillDrawing", Napi::Number::New(env, static_cast<double>(g_framesStillDrawing.load())));
+  meta.Set("timestampFallbacks", Napi::Number::New(env, static_cast<double>(g_timestampFallbacks.load())));
   if (p->isDeath) {
     // No pixel buffer for a death signal -- see FramePayload::isDeath.
     meta.Set("reason", Napi::String::New(env, p->reason));
@@ -810,6 +842,21 @@ bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH, double time
   g_stagingRing[writeSlot].timestampUs = timestampUs;
   g_stagingRingIndex = (writeSlot + 1) % kStagingRingSize;
 
+  // CopyResource above only *records* the GPU->CPU copy into the immediate
+  // context's command list -- it does not submit it, and with no Present()
+  // anywhere in this headless capture path nothing else submits it either,
+  // short of the driver eventually auto-flushing on a full command buffer
+  // (bursty at best, and in practice never happens before the caller gives
+  // up). Flush() here is what actually hands the copy to the GPU. Without
+  // it, Map(..., D3D11_MAP_FLAG_DO_NOT_WAIT) below has nothing to poll but
+  // work that was never submitted, so it returns DXGI_ERROR_WAS_STILL_DRAWING
+  // -- forever, not just on the rare occasion the comment above the read
+  // slot describes -- and this function never delivers a single frame. This
+  // is a plain Flush(), not a wait: it costs a driver call to hand off the
+  // command list, not a pipeline stall, so it does not undo the point of
+  // moving Map() to DO_NOT_WAIT above.
+  g_context->Flush();
+
   // The first kStagingRingSize-1 frames after Start() or after EnsurePipeline
   // resets this ring (a resize or a setTarget() -- see its own comment) have
   // no N-1 slot with real content to read: every slot is a freshly created,
@@ -817,9 +864,22 @@ bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH, double time
   // not a failure -- CaptureThread already treats "no Emit() this iteration"
   // as an ordinary drop (the same path a too-fast frame or a still-drawing
   // GPU takes), so the caller sees no difference from any other skipped
-  // frame; it is just guaranteed for a session's or a rebuild's first couple
-  // of frames instead of merely likely.
-  if (g_stagingRingFilled < kStagingRingSize) {
+  // frame; it is just guaranteed for a session's or a rebuild's first
+  // kStagingRingSize-1 frame(s) instead of merely likely.
+  //
+  // Compared against kStagingRingSize - 1, not kStagingRingSize: filled==0
+  // means writeSlot's own copy (just issued above) is the only content the
+  // ring has ever held, so priming this call's own return is correct. But by
+  // the very next call filled==1 already means kStagingRingSize-1 (==1 for
+  // the current ring depth) slots have been written at least once -- the
+  // slot this call is about to read (a DIFFERENT slot than the one just
+  // written, see readSlot below) already has real content from the previous
+  // call, one whole frame interval old, exactly like the steady-state case.
+  // The old `< kStagingRingSize` bound primed for filled 0 AND 1, discarding
+  // a second frame that was already readable, on every EnsurePipeline
+  // rebuild -- and `0c836e28` made those rebuilds happen on every quality
+  // change, not just at session start.
+  if (g_stagingRingFilled < kStagingRingSize - 1) {
     g_stagingRingFilled++;
     return true;
   }
@@ -831,7 +891,12 @@ bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH, double time
   if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
     // Not a failure -- see the comment above this block. The pixels are not
     // lost, only this call's chance to read them; readSlot's own content
-    // gets another chance once the ring cycles back to it.
+    // gets another chance once the ring cycles back to it. Counted (not
+    // just silently returned) so a session that skips every single frame
+    // this way -- e.g. the Flush() above being lost again some future PR --
+    // is visible in the 10s summary (screenCapture.ts) instead of looking
+    // identical to a healthy session with nothing to deliver.
+    g_framesStillDrawing.fetch_add(1, std::memory_order_relaxed);
     return true;
   }
   if (FAILED(hr)) {
@@ -950,6 +1015,43 @@ class FrameArrivedHandler
  private:
   std::atomic<HANDLE> frameEvent_{nullptr};  // not owned; CaptureThread owns and closes it
 };
+
+/**
+ * Monotonic fallback for frame delivery pacing, in the same 100ns units as
+ * frame->get_SystemRelativeTime() (see CaptureThread's pacing comment above
+ * lastDeliveredTs).
+ *
+ * get_SystemRelativeTime() can fail, and -- observed in the wild, not just
+ * hypothesised -- some drivers hand back a "successful" HRESULT with
+ * Duration == 0. Either way, the caller must never treat that as a genuine
+ * timestamp: the pacing check below is `(ts - lastDeliveredTs) < 0.9 *
+ * interval100ns`, so a `ts` of exactly 0 is only wrong for one frame if
+ * lastDeliveredTs was already >= 0 -- but the FIRST time this happens,
+ * lastDeliveredTs itself becomes 0, and every later frame's own (also
+ * fabricated-as-0-on-failure, or worse, genuinely small) value keeps
+ * satisfying that inequality, permanently. A single bad read used to be
+ * enough to end delivery for the rest of the session with nothing in the
+ * logs to explain why.
+ *
+ * QueryPerformanceCounter is this thread's own monotonic wall clock -- not
+ * comparable to WGC's SystemRelativeTime in absolute terms (different
+ * epochs), but pacing here only ever looks at a DELTA between two
+ * consecutive values, so a one-time epoch mismatch on the single frame where
+ * this fallback first engages costs at most one wrongly-paced frame, not a
+ * stall. QueryPerformanceFrequency cannot fail on any Windows version this
+ * addon targets (Vista+); the cached frequency is read once and reused, same
+ * reasoning as every other per-process-constant cache in this file.
+ */
+double QpcNow100ns() {
+  static const LARGE_INTEGER kFrequency = [] {
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    return f;
+  }();
+  LARGE_INTEGER counter;
+  QueryPerformanceCounter(&counter);
+  return static_cast<double>(counter.QuadPart) * 1.0e7 / static_cast<double>(kFrequency.QuadPart);
+}
 
 // ---------------------------------------------------------------------------
 // Capture thread: owns the whole session lifetime. FrameArrived (subscribed
@@ -1227,7 +1329,21 @@ void CaptureThread(HWND hwnd) {
       // intervals instead of one.
       ABI::Windows::Foundation::TimeSpan relativeTime{};
       hr = frame->get_SystemRelativeTime(&relativeTime);
-      const double ts = SUCCEEDED(hr) ? static_cast<double>(relativeTime.Duration) : 0.0;
+      // FAILED(hr) is the obvious failure; Duration == 0 is the one observed
+      // in the wild that is not -- some drivers report S_OK with a zero
+      // timestamp. Both get the same fallback: a fabricated 0.0 here is
+      // indistinguishable from a genuine one to the pacing check below, and
+      // once lastDeliveredTs latches onto a fabricated 0 every later frame's
+      // own (also-possibly-fabricated) value keeps satisfying `(ts - 0) <
+      // 0.9 * interval100ns` forever -- see QpcNow100ns's doc comment for
+      // the full failure mode this replaces.
+      double ts;
+      if (SUCCEEDED(hr) && relativeTime.Duration != 0) {
+        ts = static_cast<double>(relativeTime.Duration);
+      } else {
+        ts = QpcNow100ns();
+        g_timestampFallbacks.fetch_add(1, std::memory_order_relaxed);
+      }
       if (lastDeliveredTs >= 0.0 && (ts - lastDeliveredTs) < 0.9 * interval100ns) {
         continue;  // faster than the requested delivery rate -- drop (Release only, same as any other drop)
       }
@@ -1596,6 +1712,8 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
   // Per-session, so a later share does not inherit an earlier one's count.
   g_framesRefused.store(0);
   g_poolResizes.store(0);
+  g_framesStillDrawing.store(0);
+  g_timestampFallbacks.store(0);
   g_running.store(true);
   g_thread = std::thread(CaptureThread, hwnd);
   return Napi::Boolean::New(env, true);

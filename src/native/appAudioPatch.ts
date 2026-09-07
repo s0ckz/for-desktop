@@ -27,6 +27,15 @@ export const APP_AUDIO_PATCH = [
   "    try { if (screenCaptureBridge && screenCaptureBridge.log) screenCaptureBridge.log(msg); } catch (e) { /* noop */ }",
   "  };",
   "",
+  "  // Per-frame drop counter (plan PR 'no frames' item 6), distinct from",
+  "  // logPage above: this is called on every drop, not once per session, so",
+  "  // screenCapture.ts's 10s summary can report how many this window rather",
+  "  // than only whether it ever happened once. screenCapture.ts (main",
+  "  // process) is what actually decides how that reaches app-audio.log.",
+  "  const reportDrop = (stage) => {",
+  "    try { if (screenCaptureBridge && screenCaptureBridge.reportDrop) screenCaptureBridge.reportDrop(stage); } catch (e) { /* noop */ }",
+  "  };",
+  "",
   "  if (window.__stoatAppAudioPatched) {",
   "    // The main process logs 'screen share patch injected' unconditionally",
   "    // on every executeJavaScript call, so without this line a duplicate",
@@ -295,6 +304,15 @@ export const APP_AUDIO_PATCH = [
   "    // is built with no `duration` at all (a valid, optional field) rather",
   "    // than a guessed value.",
   "    let lastTimestampUs = null;",
+  "    // Gates the one-time 'new VideoFrame() construction failed' log below",
+  "    // (both the generator and canvas-fallback paths share this session's",
+  "    // one flag) -- a construction failure used to return in total silence,",
+  "    // which is itself a candidate explanation for '0 fps': every frame",
+  "    // this session ever receives could be silently dropped right here and",
+  "    // nothing downstream would ever know why. Logging every occurrence",
+  "    // instead would just trade one silent failure mode for a log flood at",
+  "    // full frame rate, so this logs the first one only.",
+  "    let loggedVideoFrameFailure = false;",
   "",
   "    if (typeof MediaStreamTrackGenerator === 'function') {",
   "      let generator = null;",
@@ -327,7 +345,31 @@ export const APP_AUDIO_PATCH = [
   "          if (lastTimestampUs !== null) vfInit.duration = Math.max(0, meta.timestampUs - lastTimestampUs);",
   "          lastTimestampUs = meta.timestampUs;",
   "          let vf = null;",
-  "          try { vf = new VideoFrame(buf, vfInit); } catch (e) { return; }",
+  "          try { vf = new VideoFrame(buf, vfInit); } catch (e) {",
+  "            reportDrop('videoFrameFailure');",
+  "            if (!loggedVideoFrameFailure) {",
+  "              loggedVideoFrameFailure = true;",
+  "              logPage('new VideoFrame() construction failed (generator path): ' + (e && e.message ? e.message : e));",
+  "            }",
+  "            return;",
+  "          }",
+  // desiredSize is `null`, not a number, once the writable stream has
+  // errored or closed -- and `null <= 0` is `true` in JS, so without the
+  // dedicated check below this fell straight into the ordinary
+  // backpressure branch and silently dropped every frame for the rest of
+  // the session: nothing ever set `closed`, nothing ever dispatched
+  // 'ended', so for-web's reacquire path never ran. Terminal, not
+  // backpressure -- end the track the same way the onState('!active')
+  // handler below already does, so the existing recovery path fires.
+  "          if (writer.desiredSize === null) {",
+  "            try { vf.close(); } catch (e) { /* noop */ }",
+  "            if (!closed) {",
+  "              closed = true;",
+  "              logPage('generator writable errored/closed (desiredSize is null); ending track');",
+  "              try { generator.dispatchEvent(new Event('ended')); } catch (e) { /* noop */ }",
+  "            }",
+  "            return;",
+  "          }",
   "          if (writer.desiredSize <= 0 || pending > 0) {",
   "            try { vf.close(); } catch (e) { /* noop */ }",
   "            return;",
@@ -409,10 +451,28 @@ export const APP_AUDIO_PATCH = [
   // upload plus a compositor hop on frames captureStream will never sample.
   // `lastDrawUs` throttles draws to one per frame interval using the same
   // real capture timestamps buildVideoTrack already tracks for `duration`.
+  // Threshold is 0.9x the interval, not a strict >=, matching the native
+  // pacer's own headroom (addon.cc's CaptureThread, `0.9 * interval100ns`)
+  // exactly -- two independent caps at the same nominal value is the "two
+  // caps" mistake `70f19071` already fixed on the web side: native paces at
+  // >= 0.9x and delivers a frame at e.g. 0.95x the interval, which this
+  // throttle at a strict `< frameIntervalUs` then rejected anyway, so a
+  // frame that passed native's own pacing was dropped a second time here --
+  // roughly halving the effective rate under ordinary jitter, not just at
+  // the boundary.
   "          let lastDrawUs = null;",
   "          const frameIntervalUs = fps > 0 ? 1e6 / fps : 0;",
   "          const unsubFrame = screenCaptureBridge.onFrame((buf, meta) => {",
   "            if (closed) return;",
+  // Throttle BEFORE touching the canvas or constructing a VideoFrame -- both
+  // cost a GPU upload/compositor hop this frame is about to be thrown away
+  // regardless. `lastDrawUs` itself is advanced only once the draw below
+  // actually happens (not here): advancing it on a throttled-out frame is
+  // harmless, but advancing it on a frame that reached VideoFrame
+  // construction and then failed would silently skip the *next* frame's
+  // trailing edge of the throttle window for no draw at all -- see the
+  // assignment after drawImage below.
+  "            if (frameIntervalUs > 0 && lastDrawUs !== null && meta.timestampUs - lastDrawUs < 0.9 * frameIntervalUs) return;",
   "            if (meta.width !== canvas.width || meta.height !== canvas.height) {",
   "              canvas.width = meta.width; canvas.height = meta.height;",
   "            }",
@@ -425,11 +485,16 @@ export const APP_AUDIO_PATCH = [
   "            };",
   "            if (lastTimestampUs !== null) vfInit.duration = Math.max(0, meta.timestampUs - lastTimestampUs);",
   "            lastTimestampUs = meta.timestampUs;",
-  "            if (frameIntervalUs > 0 && lastDrawUs !== null && meta.timestampUs - lastDrawUs < frameIntervalUs) return;",
-  "            lastDrawUs = meta.timestampUs;",
   "            let vf = null;",
-  "            try { vf = new VideoFrame(buf, vfInit); } catch (e) { return; }",
-  "            try { ctx2d.drawImage(vf, 0, 0, canvas.width, canvas.height); } catch (e) { /* noop */ }",
+  "            try { vf = new VideoFrame(buf, vfInit); } catch (e) {",
+  "              reportDrop('videoFrameFailure');",
+  "              if (!loggedVideoFrameFailure) {",
+  "                loggedVideoFrameFailure = true;",
+  "                logPage('new VideoFrame() construction failed (canvas fallback path): ' + (e && e.message ? e.message : e));",
+  "              }",
+  "              return;",
+  "            }",
+  "            try { ctx2d.drawImage(vf, 0, 0, canvas.width, canvas.height); lastDrawUs = meta.timestampUs; } catch (e) { /* noop */ }",
   "            try { vf.close(); } catch (e) { /* noop */ }",
   "          });",
   "          const unsubState = screenCaptureBridge.onState((s) => {",

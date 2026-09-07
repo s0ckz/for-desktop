@@ -90,6 +90,8 @@ let grabMsMax = 0;
 let firstWidth = null;
 let firstHeight = null;
 let lastRefused = 0; // cumulative refused-frame count off the most recent frame's metadata
+let lastStillDrawing = 0; // cumulative DXGI_ERROR_WAS_STILL_DRAWING skip count off the most recent frame's metadata
+let lastTimestampFallbacks = 0; // cumulative QpcNow100ns() pacing-fallback count off the most recent frame's metadata
 
 const testStart = Date.now();
 
@@ -113,6 +115,8 @@ try {
     if (meta.bltMs > bltMsMax) bltMsMax = meta.bltMs;
     if (meta.grabMs > grabMsMax) grabMsMax = meta.grabMs;
     if (typeof meta.refused === "number") lastRefused = meta.refused;
+    if (typeof meta.stillDrawing === "number") lastStillDrawing = meta.stillDrawing;
+    if (typeof meta.timestampFallbacks === "number") lastTimestampFallbacks = meta.timestampFallbacks;
   });
 } catch (err) {
   console.error("start() threw:", err.message);
@@ -159,6 +163,14 @@ setTimeout(async () => {
   // inferring one from this gap count.
   console.log("frames arriving >1.5x late (inter-arrival gap only, cause unknown from this alone):", arrivedLate);
   console.log("frames refused by native (queue full when JS wasn't ready) :", lastRefused);
+  // Should be 0 for a healthy run -- see addon.cc's ProcessFrame. Nonzero
+  // and climbing across the whole run (not just an occasional blip) means
+  // the Flush() that call site depends on is missing or racing again.
+  console.log("frames skipped, still drawing (DXGI_ERROR_WAS_STILL_DRAWING):", lastStillDrawing);
+  // Should also be 0 -- see addon.cc's QpcNow100ns. Nonzero means
+  // get_SystemRelativeTime() failed or stamped 0 at least once and pacing
+  // fell back to a wall clock; harmless on its own, but worth knowing about.
+  console.log("timestamp pacing fallbacks (get_SystemRelativeTime failed/zero):", lastTimestampFallbacks);
   console.log("lastError()          :", capture.lastError() || "(none)");
   console.log("");
 

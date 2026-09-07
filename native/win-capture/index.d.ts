@@ -46,6 +46,19 @@ declare const winCapture: {
            *  with this climbing was mid-resize; one that dies at zero hit a
            *  genuine capture failure. Cumulative for this capture session. */
           poolResizes: number;
+          /** Times the staging-texture readback (D3D11_MAP_FLAG_DO_NOT_WAIT)
+           *  returned DXGI_ERROR_WAS_STILL_DRAWING and the frame was skipped
+           *  -- an ordinary pacing drop, not a failure, but one worth seeing
+           *  climb: a session stuck at this incrementing on every frame is
+           *  delivering nothing and this is why. Cumulative for this capture
+           *  session. */
+          stillDrawing: number;
+          /** Times frame->get_SystemRelativeTime() failed, or returned
+           *  Duration == 0, and pacing fell back to a QueryPerformanceCounter
+           *  read instead -- see addon.cc's QpcNow100ns for why a failed read
+           *  must never be treated as a genuine 0. Cumulative for this
+           *  capture session; normally 0 for the whole session. */
+          timestampFallbacks: number;
           /** This frame's own capture timestamp -- frame->get_SystemRelativeTime()
            *  (100ns units) converted to microseconds -- not when the JS side
            *  happened to receive it. Monotonically increasing within a capture
@@ -61,7 +74,13 @@ declare const winCapture: {
        *  why. */
       (
         frame: null,
-        meta: { refused: number; poolResizes: number; reason: string },
+        meta: {
+          refused: number;
+          poolResizes: number;
+          stillDrawing: number;
+          timestampFallbacks: number;
+          reason: string;
+        },
       ): void;
     },
   ): boolean;

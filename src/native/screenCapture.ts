@@ -332,6 +332,13 @@ let active: {
    */
   refused: number;
   poolResizes: number;
+  /** Cumulative DXGI_ERROR_WAS_STILL_DRAWING skips -- see {@link LiveFrameMeta}. */
+  stillDrawing: number;
+  /** Cumulative timestamp-pacing fallbacks -- see {@link LiveFrameMeta}.
+   *  Kept here (not only in `summary`) so {@link onFrame} can edge-detect
+   *  0 -> nonzero against the *previous* frame's value, independent of
+   *  whether a 10s window happens to be closing on this exact frame. */
+  timestampFallbacks: number;
   /**
    * Identifies which request started this session. Assigned by window.ts at
    * the top of each display-media request, before any `await` -- so two
@@ -352,12 +359,37 @@ let active: {
   summary: {
     /** {@link Date.now} at the start of the window currently accumulating. */
     windowStartMs: number;
+    /** Frames native actually produced and handed to {@link onFrame} this
+     *  window -- the first stage in the pipeline plan PR "no frames" item 6
+     *  wants visible on its own, distinct from `posted` below. */
     frames: number;
     bltMsSum: number;
     grabMsSum: number;
     /** `refused` as of the last emitted summary (or session start), so the
      *  next one can log the delta rather than the running total. */
     refusedAtWindowStart: number;
+    /** `stillDrawing` as of the last emitted summary -- same delta pattern
+     *  as `refusedAtWindowStart`. */
+    stillDrawingAtWindowStart: number;
+    /** Frames actually handed to `framePort.postMessage` this window (a
+     *  frame native produced but that arrived for a session already
+     *  superseded, or with no port registered, does not count) -- reset
+     *  every window, not cumulative, so this is a plain count rather than a
+     *  delta-off-cumulative like `refused`/`stillDrawing` above. Comparing
+     *  this against `frames` in the same log line is what tells "native
+     *  isn't producing anything" (both near 0) apart from "native is fine,
+     *  delivery to the renderer is the broken stage" (`frames` healthy,
+     *  `posted` not). */
+    posted: number;
+    /** `VideoFrame` construction failures the injected page patch reported
+     *  this window (plan PR "no frames" item 6) -- see the
+     *  screenCapture:pageDrop handler in {@link initScreenCapture} and
+     *  {@link APP_AUDIO_PATCH}'s two `new VideoFrame(...)` call sites. Reset
+     *  every window, same reasoning as `posted`. Renderer-side, so a
+     *  `frames`/`posted` pair that both look healthy alongside this
+     *  climbing is what points at the *renderer's* frame construction as
+     *  the dropped stage, rather than anything in this file or addon.cc. */
+    videoFrameFailures: number;
   };
 } | null = null;
 
@@ -591,6 +623,8 @@ export async function startForSource(
     stateReadable: true,
     refused: 0,
     poolResizes: 0,
+    stillDrawing: 0,
+    timestampFallbacks: 0,
     sessionId,
     summary: {
       windowStartMs: Date.now(),
@@ -598,6 +632,9 @@ export async function startForSource(
       bltMsSum: 0,
       grabMsSum: 0,
       refusedAtWindowStart: 0,
+      stillDrawingAtWindowStart: 0,
+      posted: 0,
+      videoFrameFailures: 0,
     },
   };
   appAudioLog(
@@ -616,6 +653,19 @@ type LiveFrameMeta = {
   grabMs: number;
   refused: number;
   poolResizes: number;
+  /** Cumulative DXGI_ERROR_WAS_STILL_DRAWING skips this session -- see
+   *  index.d.ts's doc comment. An ordinary pacing drop, not a failure, but
+   *  one that fed into "0 fps" while it was silent (plan PR "no frames"
+   *  item 1) -- now folded into the 10s summary below so a session stuck
+   *  incrementing this on every frame is visible instead of looking exactly
+   *  like a healthy session with nothing to deliver. */
+  stillDrawing: number;
+  /** Cumulative timestamp-pacing fallbacks this session (native's
+   *  get_SystemRelativeTime() failed, or read a zero Duration, and fell
+   *  back to a QPC wall clock) -- see index.d.ts's doc comment. Normally 0
+   *  for the whole session; {@link onFrame} logs once on the 0 -> nonzero
+   *  edge. */
+  timestampFallbacks: number;
   /** This frame's own capture timestamp (microseconds) -- see index.d.ts's
    *  doc comment on the same field for what it's relative to and how the
    *  page patch uses it. */
@@ -624,7 +674,13 @@ type LiveFrameMeta = {
 
 /** Meta for the one death-signal call on capture-thread exit (`frame` null)
  *  -- no width/height/bltMs/grabMs, see index.d.ts. */
-type DeathFrameMeta = { refused: number; poolResizes: number; reason: string };
+type DeathFrameMeta = {
+  refused: number;
+  poolResizes: number;
+  stillDrawing: number;
+  timestampFallbacks: number;
+  reason: string;
+};
 
 function onFrame(
   frame: Buffer | null,
@@ -650,7 +706,7 @@ function onFrame(
     appAudioLog(
       "screen capture: native capture thread exited:",
       death.reason || "(no reason given)",
-      `; refused=${death.refused} poolResizes=${death.poolResizes}`,
+      `; refused=${death.refused} poolResizes=${death.poolResizes} stillDrawing=${death.stillDrawing} timestampFallbacks=${death.timestampFallbacks}`,
     );
     // onFrame is a native callback, not an async context, so this cannot
     // await -- fire it and move on. Safe to leave unhandled: stop()'s
@@ -670,6 +726,20 @@ function onFrame(
   active.height = live.height;
   active.refused = live.refused;
   active.poolResizes = live.poolResizes;
+  active.stillDrawing = live.stillDrawing;
+  // Edge-detected against the PREVIOUS frame's value (read before
+  // overwriting it below), same one-shot reasoning as the `wasPaused` check
+  // just below this block: a fallback that engaged once is worth a single
+  // note in app-audio.log, not a line on every later frame for the rest of
+  // the session it stays engaged.
+  if (active.timestampFallbacks === 0 && live.timestampFallbacks > 0) {
+    appAudioLog(
+      "screen capture: native timestamp pacing fell back to a QPC wall clock at least once for",
+      active.sourceId,
+      "(get_SystemRelativeTime failed or read a zero Duration -- see addon.cc's QpcNow100ns)",
+    );
+  }
+  active.timestampFallbacks = live.timestampFallbacks;
 
   // One-shot, alongside the lastFrameAt update above: the frame watchdog in
   // {@link startWatchdogs} is the only thing that sets `paused`, this is the
@@ -689,33 +759,56 @@ function onFrame(
     consecutiveFailures = 0;
   }
 
-  // 10s rolling health summary (plan PR C4 item 2) -- see SUMMARY_INTERVAL_MS
-  // for why this exists. Cheap per frame on purpose: a bounds check and three
-  // float adds, no allocation, no string work until the window actually
-  // closes. bltMs/grabMs are summed here and divided once below rather than
-  // kept as a running mean, since a running mean needs the same divide (and
-  // more float error) on every frame for no benefit -- nothing reads the
-  // mean until the window closes.
+  // 10s rolling health summary (plan PR C4 item 2, extended by plan PR "no
+  // frames" item 6) -- see SUMMARY_INTERVAL_MS for why this exists. Cheap
+  // per frame on purpose: a handful of comparisons/adds, no allocation, no
+  // string work until the window actually closes. bltMs/grabMs are summed
+  // here and divided once below rather than kept as a running mean, since a
+  // running mean needs the same divide (and more float error) on every
+  // frame for no benefit -- nothing reads the mean until the window closes.
+  //
+  // `frames`/`posted`/`stillDrawing`/`videoFrameFailures` together name
+  // which stage a dead share actually died at, instead of a share that
+  // produces nothing being indistinguishable from one that was never asked
+  // to produce anything (the failure mode item 6 exists to fix): `frames`
+  // near 0 with `stillDrawing` climbing points at addon.cc's staging-ring
+  // readback; `frames` healthy but `posted` near 0 points at this file's own
+  // port-delivery gating (a stale sessionId, or no port registered);
+  // `posted` healthy but `videoFrameFailures` climbing points at the
+  // renderer's own `new VideoFrame(...)` calls in appAudioPatch.ts.
   const summary = active.summary;
   summary.frames++;
   summary.bltMsSum += live.bltMs;
   summary.grabMsSum += live.grabMs;
+  // Narrowed (not just a boolean) so the postMessage call below gets
+  // `framePort`'s non-null type back from TS without an assertion. Computed
+  // once, here, rather than re-evaluated at that call site -- nothing async
+  // runs between the two uses (this whole function is a synchronous native
+  // callback), so re-checking there would just read the same answer twice,
+  // not add a freshness guarantee.
+  const port = sessionId === active.sessionId ? framePort : null;
+  if (port) summary.posted++;
   const summaryElapsedMs = now - summary.windowStartMs;
   if (summaryElapsedMs >= SUMMARY_INTERVAL_MS) {
     const deliveredFps = (summary.frames / summaryElapsedMs) * 1000;
     const refusedDelta = live.refused - summary.refusedAtWindowStart;
+    const stillDrawingDelta =
+      live.stillDrawing - summary.stillDrawingAtWindowStart;
     const meanBltMs = summary.bltMsSum / summary.frames;
     // grabMs is a Map(DO_NOT_WAIT) poll now, not a blocking GPU wait -- see
     // addon.cc's ProcessFrame -- so near-zero here means healthy, not idle.
     const meanGrabMs = summary.grabMsSum / summary.frames;
     appAudioLog(
-      `screen capture: 10s summary for ${active.sourceId}: ${deliveredFps.toFixed(1)}fps delivered, refused +${refusedDelta}, mean bltMs=${meanBltMs.toFixed(2)} grabMs=${meanGrabMs.toFixed(2)} (grabMs near zero is expected -- DO_NOT_WAIT readback, not a stall)`,
+      `screen capture: 10s summary for ${active.sourceId}: produced=${summary.frames} (${deliveredFps.toFixed(1)}fps) posted=${summary.posted} refused +${refusedDelta} stillDrawing +${stillDrawingDelta} videoFrameFailures=${summary.videoFrameFailures} mean bltMs=${meanBltMs.toFixed(2)} grabMs=${meanGrabMs.toFixed(2)} (grabMs near zero is expected -- DO_NOT_WAIT readback, not a stall)`,
     );
     summary.windowStartMs = now;
     summary.frames = 0;
     summary.bltMsSum = 0;
     summary.grabMsSum = 0;
     summary.refusedAtWindowStart = live.refused;
+    summary.stillDrawingAtWindowStart = live.stillDrawing;
+    summary.posted = 0;
+    summary.videoFrameFailures = 0;
   }
 
   // Dedicated port delivery (A4 item 2), gated on `sessionId` matching the
@@ -728,8 +821,8 @@ function onFrame(
   // -- in flight on the TSFN queue when a newer session's `active` replaced
   // this one -- is dropped here instead of being misdelivered through the
   // current session's port under the old session's stale width/height.
-  if (!framePort || sessionId !== active.sessionId) return;
-  framePort.postMessage({
+  if (!port) return;
+  port.postMessage({
     frame,
     meta: {
       width: live.width,
@@ -1198,6 +1291,17 @@ function buildState() {
  * event), and a flood on one should not eat the other's budget.
  */
 const pageLogRateLimit = createLogRateLimiter("screenCapture:pageLog", 50);
+/**
+ * screenCapture:pageDrop is the injected page patch's own frame-drop
+ * counter (plan PR "no frames" item 6) -- a `new VideoFrame(...)` call
+ * failing in appAudioPatch.ts's `buildVideoTrack`, at video-rate. It feeds
+ * `active.summary.videoFrameFailures` (not `appAudioLog` directly -- that
+ * already happens once per session via `logPage`/`screenCapture:pageLog`
+ * above), so the 10s summary can report it as a per-window count alongside
+ * the native-side stages instead of only a one-shot log line. Same distrust
+ * and same cap as pageLogRateLimit above -- a remote page, at video-rate.
+ */
+const pageDropRateLimit = createLogRateLimiter("screenCapture:pageDrop", 50);
 
 export function initScreenCapture() {
   const mod = loadNative();
@@ -1268,5 +1372,25 @@ export function initScreenCapture() {
   // capture untouched, and why -- through here instead.
   ipcMain.on("screenCapture:pageLog", (_event, message: string) => {
     if (pageLogRateLimit()) appAudioLog("page:", message);
+  });
+  // The injected page patch's per-frame drop counter (plan PR "no frames"
+  // item 6) -- see pageDropRateLimit's doc comment. `stage` is validated,
+  // not trusted: it crosses IPC from a remote page like every other value
+  // here. Only one stage exists today ("videoFrameFailure", from
+  // appAudioPatch.ts's two `new VideoFrame(...)` call sites); an unknown
+  // value is dropped rather than silently bucketed somewhere wrong, so a
+  // future stage added on the page side without a matching case here fails
+  // loudly (via the else branch's log) instead of quietly undercounting.
+  ipcMain.on("screenCapture:pageDrop", (_event, stage: unknown) => {
+    if (typeof stage !== "string") return;
+    if (!pageDropRateLimit()) return;
+    if (!active) return;
+    switch (stage) {
+      case "videoFrameFailure":
+        active.summary.videoFrameFailures++;
+        break;
+      default:
+        appAudioLog("screen capture: ignoring unknown pageDrop stage:", stage);
+    }
   });
 }
