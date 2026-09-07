@@ -16,9 +16,9 @@ import windowIconAsset from "../../assets/desktop/icon.png?asset";
 import { DEFAULT_SERVER } from "../constants";
 
 import {
+  log as appAudioLog,
   createLogRateLimiter,
   flushAppAudioLogSync,
-  log as appAudioLog,
   pidForSourceId,
   startForSource,
   stop as stopAppAudio,

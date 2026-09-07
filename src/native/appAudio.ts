@@ -797,11 +797,7 @@ async function handleSystemStall() {
 
   log("system mix: attempting an in-place restart");
   if (systemSession) systemSession.restarts++;
-  const restarted = await beginCapture(
-    { mode: "system" },
-    sourceId,
-    sessionId,
-  );
+  const restarted = await beginCapture({ mode: "system" }, sourceId, sessionId);
   if (!restarted) {
     log("system mix: restart failed to start at all, giving up");
     await stop();

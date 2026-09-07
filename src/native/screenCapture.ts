@@ -17,8 +17,8 @@
 import { BrowserWindow, ipcMain } from "electron";
 
 import {
-  createLogRateLimiter,
   log as appAudioLog,
+  createLogRateLimiter,
   windowHandleFromSourceId,
   windowStateForSourceId,
 } from "./appAudio";
