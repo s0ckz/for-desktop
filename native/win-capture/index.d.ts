@@ -46,6 +46,14 @@ declare const winCapture: {
            *  with this climbing was mid-resize; one that dies at zero hit a
            *  genuine capture failure. Cumulative for this capture session. */
           poolResizes: number;
+          /** This frame's own capture timestamp -- frame->get_SystemRelativeTime()
+           *  (100ns units) converted to microseconds -- not when the JS side
+           *  happened to receive it. Monotonically increasing within a capture
+           *  session; not comparable across sessions or to Date.now()/
+           *  performance.now(). Use directly as a generated VideoFrame's
+           *  `timestamp`, and the delta between consecutive values as its
+           *  `duration` -- see appAudioPatch.ts. */
+          timestampUs: number;
         },
       ): void;
       /** The one death-signal call on capture-thread exit -- see above. No

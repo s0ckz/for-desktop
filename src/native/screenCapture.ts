@@ -515,6 +515,10 @@ type LiveFrameMeta = {
   grabMs: number;
   refused: number;
   poolResizes: number;
+  /** This frame's own capture timestamp (microseconds) -- see index.d.ts's
+   *  doc comment on the same field for what it's relative to and how the
+   *  page patch uses it. */
+  timestampUs: number;
 };
 
 /** Meta for the one death-signal call on capture-thread exit (`frame` null)
@@ -589,6 +593,7 @@ function onFrame(
   win.webContents.send(SCREEN_CAPTURE_FRAME, frame, {
     width: live.width,
     height: live.height,
+    timestampUs: live.timestampUs,
   });
 }
 

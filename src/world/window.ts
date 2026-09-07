@@ -88,13 +88,13 @@ contextBridge.exposeInMainWorld("native", {
     onFrame: (
       handler: (
         frame: Uint8Array,
-        meta: { width: number; height: number },
+        meta: { width: number; height: number; timestampUs: number },
       ) => void,
     ) => {
       const listener = (
         _: unknown,
         frame: Uint8Array,
-        meta: { width: number; height: number },
+        meta: { width: number; height: number; timestampUs: number },
       ) => handler(frame, meta);
       ipcRenderer.on("screenCapture:frame", listener);
       return () => ipcRenderer.removeListener("screenCapture:frame", listener);

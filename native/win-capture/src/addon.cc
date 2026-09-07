@@ -18,18 +18,46 @@
 //
 // Threading model, deliberately simple: capture runs entirely from ONE
 // dedicated thread that we own end to end -- it creates the D3D11 device,
-// the WGC capture item/session/frame pool, and then polls
-// IDirect3D11CaptureFramePool::TryGetNextFrame() on a fixed cadence tied to
-// the requested fps, instead of subscribing to the pool's FrameArrived
-// event. Frame pools created with CreateFreeThreaded() do not require a
-// DispatcherQueue/message pump to deliver frames either way; polling from a
-// plain background thread avoids implementing the ABI's parameterized
+// the WGC capture item/session/frame pool, subscribes to the pool's
+// FrameArrived event, and waits on that subscription (CaptureThread, below)
+// instead of polling TryGetNextFrame() on a fixed cadence.
+//
+// This module used to poll instead, on purpose, specifically to avoid
+// implementing the ABI's parameterized
 // ITypedEventHandler<Direct3D11CaptureFramePool, IInspectable> callback
-// interface, which needs no extra WinRT projection machinery beyond what
-// this file already includes. Every frame we retrieve and don't use for
-// pacing purposes is released immediately (its ComPtr going out of scope),
-// which is what returns the buffer to the pool -- so a "drop" costs nothing
-// beyond the Release.
+// interface. That tradeoff is reversed here: polling at ~fps against a
+// source presenting at its own unrelated rate is a sampling-vs-source-rate
+// aliasing problem, and it showed up exactly where that theory predicts -- a
+// 60Hz game polled at ~60Hz drifts in and out of phase with its own presents,
+// so some polls see 0 new frames and the next sees 2 (dup/skip judder despite
+// every individual frame being correct), plus up to one whole poll interval
+// of pure latency between a present and this thread noticing it. Subscribing
+// removes both, and implementing the callback interface needed nothing more
+// than a small Microsoft::WRL::RuntimeClass<ClassicCom, ITypedEventHandler
+// <...>> -- see FrameArrivedHandler below -- not the extra projection
+// machinery the old comment here worried about. Frame pools created with
+// CreateFreeThreaded() never needed a DispatcherQueue/message pump either
+// way, polled or subscribed; that part of the old reasoning was never the
+// actual issue.
+//
+// FrameArrived's handler does nothing but SetEvent() a HANDLE this thread
+// waits on -- see FrameArrivedHandler's own comment for why nothing else is
+// safe there. Delivery is paced on each frame's own
+// frame->get_SystemRelativeTime() (a 100ns-unit timestamp WGC stamps on the
+// frame itself) rather than on wall-clock arrival time -- see the pacing
+// comment above lastDeliveredTs in CaptureThread for why that, not the event
+// subscription by itself, is what removes the aliasing above. A
+// CreateWaitableTimerExW high-resolution timer still wakes this loop roughly
+// once an interval when FrameArrived does not fire at all (a static window
+// legitimately produces no FrameArrived events), purely so the liveness
+// checks -- window still exists, stop requested -- keep running promptly; it
+// has no say any more in which frames get delivered.
+//
+// Every frame we retrieve and don't use -- draining the pool to the newest
+// one, or a frame arriving faster than the requested pacing allows -- is
+// released immediately (its ComPtr going out of scope), which is what
+// returns the buffer to the pool, so a "drop" costs nothing beyond the
+// Release.
 
 #include <napi.h>
 
@@ -38,7 +66,8 @@
 #include <winstring.h>
 #include <inspectable.h>
 #include <wrl/client.h>
-#include <timeapi.h>  // timeBeginPeriod/timeEndPeriod -- see CaptureThread
+#include <wrl/implements.h>  // Microsoft::WRL::RuntimeClass/MakeAndInitialize -- see FrameArrivedHandler
+#include <timeapi.h>  // timeBeginPeriod/timeEndPeriod -- see CaptureThread (fallback path only, now)
 
 #include <d3d11.h>
 #include <dxgi.h>
@@ -158,8 +187,10 @@ void SetErrorText(std::string message) {
  * this costs real GPU memory for no measured gain.
  *
  * Recorded here so the next person does not spend the same afternoon on it.
- * The ~49.5fps ceiling at a 60fps target remains unexplained; see the notes
- * on the polling loop in CaptureThread.
+ * The ~49.5fps ceiling at a 60fps target was the poll-vs-present aliasing
+ * the file header now describes -- see there, and lastDeliveredTs's comment
+ * in CaptureThread, for the fix (event-driven capture, paced on real frame
+ * timestamps) rather than a buffer-count workaround.
  */
 constexpr int kFramePoolBuffers = 2;
 
@@ -383,6 +414,14 @@ struct FramePayload {
   UINT32 height = 0;
   double bltMs = 0;
   double grabMs = 0;
+  // frame->get_SystemRelativeTime(), converted to microseconds (100ns units
+  // / 10) -- see CaptureThread's pacing comment above lastDeliveredTs. Real
+  // per-frame time, not wall-clock delivery time; the page patch uses this
+  // directly for VideoFrame.timestamp and its own delta for duration (see
+  // appAudioPatch.ts), replacing a fixed duration computed once at build
+  // time. Unset (0) for a death-signal payload, same as width/height/bltMs/
+  // grabMs below.
+  double timestampUs = 0;
   // Set only for the one death-signal payload CaptureThread emits on loop
   // exit (see its teardown, below) -- frame arrives as null in JS and
   // `reason` carries lastError() at that moment. See index.d.ts.
@@ -454,6 +493,7 @@ void EmitToJs(Napi::Env env, Napi::Function cb, FramePayload* p) {
   meta.Set("height", Napi::Number::New(env, p->height));
   meta.Set("bltMs", Napi::Number::New(env, p->bltMs));
   meta.Set("grabMs", Napi::Number::New(env, p->grabMs));
+  meta.Set("timestampUs", Napi::Number::New(env, p->timestampUs));
   // Safe before the call: Buffer::Copy above already took its own copy of
   // the pixels, so nothing here outlives this scope. Leaking instead would
   // cost a whole frame (~3MB) every time, ~180MB/s at 60fps.
@@ -550,12 +590,13 @@ void Emit(FramePayload* payload) {
 // it back, pack it as tight NV12, and deliver it. srcW/srcH must be the
 // *texture's own* dimensions (srcTex->GetDesc), not the frame's ContentSize --
 // see the caller in CaptureThread for why those can briefly disagree and what
-// goes wrong if you pass ContentSize here instead. Called for every frame the
-// capture loop decides to process -- there is no resize case that skips this
-// call any more, only the pacing skips upstream of it (the drain loop and the
-// "nothing new since last poll" check). Returns false only on a hard D3D/WGC
-// failure.
-bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH) {
+// goes wrong if you pass ContentSize here instead. timestampUs is the frame's
+// own get_SystemRelativeTime(), already converted -- see FramePayload's field
+// of the same name. Called for every frame the capture loop decides to
+// process -- there is no resize case that skips this call any more, only the
+// pacing skips upstream of it (the drain loop and the pacing check against
+// lastDeliveredTs). Returns false only on a hard D3D/WGC failure.
+bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH, double timestampUs) {
   if (!EnsurePipeline(srcW, srcH)) return false;
 
   D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inDesc{};
@@ -605,6 +646,7 @@ bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH) {
   payload->height = g_outH;
   payload->bltMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
   payload->grabMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
+  payload->timestampUs = timestampUs;
 
   // D3D11 maps an NV12 texture as one contiguous region: the Y plane
   // (height rows of RowPitch bytes) immediately followed by the half-height,
@@ -632,14 +674,94 @@ bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH) {
 }
 
 // ---------------------------------------------------------------------------
-// Capture thread: owns the whole session lifetime. Runs entirely as one
-// polling loop paced to the requested fps -- see the file header for why we
-// poll TryGetNextFrame() rather than subscribing to FrameArrived.
+// FrameArrived handler. Runs on a thread WinRT itself owns -- NOT the
+// capture thread -- so it must do nothing beyond SetEvent(). In particular
+// it must never touch g_tsfn: Start()'s ThreadSafeFunction::New() call seeds
+// initialThreadCount at 1 on the guarantee that exactly one thread (the
+// capture thread, via Emit()) ever calls NonBlockingCall and matches it with
+// the one Release() in CaptureThread's own teardown -- see the comment on
+// that New() call for what breaks if a second thread ever reaches g_tsfn.
+// SetEvent on a HANDLE is the one operation that's safe to do here from any
+// thread: no COM re-entrancy, and nothing shared with the capture thread
+// except the HANDLE value itself, which the capture thread guarantees stays
+// valid for as long as this handler could still be invoked (see
+// CaptureThread's teardown: remove_FrameArrived happens, and is given the
+// chance to finish any in-flight Invoke, before the event handle is ever
+// closed).
+// ---------------------------------------------------------------------------
+
+class FrameArrivedHandler
+    : public Microsoft::WRL::RuntimeClass<
+          Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
+          ABI::Windows::Foundation::ITypedEventHandler<WGC::Direct3D11CaptureFramePool*, IInspectable*>> {
+ public:
+  HRESULT RuntimeClassInitialize(HANDLE frameEvent) {
+    frameEvent_ = frameEvent;
+    return S_OK;
+  }
+
+  IFACEMETHODIMP Invoke(WGC::IDirect3D11CaptureFramePool*, IInspectable*) override {
+    SetEvent(frameEvent_);  // only this -- see the class comment above
+    return S_OK;
+  }
+
+ private:
+  HANDLE frameEvent_ = nullptr;  // not owned; CaptureThread owns and closes it
+};
+
+// ---------------------------------------------------------------------------
+// Capture thread: owns the whole session lifetime. FrameArrived (subscribed
+// below, once the frame pool exists) wakes this thread the instant WGC has a
+// new surface -- see the file header for why this replaced polling
+// TryGetNextFrame() on a fixed cadence. All D3D/WGC work still happens here,
+// on this one thread, exactly as before: FrameArrivedHandler's own Invoke()
+// (a WinRT-owned thread) does nothing but SetEvent() the handle this thread
+// waits on.
 // ---------------------------------------------------------------------------
 
 void CaptureThread(HWND hwnd) {
   HRESULT hr = RoInitialize(RO_INIT_MULTITHREADED);
   const bool roInitialised = SUCCEEDED(hr) || hr == S_FALSE;
+
+  // Thread-owned for this session's whole life: created here, closed in this
+  // function's own teardown below, and touched by no other thread except
+  // FrameArrivedHandler::Invoke() calling SetEvent on frameEvent -- see that
+  // class's comment for why that is the only safe thing it does. Locals, not
+  // globals like g_stopEvent: nothing outside this thread ever needs to see
+  // or signal them. g_stopEvent has to be a global because Stop() (JS thread)
+  // creates/signals/closes it before this thread even exists, on the first
+  // two counts; the frame-arrived event and its registration token have no
+  // such cross-thread requirement.
+  HANDLE frameEvent = nullptr;
+  EventRegistrationToken frameArrivedToken{};
+  bool frameArrivedRegistered = false;
+
+  // High-resolution pacing/heartbeat timer (item 3 of this PR). Not the
+  // delivery-pacing decision any more -- see lastDeliveredTs below -- just
+  // what wakes this loop close to every requested interval when FrameArrived
+  // alone would not: a static window legitimately produces no FrameArrived
+  // events at all, and without some periodic wake this thread would never
+  // re-check IsWindow(hwnd) or g_stopEvent until content changed again, which
+  // could be never. Needs Windows 10 1803+ (build 17134) for
+  // CREATE_WAITABLE_TIMER_HIGH_RESOLUTION; CreateWaitableTimerExW returns
+  // NULL below that, in which case this falls back to timeBeginPeriod(1) + a
+  // plain millisecond WaitForMultipleObjects timeout -- the same ~1ms-of-
+  // slack this file always paid on those systems before this PR. Created
+  // once here and closed once in the unconditional teardown below,
+  // deliberately not paired tightly around the while loop the way the old
+  // timeBeginPeriod/timeEndPeriod calls were -- so an early `break` out of
+  // the setup steps just below can never leave it unclosed or leave
+  // timeBeginPeriod uncompensated. See the teardown for where that happens.
+  HANDLE pacingTimer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+  const bool haveHighResTimer = pacingTimer != nullptr;
+  if (!haveHighResTimer) {
+    // Windows' default system timer resolution is ~15.6ms, so without this,
+    // a millisecond-granularity wait actually wakes up on the next ~15.6ms
+    // tick after the requested duration. Only needed on this fallback path --
+    // the high-resolution timer above does not depend on the global system
+    // timer resolution at all.
+    timeBeginPeriod(1);
+  }
 
   do {
     if (!roInitialised) {
@@ -715,6 +837,39 @@ void CaptureThread(HWND hwnd) {
     if (!EnsurePool(static_cast<UINT32>(itemSize.Width), static_cast<UINT32>(itemSize.Height))) break;
     if (!EnsurePipeline(static_cast<UINT32>(itemSize.Width), static_cast<UINT32>(itemSize.Height))) break;
 
+    // Subscribe before StartCapture() below so no frame can arrive
+    // un-observed. Keyed off the pool's creation, not every EnsurePool call:
+    // EnsurePool's Recreate() branch (buffer size/format/count change on a
+    // resize) reuses the same frame-pool COM object and therefore the same
+    // subscription, so this only needs to run once per session -- the
+    // EnsurePool call just above always takes its creation branch here,
+    // since g_framePool was reset to null by the previous session's own
+    // teardown (see below) before this thread ever started.
+    frameEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!frameEvent) {
+      SetError("CreateEvent(frameEvent)", HRESULT_FROM_WIN32(GetLastError()));
+      break;
+    }
+    {
+      ComPtr<FrameArrivedHandler> handler;
+      hr = Microsoft::WRL::MakeAndInitialize<FrameArrivedHandler>(&handler, frameEvent);
+      if (FAILED(hr)) {
+        SetError("MakeAndInitialize(FrameArrivedHandler)", hr);
+        break;
+      }
+      hr = g_framePool->add_FrameArrived(handler.Get(), &frameArrivedToken);
+      if (FAILED(hr)) {
+        SetError("Direct3D11CaptureFramePool::add_FrameArrived", hr);
+        break;
+      }
+      frameArrivedRegistered = true;
+      // handler's own ComPtr going out of scope here does not end the
+      // subscription -- add_FrameArrived above took its own reference, the
+      // same way any WinRT event source does, which is what keeps the
+      // handler alive until remove_FrameArrived (in this function's
+      // teardown, below) drops it.
+    }
+
     hr = g_framePool->CreateCaptureSession(g_item.Get(), &g_session);
     if (FAILED(hr)) {
       SetError("CreateCaptureSession", hr);
@@ -726,49 +881,90 @@ void CaptureThread(HWND hwnd) {
       break;
     }
 
+    // Real per-frame timestamps (item 2 of this PR): pace and deliver on
+    // frame->get_SystemRelativeTime() -- a 100ns-unit, monotonically
+    // increasing clock WGC stamps on the frame itself -- not on wall-clock
+    // time this thread happens to observe the frame at. That distinction is
+    // what actually removes the poll-vs-present aliasing the file header
+    // describes: FrameArrived alone only fixes *when* this thread wakes up,
+    // not *which* frame it is looking at relative to the source's own
+    // cadence. A source presenting faster than the requested delivery rate
+    // (a 144Hz desktop feeding a 30fps share) still needs frames dropped
+    // deliberately, not accidentally by whichever one happened to be newest
+    // when a fixed-cadence poll landed.
+    double lastDeliveredTs = -1.0;  // 100ns units; negative = "always take the first frame"
 
-    // Windows' default system timer resolution is ~15.6ms, so without this,
-    // WaitForSingleObject(..., 33) actually wakes up on the next ~15.6ms tick
-    // after the requested duration -- i.e. closer to 48ms, not 33ms. That
-    // alone was enough to cap this loop at ~21fps when asked for 30 (measured
-    // directly: harness showed ~47ms actual inter-frame spacing against a
-    // 33ms request). timeBeginPeriod(1) asks the scheduler for ~1ms
-    // resolution for as long as this thread runs; timeEndPeriod(1) below
-    // gives it back.
-    timeBeginPeriod(1);
-
-    // Fixed-cadence scheduling: target the next tick at a constant offset
-    // from the *previous target*, not from "now" -- a plain fixed-length
-    // sleep would add each iteration's own processing time (CreateVideoProcessorInputView,
-    // the Blt, the grab, the NV12 packing copy) on top of the wait, drifting
-    // the achieved rate below the requested one by roughly that amount every
-    // frame. Computing the wait as "time until the next scheduled tick"
-    // instead absorbs that processing time into the interval rather than
-    // adding to it.
-    auto nextTick = std::chrono::steady_clock::now() +
-                    std::chrono::duration<double>(1.0 / g_fps.load(std::memory_order_relaxed));
+    // nextTick now only drives pacingTimer -- see that HANDLE's own comment
+    // above for why it no longer has any say in which frames get delivered.
+    auto nextTick = std::chrono::steady_clock::now();
 
     while (g_running.load()) {
       const auto now = std::chrono::steady_clock::now();
-      const auto waitFor = std::chrono::duration_cast<std::chrono::milliseconds>(nextTick - now);
-      const DWORD waitMs = waitFor.count() > 0 ? static_cast<DWORD>(waitFor.count()) : 0;
-      // Re-read every iteration so a mid-share rate change takes effect on the
-      // very next frame instead of the next capture session.
-      const auto interval =
-          std::chrono::duration<double>(1.0 / g_fps.load(std::memory_order_relaxed));
+      // Re-read every iteration, same reasoning as before this PR: a
+      // mid-share setFps() must take effect on the very next wait, not the
+      // next session.
+      const double fps = g_fps.load(std::memory_order_relaxed);
+      const auto interval = std::chrono::duration<double>(1.0 / fps);
+      const double interval100ns = 1.0e7 / fps;
+
+      // Resync, not accumulate, when behind: if this loop has fallen more
+      // than one whole interval behind schedule (a slow VideoProcessorBlt/
+      // Map, the process itself getting descheduled, ...), snapping nextTick
+      // forward to now avoids the old failure mode this exact pattern used to
+      // have here -- repeatedly adding one interval to a nextTick that is
+      // already in the past computes a wait of 0 on every following
+      // iteration until the deficit is paid off one interval at a time, i.e.
+      // a busy spin. The stakes are lower now than before this PR --
+      // pacingTimer no longer paces delivery, only wakes the liveness checks
+      // below -- but the failure mode is exactly as easy to reintroduce, so
+      // it gets the same fix.
+      if (now - nextTick > interval) nextTick = now;
       nextTick += std::chrono::duration_cast<std::chrono::steady_clock::duration>(interval);
 
-      // WaitForSingleObject IS the pacing: whatever WGC produced during this
-      // sleep beyond the single frame we grab below is simply left in the
-      // pool to be dropped by the drain loop, never queued up for later.
-      if (WaitForSingleObject(g_stopEvent, waitMs) == WAIT_OBJECT_0) break;
+      DWORD waitResult;
+      if (haveHighResTimer) {
+        const auto waitDuration = nextTick - now;
+        const LONGLONG wait100ns = (std::max)(
+            static_cast<LONGLONG>(0),
+            std::chrono::duration_cast<std::chrono::duration<LONGLONG, std::ratio<1, 10000000>>>(waitDuration)
+                .count());
+        LARGE_INTEGER dueTime;
+        dueTime.QuadPart = -wait100ns;  // negative = relative to now, 100ns units
+        if (!SetWaitableTimerEx(pacingTimer, &dueTime, 0, nullptr, nullptr, nullptr, 0)) {
+          SetError("SetWaitableTimerEx", HRESULT_FROM_WIN32(GetLastError()));
+          break;
+        }
+        HANDLE handles[3] = {g_stopEvent, frameEvent, pacingTimer};
+        waitResult = WaitForMultipleObjects(3, handles, FALSE, INFINITE);
+      } else {
+        // Fallback: the coarse millisecond wait this file used exclusively
+        // before this PR, now racing frameEvent too instead of being the
+        // sole pacing mechanism -- see the file header.
+        const auto waitFor = std::chrono::duration_cast<std::chrono::milliseconds>(nextTick - now);
+        const DWORD waitMs = waitFor.count() > 0 ? static_cast<DWORD>(waitFor.count()) : 0;
+        HANDLE handles[2] = {g_stopEvent, frameEvent};
+        waitResult = WaitForMultipleObjects(2, handles, FALSE, waitMs);
+      }
+
+      if (waitResult == WAIT_OBJECT_0) break;  // g_stopEvent
+      if (waitResult == WAIT_FAILED) {
+        SetError("WaitForMultipleObjects", HRESULT_FROM_WIN32(GetLastError()));
+        break;
+      }
+      // Anything else -- frameEvent, pacingTimer, or WAIT_TIMEOUT on the
+      // fallback path -- all fall through to the same check-and-drain below.
+      // Which one woke this iteration does not matter: draining to the
+      // newest frame and pacing on its own timestamp behaves correctly
+      // whether this wait was satisfied by new content, the heartbeat, or a
+      // coarse timeout.
       if (!IsWindow(hwnd)) {
         SetError("captured window", HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE));
         break;
       }
 
       // Drain the pool, keeping only the newest frame -- under load WGC can
-      // have queued more than one since our last poll.
+      // still have queued more than one since our last wait (the event tells
+      // us "at least one", not "exactly one").
       ComPtr<WGC::IDirect3D11CaptureFrame> frame;
       for (;;) {
         ComPtr<WGC::IDirect3D11CaptureFrame> next;
@@ -776,7 +972,22 @@ void CaptureThread(HWND hwnd) {
         if (FAILED(frHr) || !next) break;
         frame = next;  // the previously-held frame (if any) is Released here
       }
-      if (!frame) continue;  // nothing new since last poll
+      if (!frame) continue;  // nothing new since last wait
+
+      // Pace on the frame's own timestamp -- see the comment above
+      // lastDeliveredTs's declaration for why wall-clock time would not do.
+      // 0.9x instead of a strict >= interval100ns leaves headroom for
+      // ordinary sub-frame jitter in exactly when WGC stamps (and this
+      // thread observes) each present -- without it, a delivery landing a
+      // hair under one full interval late would be pushed out to two
+      // intervals instead of one.
+      ABI::Windows::Foundation::TimeSpan relativeTime{};
+      hr = frame->get_SystemRelativeTime(&relativeTime);
+      const double ts = SUCCEEDED(hr) ? static_cast<double>(relativeTime.Duration) : 0.0;
+      if (lastDeliveredTs >= 0.0 && (ts - lastDeliveredTs) < 0.9 * interval100ns) {
+        continue;  // faster than the requested delivery rate -- drop (Release only, same as any other drop)
+      }
+      lastDeliveredTs = ts;
 
       WG::SizeInt32 contentSize{};
       frame->get_ContentSize(&contentSize);
@@ -854,14 +1065,14 @@ void CaptureThread(HWND hwnd) {
       // lived in.
       D3D11_TEXTURE2D_DESC srcDesc{};
       srcTex->GetDesc(&srcDesc);
-      ProcessFrame(srcTex.Get(), srcDesc.Width, srcDesc.Height);
+      ProcessFrame(srcTex.Get(), srcDesc.Width, srcDesc.Height, ts / 10.0);
 
       // Recreate the pool for the window's current content size if it has
       // drifted from what the pool was last built for. Deliberately after
       // ProcessFrame and gated on the POOL's own last size (g_poolW/g_poolH),
       // not on whether it differs from srcDesc -- this frame's texture came
       // from the pool as it was *before* any Recreate below, so it will
-      // legitimately still show a resize in progress on the very next poll
+      // legitimately still show a resize in progress on the very next wait
       // too; that is expected, not a bug, and is exactly what keeps this
       // converging (one Recreate per real size change) instead of every
       // frame re-deciding based on a comparison that's already stale by the
@@ -878,8 +1089,6 @@ void CaptureThread(HWND hwnd) {
         }
       }
     }
-
-    timeEndPeriod(1);
   } while (false);
 
   // Signal exit to JS, once, whatever kind of exit this was -- including an
@@ -894,6 +1103,20 @@ void CaptureThread(HWND hwnd) {
     death->isDeath = true;
     death->reason = GetErrorText();
     Emit(death);
+  }
+
+  // Revoke the FrameArrived subscription before closing the frame pool --
+  // required ordering, not just tidiness: Close() below tells WGC to stop
+  // capturing immediately, and revoking first guarantees no Invoke can land
+  // on a handler this thread is about to outlive. remove_FrameArrived is the
+  // standard WinRT event-source contract for this: it does not return until
+  // any in-flight Invoke on another thread has finished, and guarantees no
+  // future one is dispatched -- which is exactly what makes it safe to close
+  // frameEvent, below, once teardown reaches it. See FrameArrivedHandler's
+  // own comment for the other half of this guarantee.
+  if (frameArrivedRegistered && g_framePool) {
+    g_framePool->remove_FrameArrived(frameArrivedToken);
+    frameArrivedRegistered = false;
   }
 
   // Teardown, in reverse order of acquisition. Closing the session/pool
@@ -924,6 +1147,27 @@ void CaptureThread(HWND hwnd) {
   g_device.Reset();
   g_srcW = g_srcH = g_outW = g_outH = 0;
   g_poolW = g_poolH = 0;
+
+  // frameEvent is safe to close now regardless of how CaptureThread got here
+  // (a clean stop, a mid-setup failure, an unrecoverable per-frame error) --
+  // the remove_FrameArrived above already guarantees the one other thread
+  // that could ever touch it (FrameArrivedHandler::Invoke) can no longer be
+  // invoked. If a break happened before frameEvent was even created (an
+  // early device/session setup failure), it is still nullptr here and this
+  // is a no-op.
+  if (frameEvent) {
+    CloseHandle(frameEvent);
+    frameEvent = nullptr;
+  }
+  // Paired with the unconditional creation at the top of this function, not
+  // with any single point inside the loop -- see pacingTimer's own comment
+  // there for why it is closed once here instead of immediately after the
+  // while loop the way the old timeBeginPeriod/timeEndPeriod pair was.
+  if (pacingTimer) {
+    CloseHandle(pacingTimer);
+  } else {
+    timeEndPeriod(1);
+  }
 
   if (roInitialised) RoUninitialize();
 
