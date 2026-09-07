@@ -372,7 +372,13 @@ async function respondToDisplayMedia(
     const requestedFps = takeNextRequestedFps() ?? 30;
     const fpsCap = captureFpsCap();
     const fps = fpsCap !== null ? Math.min(requestedFps, fpsCap) : requestedFps;
-    if (startScreenCapture(source.id, fps, sessionId)) {
+    // Awaited (item 4): startScreenCapture is now async (it awaits its own
+    // pre-start stop() before touching mod.start()) -- respondToDisplayMedia
+    // is already async, so this just needed the keyword added; without it,
+    // `if` would test a Promise object, which is always truthy, and this
+    // branch would report "native GPU capture" even when start ultimately
+    // failed or fell back.
+    if (await startScreenCapture(source.id, fps, sessionId)) {
       appAudioLog(
         "video path: native GPU capture (WGC + VideoProcessorBlt) for",
         source.id,
@@ -406,7 +412,9 @@ async function respondToDisplayMedia(
   // at 5s, but the cap is a backstop for an activation that hangs, not a
   // figure this approaches -- a freeze here would be user-visible, so
   // re-measure before assuming it is still cheap.
-  if (startForSource(source.id, sessionId)) {
+  // Awaited (item 4): appAudio's startForSource is now async for the same
+  // reason as startScreenCapture above -- same correctness note applies.
+  if (await startForSource(source.id, sessionId)) {
     // Audio arrives out-of-band and is stitched in by the renderer; asking
     // Chromium for loopback too would double up the sound.
     appAudioLog("sharing", videoSource.id, "with per-app audio");
@@ -878,21 +886,33 @@ export function createMainWindow() {
       armedShare = null;
       if (armed && Date.now() - armed.at < ARMED_TTL_MS) {
         appAudioLog("answering with re-acquired source", armed.source.id);
-        stopAppAudio(requestId);
-        // "superseded", not the "stopped" default: this ends the previous
-        // native session because a new one (the re-acquired source) is about
-        // to replace it, not because the user asked to stop sharing. The
-        // companion for-web PR keys its recovery-budget accounting off this
-        // field, and a supersede must not look like a user stop -- see
-        // StopReason's doc comment in screenCapture.ts. requestId scopes it
-        // to sessions older than this one -- see item 4.
-        stopScreenCapture("superseded", requestId);
-        void respondToDisplayMedia(
-          armed.source,
-          armed.audio && request.audioRequested,
-          answer,
-          requestId,
-        ).catch((err) => {
+        // Item 4: both stop()s now return a promise that only settles once
+        // the native reap has actually finished (or timed out) rather than
+        // blocking the main thread the old synchronous stop() did, so the
+        // video/audio start below (inside respondToDisplayMedia) must wait
+        // for both before it runs -- otherwise it can race a native
+        // start() against a still-in-flight teardown of the session it's
+        // replacing. This display-media handler is not itself async (it's
+        // Electron's plain callback signature), hence the IIFE.
+        void (async () => {
+          // "superseded", not the "stopped" default: this ends the previous
+          // native session because a new one (the re-acquired source) is
+          // about to replace it, not because the user asked to stop sharing.
+          // The companion for-web PR keys its recovery-budget accounting off
+          // this field, and a supersede must not look like a user stop --
+          // see StopReason's doc comment in screenCapture.ts. requestId
+          // scopes it to sessions older than this one -- see item 4.
+          await Promise.all([
+            stopAppAudio(requestId),
+            stopScreenCapture("superseded", requestId),
+          ]);
+          await respondToDisplayMedia(
+            armed.source,
+            armed.audio && request.audioRequested,
+            answer,
+            requestId,
+          );
+        })().catch((err) => {
           appAudioLog(
             "respondToDisplayMedia failed, answering with video-only fallback:",
             String(err),
@@ -922,12 +942,23 @@ export function createMainWindow() {
           // opens. See the note in `findRememberedWindow`.
           thumbnailSize: { width: 0, height: 0 },
         })
-        .then((sources) => {
+        .then(async (sources) => {
           // Any previous share is over by the time a new one is requested.
-          stopAppAudio(requestId);
-          // "superseded", not "stopped" -- see the comment on the other
-          // stopScreenCapture() call above.
-          stopScreenCapture("superseded", requestId);
+          // "superseded", not "stopped" for the screen-capture side -- see
+          // the comment on the other stopScreenCapture() call above. Item 4:
+          // both stop()s now only resolve once their native reap has
+          // actually finished (or timed out), instead of blocking the main
+          // thread the way the old synchronous stop() did, so this awaits
+          // both rather than firing them and moving on -- the video/audio
+          // start further down must not race a native start() against a
+          // still-in-flight teardown of the session it's replacing. Making
+          // this `.then` callback async (rather than a nested IIFE, as the
+          // armed-fast-path branch above needs) is enough here since its
+          // caller is already a promise chain with its own `.catch` below.
+          await Promise.all([
+            stopAppAudio(requestId),
+            stopScreenCapture("superseded", requestId),
+          ]);
           // Everything past this point is a *new* share, not a recovery of
           // the one the armed fast path above would have answered -- the
           // Wayland single-source shortcut and a fresh picker answer both
@@ -937,16 +968,15 @@ export function createMainWindow() {
           // resetNativeFailures's doc comment for why the armed path above
           // must never do this.
           //
-          // Placed here, right after stopScreenCapture() rather than
-          // synchronously before this getSources() call: getSources({
+          // Placed here, right after the awaited Promise.all above rather
+          // than synchronously before this getSources() call: getSources({
           // fetchWindowIcons: true }) is a visible stall (see the comment on
-          // it above), and stopScreenCapture() -- which stops the *previous*
-          // session's watchdog timers -- does not run until it resolves. A
-          // reset issued before that await would race the old session's own
-          // watchdog: if it was already stalled, it could still fire and
-          // increment consecutiveFailures in that gap, and the new share
-          // would inherit a failure count this reset was meant to have
-          // already cleared.
+          // it above), and the previous session's watchdog timers do not
+          // actually stop until that Promise.all resolves. A reset issued
+          // before that await would race the old session's own watchdog: if
+          // it was already stalled, it could still fire and increment
+          // consecutiveFailures in that gap, and the new share would inherit
+          // a failure count this reset was meant to have already cleared.
           resetNativeFailures();
           appAudioLog("sources offered:", String(sources.length));
 
@@ -1039,4 +1069,14 @@ export function quitApp() {
 // Ensure global app quit works properly
 app.on("before-quit", () => {
   shouldQuit = true;
+  // Item 5: the cooperative path that runs first, ahead of whatever the
+  // native destructors do as a backstop once the process is actually
+  // exiting -- gives the capture thread(s) a chance to join cleanly instead
+  // of being torn down mid-flight. Fired and not awaited: before-quit has no
+  // mechanism to wait on this, and both stop()s' returned promises can never
+  // reject (see each file's stopNative() doc comment) or hang the process
+  // (NATIVE_STOP_TIMEOUT_MS bounds how long either can appear "busy" for).
+  appAudioLog("quit: native capture stop requested");
+  void stopScreenCapture("stopped");
+  void stopAppAudio();
 });

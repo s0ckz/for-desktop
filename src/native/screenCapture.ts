@@ -303,14 +303,32 @@ let active: {
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let watchdogTimer: ReturnType<typeof setInterval> | null = null;
 
+/**
+ * Cached answer from the native isSupported() probe (item 6). Each call does
+ * a full RoInitialize plus a factory activation, and buildState() calls this
+ * on every broadcastState() -- every frame-rate change, every watchdog
+ * transition -- so an uncached call turns "just report state" into
+ * "reprobe the OS/GPU" on a hot path. Hardware/OS capability cannot change
+ * mid-process (a GPU driver does not appear or disappear while this process
+ * is running), so the first answer is good for the process's life; null
+ * means "not probed yet", not "unsupported" -- see below.
+ */
+let cachedSupported: boolean | null = null;
+
 export function isScreenCaptureSupported(): boolean {
+  if (cachedSupported !== null) return cachedSupported;
   const mod = loadNative();
+  // Not cached: `!mod` is already a cheap check (loadNative() itself is a
+  // one-shot try, so this stays true or false for the process's life without
+  // help), and caching `false` here would be wrong if the module somehow
+  // loaded later than this particular call.
   if (!mod) return false;
   try {
-    return process.platform === "win32" && mod.isSupported();
+    cachedSupported = process.platform === "win32" && mod.isSupported();
   } catch {
-    return false;
+    cachedSupported = false;
   }
+  return cachedSupported;
 }
 
 export function isScreenCaptureActive() {
@@ -333,11 +351,11 @@ export function isScreenCaptureActive() {
  *   below and stamped onto `active` so a later stale caller can never affect
  *   this session once it exists.
  */
-export function startForSource(
+export async function startForSource(
   sourceId: string,
   fps: number,
   sessionId: number,
-): boolean {
+): Promise<boolean> {
   // Belt and braces on top of stop()'s own clear: every return path below
   // already sets this to something specific (or to null on success), but
   // clearing it here too means a future early-return branch that forgets to
@@ -352,7 +370,7 @@ export function startForSource(
     );
     return false;
   }
-  if (!mod.isSupported()) {
+  if (!isScreenCaptureSupported()) {
     lastFallbackReason = "OS/GPU reports unsupported";
     appAudioLog(
       "screen capture: no native GPU path, falling back to Chromium capture: OS/GPU reports unsupported",
@@ -384,6 +402,22 @@ export function startForSource(
     return false;
   }
 
+  // A stop() from an earlier attempt (this share's own supersede below, a
+  // death signal from onFrame, a watchdog teardown, ...) may still be
+  // joining the capture thread on the libuv threadpool -- see nativeBusy's
+  // doc comment above stopNative(). mod.start() would just throw "previous
+  // capture still shutting down" in that case; failing fast here skips the
+  // pointless round trip through stop()/mod.start() and reaches the same
+  // fallback outcome without spending another NATIVE_STOP_TIMEOUT_MS racing
+  // a second timeout against a join we already know is running long.
+  if (nativeBusy) {
+    lastFallbackReason = "native stop still pending";
+    appAudioLog(
+      "screen capture: previous native stop still in flight, falling back to Chromium capture",
+    );
+    return false;
+  }
+
   // "superseded", not the "stopped" default: whatever was running before
   // this attempt is being replaced by it, not user/page-stopped. See
   // StopReason's doc comment. Passing sessionId means this is a no-op
@@ -392,7 +426,24 @@ export function startForSource(
   // "capture already running" and falls back to Chromium capture, same as
   // any other start failure. If the attempt below fails to actually start,
   // the `!started`/catch branches undo this -- see their comments.
-  stop("superseded", sessionId);
+  //
+  // Awaited (item 4): stop()'s JS-visible bookkeeping (active, broadcastState)
+  // already happened synchronously inside stop() itself by the time this
+  // resolves -- what we're actually waiting on here is stopNative()'s race,
+  // so mod.start() below never runs while the native side still considers
+  // itself mid-teardown.
+  await stop("superseded", sessionId);
+
+  // The await above is also the call whose own stopNative() could be the one
+  // that just timed out -- nativeBusy can only be known for certain once it
+  // returns, so it's checked again rather than trusting the pre-check alone.
+  if (nativeBusy) {
+    lastFallbackReason = "native stop still pending";
+    appAudioLog(
+      "screen capture: native stop did not finish in time, falling back to Chromium capture",
+    );
+    return false;
+  }
 
   try {
     const started = mod.start(
@@ -496,7 +547,13 @@ function onFrame(
       death.reason || "(no reason given)",
       `; refused=${death.refused} poolResizes=${death.poolResizes}`,
     );
-    stop("capture-error", sessionId);
+    // onFrame is a native callback, not an async context, so this cannot
+    // await -- fire it and move on. Safe to leave unhandled: stop()'s
+    // returned promise can never reject (see stopNative()'s doc comment),
+    // and the JS-visible bookkeeping (active, broadcastState) it does
+    // happens synchronously before this statement even returns, so nothing
+    // here needs to wait on the native join to have already taken effect.
+    void stop("capture-error", sessionId);
     return;
   }
   // Same reasoning as the death branch above, mirrored for the live case.
@@ -613,7 +670,10 @@ function startWatchdogs() {
         "screen capture: captured window is gone, ending native capture for",
         active.sourceId,
       );
-      stop("window-gone");
+      // Sync timer callback -- see the identical reasoning on onFrame's
+      // death-branch stop() call above for why this is safe to leave
+      // unawaited.
+      void stop("window-gone");
       return;
     }
 
@@ -675,7 +735,9 @@ function startWatchdogs() {
           mod?.lastError() ?? "(unknown)",
           `; refused=${active.refused} poolResizes=${active.poolResizes}`,
         );
-        stop("capture-error");
+        // Sync timer callback -- same reasoning as the other stop() call
+        // sites in this file.
+        void stop("capture-error");
       }
       return;
     }
@@ -763,16 +825,74 @@ export function resetNativeFailures() {
   consecutiveFailures = 0;
 }
 
-/** Stops whatever native capture is running, without touching our own
- *  bookkeeping. Split out of stop() so it can run unconditionally there,
- *  ahead of the `!active` check -- see stop()'s comment for why. */
-function stopNative() {
+/**
+ * Whether an earlier stop()'s native join is still running past
+ * {@link NATIVE_STOP_TIMEOUT_MS} -- see {@link stopNative}. While this is
+ * true, native start() would throw "previous capture still shutting down",
+ * so {@link startForSource} checks this itself instead of finding out the
+ * hard way. Cleared the moment the join this flag was tracking actually
+ * finishes, whenever that turns out to be -- so a slow join degrades the
+ * native path only for as long as it is genuinely still shutting down, never
+ * permanently. A stuck `true` here would disable native capture for the rest
+ * of the process's life (item 4), so every path that sets it must have a
+ * matching path that clears it -- see stopNative() below.
+ */
+let nativeBusy = false;
+
+/** How long {@link stopNative} waits for the native join before reporting
+ *  busy instead of leaving its caller to block indefinitely. */
+const NATIVE_STOP_TIMEOUT_MS = 3000;
+
+/**
+ * Stops whatever native capture is running, without touching our own
+ * bookkeeping. Split out of stop() so it can run unconditionally there,
+ * ahead of the `!active` check -- see stop()'s comment for why.
+ *
+ * Returns a promise that resolves once it is safe to call mod.start() again
+ * -- either because the native join actually finished, or because
+ * NATIVE_STOP_TIMEOUT_MS elapsed first, in which case {@link nativeBusy} is
+ * set. The real join keeps running on the libuv threadpool regardless of
+ * which of the two wins: the timer here only decides what JS reports while
+ * waiting. `settle`'s own `.then` (which clears nativeBusy) is chained off
+ * the real join, not off the race, and is explicitly unhooked from the
+ * timeout via `clearTimeout` when the join wins first -- without that, a
+ * join that finishes in 10ms would still leave a stray timer that fires
+ * NATIVE_STOP_TIMEOUT_MS later, wrongly flips nativeBusy back to true and
+ * logs a bogus "still pending" line for a stop that was long over.
+ *
+ * Can never reject: whatever mod.stop() does, the failure is swallowed here
+ * (mirroring the old synchronous stopNative()'s try/catch) rather than
+ * surfaced, since a caller of stop() has nothing useful to do with a
+ * rejected teardown -- and every sync call site of stop() in this file
+ * fires it with `void` on exactly that guarantee.
+ */
+function stopNative(): Promise<void> {
   const mod = loadNative();
-  try {
-    mod?.stop();
-  } catch {
-    /* already stopped */
-  }
+  if (!mod) return Promise.resolve();
+
+  const settle = Promise.resolve(mod.stop())
+    .catch(() => {
+      /* already stopped, or the native side reported an error tearing down
+         -- either way the thread has been reaped by the time this runs,
+         which is all nativeBusy needs to know. */
+    })
+    .then(() => {
+      nativeBusy = false;
+    });
+
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      appAudioLog(
+        `screen capture: native stop still pending after ${NATIVE_STOP_TIMEOUT_MS}ms`,
+      );
+      nativeBusy = true;
+      resolve();
+    }, NATIVE_STOP_TIMEOUT_MS);
+    void settle.then(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
 }
 
 /**
@@ -787,11 +907,25 @@ function stopNative() {
  *   than tearing down a session it doesn't own (item 4). Omitted entirely by
  *   callers that mean "stop whatever is active right now, unconditionally"
  *   (the page's own `screenCapture:stop`, the window-gone poll, ...).
+ * @returns A promise resolving once the native reap has settled (or
+ *   NATIVE_STOP_TIMEOUT_MS has elapsed -- see {@link stopNative}). All the
+ *   JS-visible bookkeeping below (`active`, `broadcastState()`) happens
+ *   synchronously, before this function returns, deliberately -- the
+ *   renderer must never be told a stale "still active" story just because a
+ *   native join is taking a while in the background. Only the native reap
+ *   itself is async, which is why every sync-context caller in this file
+ *   (watchdog timers, the ipcMain handler, onFrame's death branch) can fire
+ *   this with `void` and rely on the bookkeeping having already happened by
+ *   the time control returns to them -- only startForSource, which actually
+ *   needs to know when it is safe to call mod.start() again, awaits it.
  */
-export function stop(reason: StopReason = "stopped", sessionId?: number) {
+export function stop(
+  reason: StopReason = "stopped",
+  sessionId?: number,
+): Promise<void> {
   if (sessionId !== undefined && active && sessionId < active.sessionId) {
     appAudioLog(`screen capture: stop ignored: stale session ${sessionId}`);
-    return;
+    return Promise.resolve();
   }
   stopWatchdogs();
   // Unconditionally, not `if (active)`. Native stop() is a no-op when nothing
@@ -800,8 +934,10 @@ export function stop(reason: StopReason = "stopped", sessionId?: number) {
   // beginCapture): a native session that ever started without `active` being
   // set would otherwise survive an exported stop() that already cleared it,
   // leaving every later start() throw "capture already running" for the rest
-  // of the process's life.
-  stopNative();
+  // of the process's life. Kicked off here but not awaited inline -- see this
+  // function's own @returns doc above for why the JS bookkeeping below stays
+  // synchronous while only the returned promise tracks the native reap.
+  const nativeStopPromise = stopNative();
   // Scope the fallback reason to the share that is about to start (or that
   // never even attempts native capture, e.g. a screen source) -- see
   // lastFallbackReason's doc comment for why this must happen here rather
@@ -820,12 +956,13 @@ export function stop(reason: StopReason = "stopped", sessionId?: number) {
   // superseded, then the replacement failed to start). See StopReason's doc
   // comment.
   stopReason = active ? reason : null;
-  if (!active) return;
+  if (!active) return nativeStopPromise;
   appAudioLog(
     `screen capture: stopped native capture for ${active.sourceId} (${reason})`,
   );
   active = null;
   broadcastState();
+  return nativeStopPromise;
 }
 
 function broadcastState() {
@@ -881,7 +1018,10 @@ export function initScreenCapture() {
   // decide whether to swap in the generated track -- same pattern as
   // appAudio:getState.
   ipcMain.handle("screenCapture:getState", () => buildState());
-  ipcMain.on("screenCapture:stop", () => stop("stopped"));
+  // Sync ipcMain handler -- same "fire and let stop() settle its own
+  // bookkeeping synchronously" reasoning as this file's other stop() call
+  // sites.
+  ipcMain.on("screenCapture:stop", () => void stop("stopped"));
   // The value arrives from a remote page, so it is validated, not trusted:
   // reject anything that isn't a finite number (same distrust as
   // RENDERER_WRITABLE_KEYS in config.ts) and clamp the rest to a sane range

@@ -110,14 +110,21 @@ function killPid(pid) {
   }
 }
 
-function cleanup(exitCode) {
+// async now that audio.stop() returns a promise (native item 3) -- awaited
+// below so the mixer's threads are actually joined and its handles actually
+// closed before this process exits, instead of racing process.exit()
+// against a stop that is still in flight. Callers in a synchronous context
+// (the signal/exception handlers just below) don't await this themselves;
+// that's fine -- cleanup() still reaches its own process.exit() once
+// audio.stop() settles, which is all any of them needs.
+async function cleanup(exitCode) {
   if (cleanedUp) return;
   cleanedUp = true;
   if (statusTimer) clearInterval(statusTimer);
   killPid(allowedPid);
   killPid(blockedPid);
   try {
-    audio.stop();
+    await audio.stop();
   } catch {
     /* already stopped */
   }
@@ -432,16 +439,16 @@ function check(label, pass, failDetail) {
 
   if (!chunksOk) {
     console.log("RESULT: FAIL - no audio delivered at all (heartbeat missing in some phase)");
-    cleanup(2);
+    await cleanup(2);
   } else if (mixerNeverAttached) {
     console.log("RESULT: FAIL - mixer never attached a client (allowed source stayed uncaptured)");
-    cleanup(3);
+    await cleanup(3);
   } else if (blockedLeaked) {
     console.log("RESULT: FAIL - blocked source leaked into the mix");
-    cleanup(4);
+    await cleanup(4);
   } else {
     console.log("RESULT: PASS - blocklist holds across all four phases");
-    cleanup(0);
+    await cleanup(0);
   }
 })().catch((err) => {
   console.error("test-exclude.js crashed:", err);

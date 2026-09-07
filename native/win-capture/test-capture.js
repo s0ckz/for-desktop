@@ -123,8 +123,8 @@ try {
 
 console.log(`capture started, running for ${DURATION_MS / 1000}s ...`);
 
-setTimeout(() => {
-  capture.stop();
+setTimeout(async () => {
+  await capture.stop();
   const elapsedS = (Date.now() - testStart) / 1000;
 
   if (spawnedNotepad) {

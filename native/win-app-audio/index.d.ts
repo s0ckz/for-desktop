@@ -18,7 +18,18 @@ declare const winAppAudio: {
     iconic: boolean;
   };
   start(pid: number, includeTree: boolean, onChunk: (chunk: Buffer) => void): void;
-  stop(): void;
+  /**
+   * Requests whichever mode is currently running (single-process or the
+   * system mixer) to stop, and resolves once every thread it owns has
+   * actually joined -- those joins run off the main thread (a libuv
+   * threadpool AsyncWorker), so this never blocks Electron's main thread
+   * the way the old synchronous stop() did. Safe to call when nothing is
+   * running (resolves immediately). While the returned promise is
+   * pending, start()/startSystemExcluding() throw "previous capture still
+   * shutting down" instead of racing a new session against this one's
+   * teardown.
+   */
+  stop(): Promise<void>;
   lastError(): string;
   /** Enumerate every process currently rendering audio. */
   listAudioProcesses(): AudioProcess[];

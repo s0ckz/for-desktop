@@ -16,8 +16,17 @@ Napi::Value FalseNoop(const Napi::CallbackInfo& info) {
   return Napi::Boolean::New(info.Env(), false);
 }
 
-Napi::Value Noop(const Napi::CallbackInfo& info) {
-  return info.Env().Undefined();
+// Real stop() (addon.cc) is now async -- Napi::Promise<void>, resolved once
+// the capture thread's join actually completes off the main thread (item
+// 3). start() above never starts anything on this platform, so there is
+// nothing to join here, but the stub still needs to hand back a promise
+// (already resolved) so callers on every platform can `await stop()`
+// unconditionally without a platform check.
+Napi::Value ResolvedStop(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  Napi::Promise::Deferred deferred = Napi::Promise::Deferred::New(env);
+  deferred.Resolve(env.Undefined());
+  return deferred.Promise();
 }
 
 Napi::Value EmptyString(const Napi::CallbackInfo& info) {
@@ -27,7 +36,7 @@ Napi::Value EmptyString(const Napi::CallbackInfo& info) {
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("isSupported", Napi::Function::New(env, NotSupported));
   exports.Set("start", Napi::Function::New(env, FalseNoop));
-  exports.Set("stop", Napi::Function::New(env, Noop));
+  exports.Set("stop", Napi::Function::New(env, ResolvedStop));
   exports.Set("lastError", Napi::Function::New(env, EmptyString));
   return exports;
 }

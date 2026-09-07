@@ -57,7 +57,16 @@ declare const winCapture: {
       ): void;
     },
   ): boolean;
-  stop(): void;
+  /**
+   * Requests capture to stop and resolves once the capture thread has
+   * actually joined -- the join runs off the main thread (a libuv
+   * threadpool AsyncWorker), so this never blocks Electron's main thread
+   * the way the old synchronous stop() did. Safe to call when nothing is
+   * running (resolves immediately). While the returned promise is
+   * pending, start() throws "previous capture still shutting down"
+   * instead of racing a new session against this one's teardown.
+   */
+  stop(): Promise<void>;
   /**
    * Change the delivery rate of the capture already running. Returns false if
    * nothing is capturing or the value is unusable. Takes effect on the next

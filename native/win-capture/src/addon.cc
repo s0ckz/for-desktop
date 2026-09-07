@@ -54,6 +54,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -84,15 +85,61 @@ namespace {
 
 // ---------------------------------------------------------------------------
 // Capture session state -- all of it lives only between Start() and the
-// capture thread's teardown, and is only ever touched from that one thread
-// (the JS-facing Start/Stop/LastError calls only set flags/join it).
+// capture thread's teardown, and (g_lastError aside) is only ever touched
+// from that one thread; the JS-facing Start()/Stop()/LastError() calls only
+// set flags, create/close g_stopEvent, or (Stop(), via StopWorker) join it.
+// g_lastError is the one exception: it is written by the capture thread but
+// also read AND written from the JS thread (IsSupported()), so it alone
+// needs the mutex below -- see its own comment for why.
 // ---------------------------------------------------------------------------
 
 std::thread g_thread;
 std::atomic<bool> g_running{false};
+// Set the instant a stop is requested (signalStop, or the AddCleanupHook
+// path) and cleared only once the join has actually completed (StopWorker::
+// OnOK/OnError). g_thread itself cannot serve as that flag once Stop()
+// std::move()s it into the worker -- joinable() goes false the moment the
+// move happens, well before the join it names has finished -- so this is
+// the one thing Start() can check to refuse "previous capture still
+// shutting down" for the whole window the async join is in flight.
+std::atomic<bool> g_stopping{false};
 HANDLE g_stopEvent = nullptr;
 Napi::ThreadSafeFunction g_tsfn;
+// stop() calls that arrived while g_stopping was already true -- i.e. while
+// an earlier stop()'s StopWorker join was still in flight. Resolved (or
+// rejected, on the OnError path) alongside the primary deferred once that
+// join actually completes -- see Stop()'s own comment for why this exists.
+// JS-thread-only: Stop() and StopWorker::OnOK/OnError both run there, so no
+// lock is needed.
+std::vector<Napi::Promise::Deferred> g_pendingStopDeferreds;
+
+// g_lastError is written by the capture thread (SetError, and the dropped-
+// death-signal message in Emit) while the JS/main thread both reads it
+// (LastError()) and writes it (IsSupported(), which buildState() in the JS
+// layer reaches on every broadcastState() -- so this races on essentially
+// every frame). std::string is not safe to read/write concurrently without
+// this: a torn SSO-to-heap transition is real UB, not just a stale-value
+// nuisance. The mutex is intentionally the least clever fix available --
+// every access goes through GetErrorText()/SetErrorText() below, never the
+// bare variable.
+//
+// Named GetErrorText/SetErrorText, not GetLastError/SetLastError: those are
+// Win32 API functions (windows.h, above), and a same-named helper in this
+// anonymous namespace shadows them for every unqualified call below it in
+// this translation unit -- IsSupported()'s GetLastError() calls a few
+// hundred lines down need the real Win32 one back.
+std::mutex g_lastErrorMutex;
 std::string g_lastError;
+
+std::string GetErrorText() {
+  std::lock_guard<std::mutex> lock(g_lastErrorMutex);
+  return g_lastError;
+}
+
+void SetErrorText(std::string message) {
+  std::lock_guard<std::mutex> lock(g_lastErrorMutex);
+  g_lastError = std::move(message);
+}
 
 /**
  * Buffers in the WGC frame pool.
@@ -163,7 +210,7 @@ UINT32 g_poolH = 0;
 void SetError(const char* stage, HRESULT hr) {
   char buf[192];
   snprintf(buf, sizeof(buf), "%s failed (hr=0x%08lX)", stage, static_cast<unsigned long>(hr));
-  g_lastError = buf;
+  SetErrorText(buf);
 }
 
 // desktopCapturer hands window ids out as strings; accept either form, same
@@ -417,8 +464,15 @@ void EmitToJs(Napi::Env env, Napi::Function cb, FramePayload* p) {
 /**
  * Bounded retry for a dropped death payload alone -- see Emit() below for why
  * a frame drop and a death drop are not the same risk. 10 attempts x 5ms caps
- * the added delay at ~50ms in the one case where retrying can't help (see
- * Emit()), which is negligible next to Stop()'s join.
+ * the added delay at ~50ms, which is negligible next to how long the capture
+ * thread otherwise takes to unwind (D3D/WGC teardown) and unobservable by
+ * any caller -- since item 3, nothing blocks on this thread exiting any more
+ * (stop()'s join runs on the libuv threadpool; see StopWorker), so this bound
+ * is no longer trading against a blocked JS thread, just against how long
+ * the death signal can take to land after everything else has already wound
+ * down. Still a real cap worth keeping small: see Emit() for why retrying
+ * can occasionally still fail to land it at all, in which case 50ms is what
+ * this costs for nothing.
  */
 constexpr int kDeathRetries = 10;
 constexpr DWORD kDeathRetryDelayMs = 5;
@@ -445,21 +499,38 @@ void Emit(FramePayload* payload) {
   // paused forever with nothing to notice. So retry a bounded number of times
   // instead of giving up on the first full queue.
   //
-  // Safe in both cases this can fire from:
-  //  - Abnormal death (the case this retry actually exists for): Stop()
-  //    below is NOT joining -- nothing called it -- so the JS thread is free
-  //    to drain the queue and a retry lands almost immediately.
-  //  - Ordinary stop(): Stop() IS blocked in g_thread.join() waiting for
-  //    this very thread, so the JS thread cannot drain and every retry here
-  //    will exhaust. That's moot, not a problem: `active` is already null on
-  //    the JS side by the time Stop() called us, so nothing was waiting on
-  //    this signal anyway. kDeathRetries x kDeathRetryDelayMs bounds how long
-  //    this can add to Stop()'s join to ~50ms worst case -- do not raise it
-  //    into the seconds.
+  // UPDATED for item 3 (async stop): both paths that can reach here now
+  // leave the JS thread free to drain the queue for the whole retry window,
+  // so a retry should usually land on the first or second attempt:
+  //  - Abnormal death (nothing called stop()): always true -- the JS thread
+  //    was never blocked on this thread in this case.
+  //  - Ordinary stop(): stop()'s join no longer runs on the JS/main thread --
+  //    it runs on the libuv threadpool via StopWorker (see Stop() below), so
+  //    the JS thread is free to run its event loop, and this queue, for the
+  //    whole join. Before item 3, Stop() was synchronously blocked in
+  //    g_thread.join() right here, so every retry on this path was
+  //    guaranteed to exhaust -- that guarantee is gone now, which is why
+  //    this comment needed updating, not because the retry loop itself
+  //    changed.
   //
-  // Must NOT be a BlockingCall: Stop() joins this thread from the main/JS
-  // thread, so a call that blocks waiting for queue space only the JS thread
-  // can drain would deadlock Stop() forever on the ordinary-stop path above.
+  // One path can still starve it: the AddCleanupHook added by item 5 (quit
+  // without an explicit stop() first) runs its own bounded
+  // WaitForSingleObject(thread.native_handle(), 3000) synchronously on the
+  // JS/main thread. If this NonBlockingCall lands while that hook is still
+  // waiting, the JS thread is once again not draining the queue -- so the
+  // retry can still legitimately exhaust, and that is fine for the same
+  // reason it always was: nothing JS-side is depending on this signal once
+  // shutdown has gone this far.
+  //
+  // This is exactly why Emit() must stay a NonBlockingCall retry loop and
+  // never become a BlockingCall: a call that blocks waiting for queue space
+  // only the JS thread can drain would deadlock that cleanup-hook wait the
+  // same way it used to deadlock Stop()'s old synchronous join.
+  //
+  // kDeathRetries x kDeathRetryDelayMs (10 x 5ms = 50ms) is kept as-is: it
+  // was already generous for a queue that now drains almost immediately in
+  // the common case, and it stays cheap insurance for the one path above
+  // that can still legitimately exhaust it.
   for (int attempt = 0; attempt < kDeathRetries && status != napi_ok; attempt++) {
     Sleep(kDeathRetryDelayMs);
     status = g_tsfn.NonBlockingCall(payload, EmitToJs);
@@ -470,7 +541,7 @@ void Emit(FramePayload* payload) {
     // (the death payload's own `reason`, already lost with it); still
     // surfaced through lastError(), e.g. in the FRAME_WATCHDOG_NO_STATE_MS
     // log line in screenCapture.ts.
-    g_lastError = "death signal dropped: TSFN queue stayed full after retries";
+    SetErrorText("death signal dropped: TSFN queue stayed full after retries");
     delete payload;
   }
 }
@@ -821,7 +892,7 @@ void CaptureThread(HWND hwnd) {
   {
     auto* death = new FramePayload();
     death->isDeath = true;
-    death->reason = g_lastError;
+    death->reason = GetErrorText();
     Emit(death);
   }
 
@@ -938,6 +1009,18 @@ Napi::Value IsSupported(const Napi::CallbackInfo& info) {
 
 Napi::Value Start(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
+  // Checked before g_running: once Stop() below moves g_thread into a
+  // StopWorker, g_thread.joinable() goes false immediately even though the
+  // join it names is still running on the threadpool, so g_running/joinable
+  // alone cannot tell "idle" from "still shutting down" for that whole
+  // window. g_stopping is the flag that covers it (set in Stop(), cleared
+  // only once StopWorker::OnOK/OnError actually runs). g_thread.joinable()
+  // is kept here too as a belt-and-braces check for any future path that
+  // might leave g_thread set without going through g_stopping.
+  if (g_stopping.load() || g_thread.joinable()) {
+    Napi::Error::New(env, "previous capture still shutting down").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
   if (g_running.load()) {
     Napi::Error::New(env, "capture already running").ThrowAsJavaScriptException();
     return env.Undefined();
@@ -964,7 +1047,7 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  g_lastError.clear();
+  SetErrorText(std::string());
   g_srcW = g_srcH = g_outW = g_outH = 0;
   g_poolW = g_poolH = 0;
   if (g_stopEvent) CloseHandle(g_stopEvent);
@@ -1008,21 +1091,116 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
   return Napi::Boolean::New(env, true);
 }
 
-Napi::Value Stop(const Napi::CallbackInfo& info) {
-  Napi::Env env = info.Env();
-  if (!g_running.load() && !g_thread.joinable()) return env.Undefined();
+// Sets the flags that ask the capture thread to exit and returns
+// immediately -- never blocks, never touches g_thread. Split out of Stop()
+// so both Stop() and the AddCleanupHook registered in Init() (process exit
+// without an explicit stop() first -- see R5) can request the same
+// shutdown without duplicating it.
+void SignalStop() {
   g_running.store(false);
   if (g_stopEvent) SetEvent(g_stopEvent);
-  if (g_thread.joinable()) g_thread.join();
-  if (g_stopEvent) {
-    CloseHandle(g_stopEvent);
-    g_stopEvent = nullptr;
+}
+
+// Joins the capture thread off the main thread and resolves stop()'s
+// promise once that join completes. This is item 3's whole point: the old
+// synchronous Stop() ran g_thread.join() directly on the JS/Electron main
+// thread, which could block it for as long as one CaptureThread iteration
+// takes to notice g_stopEvent and unwind (WGC session close, D3D device
+// teardown) -- exactly the main-thread freeze this PR exists to remove
+// (R4).
+//
+// g_thread is moved in, not referenced: Execute() below runs on a libuv
+// threadpool thread, so this worker needs its own copy of the std::thread
+// handle rather than touching the global from two threads at once. The
+// move also makes g_thread.joinable() go false the instant Stop() returns,
+// which is exactly what lets a concurrent Start() tell "idle" from "still
+// shutting down" via g_stopping instead (see Start()'s guard above).
+class StopWorker : public Napi::AsyncWorker {
+ public:
+  StopWorker(Napi::Env env, Napi::Promise::Deferred deferred, std::thread thread)
+      : Napi::AsyncWorker(env), deferred_(deferred), thread_(std::move(thread)) {}
+
+  // Runs on the libuv threadpool -- must not touch any Napi:: type (env,
+  // values, the deferred) from here; that is exactly what OnOK/OnError
+  // (called back on the JS thread once this returns) are for.
+  void Execute() override {
+    if (thread_.joinable()) thread_.join();
   }
-  return env.Undefined();
+
+  // Back on the JS thread. Handle close happens here, not in Execute(), per
+  // item 5's instruction -- keeping every mutation of g_stopEvent on this
+  // one thread (as opposed to split across two) keeps its lifetime story
+  // simple: exactly one thread (JS) ever creates or closes it, exactly one
+  // thread (the capture thread, via WaitForSingleObject) ever waits on it.
+  void OnOK() override {
+    if (g_stopEvent) {
+      CloseHandle(g_stopEvent);
+      g_stopEvent = nullptr;
+    }
+    g_stopping.store(false);
+    deferred_.Resolve(Env().Undefined());
+    // Any stop() calls that arrived while this join was still in flight
+    // (see Stop()'s comment) resolve now too, alongside the primary
+    // deferred -- same outcome, same tick.
+    for (auto& d : g_pendingStopDeferreds) d.Resolve(Env().Undefined());
+    g_pendingStopDeferreds.clear();
+  }
+
+  void OnError(const Napi::Error& e) override {
+    // Execute() above only calls std::thread::join(), which does not throw
+    // for a joinable thread, so this path is not expected to run in
+    // practice. It exists so g_stopping cannot get stuck true forever (and
+    // Start() permanently refuse) if AsyncWorker's own machinery ever
+    // reports a failure some other way; reject rather than resolve so a
+    // caller who somehow hits this sees it instead of believing stop()
+    // silently succeeded.
+    g_stopping.store(false);
+    deferred_.Reject(e.Value());
+    for (auto& d : g_pendingStopDeferreds) d.Reject(e.Value());
+    g_pendingStopDeferreds.clear();
+  }
+
+ private:
+  Napi::Promise::Deferred deferred_;
+  std::thread thread_;
+};
+
+Napi::Value Stop(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  Napi::Promise::Deferred deferred = Napi::Promise::Deferred::New(env);
+  // A stop is already in flight: g_stopping is set below and only cleared
+  // once StopWorker::OnOK/OnError actually runs. By the time it is true,
+  // g_running is already false (SignalStop cleared it) and g_thread is
+  // already non-joinable (std::move()'d into the worker below) -- so the
+  // "nothing to stop" check just past this one would otherwise resolve a
+  // second stop() immediately, before the in-flight join has actually
+  // finished. That breaks the contract Start() relies on (it throws
+  // "previous capture still shutting down" for the whole g_stopping
+  // window): a caller doing `await stop(); start()` would see this stop()
+  // resolve early and then hit that throw anyway. Queue this deferred
+  // instead and let the in-flight StopWorker's OnOK/OnError resolve/reject
+  // it alongside the primary one.
+  if (g_stopping.load()) {
+    g_pendingStopDeferreds.push_back(std::move(deferred));
+    return g_pendingStopDeferreds.back().Promise();
+  }
+  if (!g_running.load() && !g_thread.joinable()) {
+    // Nothing to stop -- resolve immediately. Matches the stub's
+    // already-resolved promise (see stub.cc) so callers see the same shape
+    // on every platform regardless of whether anything was actually
+    // running.
+    deferred.Resolve(env.Undefined());
+    return deferred.Promise();
+  }
+  SignalStop();
+  g_stopping.store(true);
+  auto* worker = new StopWorker(env, deferred, std::move(g_thread));
+  worker->Queue();
+  return deferred.Promise();
 }
 
 Napi::Value LastError(const Napi::CallbackInfo& info) {
-  return Napi::String::New(info.Env(), g_lastError);
+  return Napi::String::New(info.Env(), GetErrorText());
 }
 
 /**
@@ -1050,6 +1228,50 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("stop", Napi::Function::New(env, Stop));
   exports.Set("setFps", Napi::Function::New(env, SetFps));
   exports.Set("lastError", Napi::Function::New(env, LastError));
+
+  // Item 5 / R5: nothing previously stopped native capture on quit. Left
+  // alone, an in-progress g_thread reaches static destruction as a still-
+  // joinable std::thread, which is std::terminate() -- or, if teardown
+  // order goes the other way, a deadlock in DLL detach instead. This hook
+  // runs synchronously on the JS/main thread as the environment is torn
+  // down (Electron quit, or a plain process exit), so it is the last
+  // chance to request an orderly stop before that.
+  //
+  // Bounded, not join()-forever: a wedged capture thread must not hang
+  // process exit. 3000ms is generous against how long CaptureThread's own
+  // teardown actually takes (WGC session/pool Close(), a handful of D3D
+  // Release() calls) while still bounding the worst case. On timeout,
+  // detach rather than join -- a detached thread that outlives the process
+  // by a few more milliseconds while the OS is tearing everything down
+  // anyway is harmless; destroying a still-joinable std::thread is not.
+  //
+  // If stop() was already called and is mid-flight (StopWorker joining on
+  // the threadpool), g_thread was already std::move()'d out of and is not
+  // joinable here, so this is a no-op -- correctly: that join is already
+  // in progress and Node keeps the loop alive for it regardless.
+  env.AddCleanupHook([]() {
+    if (!g_thread.joinable()) return;
+    SignalStop();
+    HANDLE handle = g_thread.native_handle();
+    if (WaitForSingleObject(handle, 3000) == WAIT_OBJECT_0) {
+      g_thread.join();
+      // Safe here, and ONLY here: the one thread that ever waits on
+      // g_stopEvent has now fully exited (join() would not have returned
+      // otherwise), so nothing can touch this handle again. In the detach
+      // branch below the thread may still be running -- possibly not yet
+      // as far as its own WaitForSingleObject(g_stopEvent, ...) call --
+      // closing the handle there would hand that call an invalid handle.
+      // Leaking it in that one case is deliberate: the process is exiting
+      // either way, and the OS reclaims the handle regardless.
+      if (g_stopEvent) {
+        CloseHandle(g_stopEvent);
+        g_stopEvent = nullptr;
+      }
+    } else {
+      g_thread.detach();
+    }
+  });
+
   return exports;
 }
 
