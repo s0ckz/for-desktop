@@ -643,6 +643,28 @@ std::atomic<uint64_t> g_framesStillDrawing{0};
  */
 std::atomic<uint64_t> g_timestampFallbacks{0};
 
+/**
+ * Times CaptureThread's pacing clock reset because `ts` (from whichever of
+ * get_SystemRelativeTime()/QpcNow100ns() was used for this frame -- see
+ * g_timestampFallbacks just above) landed BEFORE lastDeliveredTs instead of
+ * merely too close to it -- cumulative for this session. Deliberately a
+ * separate counter from g_timestampFallbacks, not a reuse of it: falling
+ * back to QpcNow100ns() and hitting this backward jump are not the same
+ * event. A session can use the fallback on every frame after the first
+ * without ever landing here (the QPC-derived value stays consistently ahead
+ * of lastDeliveredTs), and this can just as well fire coming BACK OUT of the
+ * fallback -- a genuine, smaller get_SystemRelativeTime() read following a
+ * larger QpcNow100ns() one -- which never touches g_timestampFallbacks at
+ * all, since that frame took the successful-read branch. Counting them
+ * together would blur "we used a substitute clock" (harmless by itself, per
+ * QpcNow100ns's doc comment) with "the two clocks just disagreed about
+ * order" (the actual precondition for the stall this counter exists to make
+ * visible -- see the re-baseline just above the pacing check in
+ * CaptureThread for the fix, and QpcNow100ns's doc comment for why the
+ * re-baseline, not this counter, is what keeps it from recurring).
+ */
+std::atomic<uint64_t> g_timestampDiscontinuities{0};
+
 // Named (not an inline lambda at the call site) so Emit() below can pass it
 // to more than one NonBlockingCall attempt when retrying a death payload.
 void EmitToJs(Napi::Env env, Napi::Function cb, FramePayload* p) {
@@ -651,6 +673,8 @@ void EmitToJs(Napi::Env env, Napi::Function cb, FramePayload* p) {
   meta.Set("poolResizes", Napi::Number::New(env, static_cast<double>(g_poolResizes.load())));
   meta.Set("stillDrawing", Napi::Number::New(env, static_cast<double>(g_framesStillDrawing.load())));
   meta.Set("timestampFallbacks", Napi::Number::New(env, static_cast<double>(g_timestampFallbacks.load())));
+  meta.Set("timestampDiscontinuities",
+           Napi::Number::New(env, static_cast<double>(g_timestampDiscontinuities.load())));
   if (p->isDeath) {
     // No pixel buffer for a death signal -- see FramePayload::isDeath.
     meta.Set("reason", Napi::String::New(env, p->reason));
@@ -1035,11 +1059,24 @@ class FrameArrivedHandler
  *
  * QueryPerformanceCounter is this thread's own monotonic wall clock -- not
  * comparable to WGC's SystemRelativeTime in absolute terms (different
- * epochs), but pacing here only ever looks at a DELTA between two
- * consecutive values, so a one-time epoch mismatch on the single frame where
- * this fallback first engages costs at most one wrongly-paced frame, not a
- * stall. QueryPerformanceFrequency cannot fail on any Windows version this
- * addon targets (Vista+); the cached frequency is read once and reused, same
+ * epochs), and pacing here only ever looks at a DELTA between two
+ * consecutive values -- so switching which clock backs `ts`, in either
+ * direction, can make that delta go negative instead of merely small. Left
+ * unguarded, that is not "at most one wrongly-paced frame": it is the exact
+ * same permanent-stall shape described above, just triggered by a clock
+ * switch instead of a fabricated 0 -- a negative delta satisfies the pacing
+ * check's `< 0.9 * interval100ns` forever, since lastDeliveredTs is only
+ * updated on the non-dropped path. What actually makes the epoch mismatch
+ * survivable is CaptureThread's own discontinuity guard, immediately before
+ * the pacing check: any `ts` that reads BEFORE lastDeliveredTs re-baselines
+ * pacing (resets to the "take the next frame unconditionally" sentinel) the
+ * moment it happens, rather than trusting the two clocks to ever agree on
+ * absolute values. With that guard in place, a one-time epoch mismatch on
+ * the frame where a clock switch happens costs at most one re-baselined
+ * frame, not a stall -- see g_timestampDiscontinuities for the counter that
+ * makes a session which actually hits this leave a trace.
+ * QueryPerformanceFrequency cannot fail on any Windows version this addon
+ * targets (Vista+); the cached frequency is read once and reused, same
  * reasoning as every other per-process-constant cache in this file.
  */
 double QpcNow100ns() {
@@ -1343,6 +1380,32 @@ void CaptureThread(HWND hwnd) {
       } else {
         ts = QpcNow100ns();
         g_timestampFallbacks.fetch_add(1, std::memory_order_relaxed);
+      }
+      // Guard against a clock discontinuity before trusting the pacing check
+      // below at all. `ts` above can come from either clock on any given
+      // frame -- a genuine frame->get_SystemRelativeTime() read, or the
+      // QpcNow100ns() fallback -- and those two are not comparable in
+      // absolute terms (different epochs; see QpcNow100ns's doc comment).
+      // Whenever this session switches from one to the other -- entering the
+      // fallback, leaving it, or flapping between the two on alternating
+      // frames if a driver's Duration==0 glitch is itself intermittent -- the
+      // new `ts` can land BEFORE lastDeliveredTs, not just too close to it.
+      // Falling through to the pacing check below with that still equal to
+      // an earlier reading from the OTHER clock would be wrong in exactly the
+      // way this fallback was added to fix: `(ts - lastDeliveredTs) < 0.9 *
+      // interval100ns` is satisfied forever by a hugely negative delta, and
+      // lastDeliveredTs is only ever updated on the non-dropped path just
+      // below -- so every later frame this session would be dropped,
+      // silently, for the same structural reason the fabricated-0 bug was
+      // (see QpcNow100ns's doc comment), just reached by a clock switch
+      // instead of a fabricated value. Re-baseline instead of clamping or
+      // skipping: reset to the same "always take the next frame" sentinel
+      // the very first frame of the session uses (lastDeliveredTs's own
+      // declaration above), so this frame is delivered unconditionally and
+      // every frame after it paces off whichever clock is now in use.
+      if (lastDeliveredTs >= 0.0 && ts < lastDeliveredTs) {
+        g_timestampDiscontinuities.fetch_add(1, std::memory_order_relaxed);
+        lastDeliveredTs = -1.0;
       }
       if (lastDeliveredTs >= 0.0 && (ts - lastDeliveredTs) < 0.9 * interval100ns) {
         continue;  // faster than the requested delivery rate -- drop (Release only, same as any other drop)
@@ -1714,6 +1777,7 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
   g_poolResizes.store(0);
   g_framesStillDrawing.store(0);
   g_timestampFallbacks.store(0);
+  g_timestampDiscontinuities.store(0);
   g_running.store(true);
   g_thread = std::thread(CaptureThread, hwnd);
   return Napi::Boolean::New(env, true);

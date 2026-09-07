@@ -339,6 +339,13 @@ let active: {
    *  0 -> nonzero against the *previous* frame's value, independent of
    *  whether a 10s window happens to be closing on this exact frame. */
   timestampFallbacks: number;
+  /** Cumulative pacing-clock re-baselines -- see {@link LiveFrameMeta}. Kept
+   *  here (not only in `summary`) for the same edge-detect reason as
+   *  `timestampFallbacks` just above: a distinct event from it (see
+   *  addon.cc's g_timestampDiscontinuities doc comment for why these two
+   *  are not folded into one counter), so it needs its own previous-value
+   *  slot rather than sharing `timestampFallbacks`'s. */
+  timestampDiscontinuities: number;
   /**
    * Identifies which request started this session. Assigned by window.ts at
    * the top of each display-media request, before any `await` -- so two
@@ -371,6 +378,13 @@ let active: {
     /** `stillDrawing` as of the last emitted summary -- same delta pattern
      *  as `refusedAtWindowStart`. */
     stillDrawingAtWindowStart: number;
+    /** `timestampDiscontinuities` as of the last emitted summary -- same
+     *  delta pattern as `refusedAtWindowStart`. Normally the delta is 0 for
+     *  the whole session; nonzero in a window is what gives a session that
+     *  actually hit the clock-discontinuity guard in addon.cc's
+     *  CaptureThread a trace beyond the one-shot edge-detect log in
+     *  {@link onFrame}. */
+    discontinuitiesAtWindowStart: number;
     /** Frames actually handed to `framePort.postMessage` this window (a
      *  frame native produced but that arrived for a session already
      *  superseded, or with no port registered, does not count) -- reset
@@ -625,6 +639,7 @@ export async function startForSource(
     poolResizes: 0,
     stillDrawing: 0,
     timestampFallbacks: 0,
+    timestampDiscontinuities: 0,
     sessionId,
     summary: {
       windowStartMs: Date.now(),
@@ -633,6 +648,7 @@ export async function startForSource(
       grabMsSum: 0,
       refusedAtWindowStart: 0,
       stillDrawingAtWindowStart: 0,
+      discontinuitiesAtWindowStart: 0,
       posted: 0,
       videoFrameFailures: 0,
     },
@@ -666,6 +682,13 @@ type LiveFrameMeta = {
    *  for the whole session; {@link onFrame} logs once on the 0 -> nonzero
    *  edge. */
   timestampFallbacks: number;
+  /** Cumulative pacing-clock re-baselines this session (native's pacing
+   *  `ts` -- from either clock -- read as landing BEFORE the previous
+   *  delivered frame's, and reset instead of stalling delivery) -- see
+   *  index.d.ts's doc comment. A separate counter from `timestampFallbacks`;
+   *  normally 0 for the whole session; {@link onFrame} logs once on the
+   *  0 -> nonzero edge, same as `timestampFallbacks`. */
+  timestampDiscontinuities: number;
   /** This frame's own capture timestamp (microseconds) -- see index.d.ts's
    *  doc comment on the same field for what it's relative to and how the
    *  page patch uses it. */
@@ -679,6 +702,7 @@ type DeathFrameMeta = {
   poolResizes: number;
   stillDrawing: number;
   timestampFallbacks: number;
+  timestampDiscontinuities: number;
   reason: string;
 };
 
@@ -706,7 +730,7 @@ function onFrame(
     appAudioLog(
       "screen capture: native capture thread exited:",
       death.reason || "(no reason given)",
-      `; refused=${death.refused} poolResizes=${death.poolResizes} stillDrawing=${death.stillDrawing} timestampFallbacks=${death.timestampFallbacks}`,
+      `; refused=${death.refused} poolResizes=${death.poolResizes} stillDrawing=${death.stillDrawing} timestampFallbacks=${death.timestampFallbacks} timestampDiscontinuities=${death.timestampDiscontinuities}`,
     );
     // onFrame is a native callback, not an async context, so this cannot
     // await -- fire it and move on. Safe to leave unhandled: stop()'s
@@ -740,6 +764,22 @@ function onFrame(
     );
   }
   active.timestampFallbacks = live.timestampFallbacks;
+  // Same edge-detect pattern as `timestampFallbacks` just above, and
+  // deliberately a separate check against a separate previous value rather
+  // than folded into it -- see addon.cc's g_timestampDiscontinuities doc
+  // comment for why a fallback engaging and a discontinuity firing are not
+  // the same event, so one 0 -> nonzero edge does not imply the other.
+  if (
+    active.timestampDiscontinuities === 0 &&
+    live.timestampDiscontinuities > 0
+  ) {
+    appAudioLog(
+      "screen capture: native pacing clock jumped backwards at least once and was re-baselined for",
+      active.sourceId,
+      "(see addon.cc's discontinuity guard in CaptureThread)",
+    );
+  }
+  active.timestampDiscontinuities = live.timestampDiscontinuities;
 
   // One-shot, alongside the lastFrameAt update above: the frame watchdog in
   // {@link startWatchdogs} is the only thing that sets `paused`, this is the
@@ -794,12 +834,19 @@ function onFrame(
     const refusedDelta = live.refused - summary.refusedAtWindowStart;
     const stillDrawingDelta =
       live.stillDrawing - summary.stillDrawingAtWindowStart;
+    // Delta, not the cumulative total -- same reasoning as `refusedDelta`/
+    // `stillDrawingDelta` above: a window where this is nonzero is the one
+    // that actually hit the clock discontinuity, which the one-shot
+    // edge-detect log in this function's live branch would otherwise only
+    // ever mention once for the whole session.
+    const discontinuitiesDelta =
+      live.timestampDiscontinuities - summary.discontinuitiesAtWindowStart;
     const meanBltMs = summary.bltMsSum / summary.frames;
     // grabMs is a Map(DO_NOT_WAIT) poll now, not a blocking GPU wait -- see
     // addon.cc's ProcessFrame -- so near-zero here means healthy, not idle.
     const meanGrabMs = summary.grabMsSum / summary.frames;
     appAudioLog(
-      `screen capture: 10s summary for ${active.sourceId}: produced=${summary.frames} (${deliveredFps.toFixed(1)}fps) posted=${summary.posted} refused +${refusedDelta} stillDrawing +${stillDrawingDelta} videoFrameFailures=${summary.videoFrameFailures} mean bltMs=${meanBltMs.toFixed(2)} grabMs=${meanGrabMs.toFixed(2)} (grabMs near zero is expected -- DO_NOT_WAIT readback, not a stall)`,
+      `screen capture: 10s summary for ${active.sourceId}: produced=${summary.frames} (${deliveredFps.toFixed(1)}fps) posted=${summary.posted} refused +${refusedDelta} stillDrawing +${stillDrawingDelta} timestampDiscontinuities +${discontinuitiesDelta} videoFrameFailures=${summary.videoFrameFailures} mean bltMs=${meanBltMs.toFixed(2)} grabMs=${meanGrabMs.toFixed(2)} (grabMs near zero is expected -- DO_NOT_WAIT readback, not a stall)`,
     );
     summary.windowStartMs = now;
     summary.frames = 0;
@@ -807,6 +854,7 @@ function onFrame(
     summary.grabMsSum = 0;
     summary.refusedAtWindowStart = live.refused;
     summary.stillDrawingAtWindowStart = live.stillDrawing;
+    summary.discontinuitiesAtWindowStart = live.timestampDiscontinuities;
     summary.posted = 0;
     summary.videoFrameFailures = 0;
   }
