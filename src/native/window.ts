@@ -782,7 +782,11 @@ export function createMainWindow() {
   // Armed right after loadURL() is *called*, not after its promise settles --
   // the failure mode this guards against is exactly the case where neither
   // did-finish-load nor did-fail-load ever arrives, so loadURL()'s own
-  // promise never settles either.
+  // promise never settles either. Armed once per load attempt: the initial
+  // loadURL() below, and again after the recovery reload() this function
+  // triggers, so a recovery that itself hangs is not silent either -- the
+  // `loadWatchdogReloaded` flag (not a missing re-arm) is what keeps that
+  // second attempt from reloading forever.
   function armLoadWatchdog() {
     clearLoadWatchdog();
     loadWatchdogTimer = setTimeout(() => {
@@ -809,6 +813,13 @@ export function createMainWindow() {
         getBuildUrl().toString(),
       );
       mainWindow.webContents.reload();
+      // Re-arm so a recovery reload that itself never resolves is caught
+      // too -- otherwise the "giving up" branch above can never run, and a
+      // hung recovery reload would fail exactly as silently as the original
+      // hang this watchdog exists to report. `loadWatchdogReloaded` is
+      // already true at this point, so this second timer can only take the
+      // giving-up branch above; it will not trigger another reload().
+      armLoadWatchdog();
     }, LOAD_WATCHDOG_MS);
   }
 
