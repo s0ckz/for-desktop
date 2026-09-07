@@ -512,6 +512,74 @@ struct FramePayload {
   std::string reason;
 };
 
+// Pool of live-frame payloads (PR A4 item 3), sized to match the TSFN queue
+// depth argued for in Start()'s g_tsfn comment (3) -- a `new`/`delete`
+// FramePayload per frame was a ~3MB heap alloc/dealloc pair at up to 60fps,
+// on top of the memcpy this whole module already exists to shrink. This is a
+// fixed global array, not per-session: it survives across Start()/Stop()
+// cycles untouched (nothing about it needs resetting -- see the doc comment
+// on AcquirePooledPayload for why that is safe), the same way the staging
+// texture ring's slots do.
+//
+// Does NOT cover the death-signal payload (Emit()'s other caller, in
+// CaptureThread's teardown) -- that one stays a plain `new`/`delete`,
+// deliberately. It happens at most once per session, so pooling it buys
+// nothing, and pooling it WOULD introduce a real hazard: the death payload
+// goes through Emit()'s bounded retry loop specifically because the queue
+// can legitimately be full at that moment (see kDeathRetries' comment), and
+// a payload drawn from this same 3-slot pool could still be sitting
+// queued-but-not-yet-drained from an ordinary frame at that exact moment --
+// there is no guarantee a free slot exists to hand the death signal in the
+// first place, which would turn "retry until the queue has room" into
+// "retry until a *pool slot* frees up AND the queue has room", a strictly
+// harder and unnecessary problem for a payload this module can afford to
+// heap-allocate once per session.
+constexpr int kFramePoolSize = 3;
+FramePayload g_framePayloadPool[kFramePoolSize];
+std::atomic<bool> g_framePayloadInUse[kFramePoolSize] = {};
+
+// Only the capture thread ever calls this (the same single-writer invariant
+// documented on g_tsfn's New() call in Start() -- Emit() is CaptureThread's
+// alone to call), so the linear scan below needs no producer-side lock: at
+// most one thread is ever racing the *consumer* side (the JS thread, via
+// ReleasePooledPayload below), never itself.
+//
+// Returns nullptr when all kFramePoolSize slots are still owned by a
+// payload the JS thread has not yet finished reading -- the caller (
+// ProcessFrame) treats that exactly like Emit()'s own full-queue drop: bump
+// g_framesRefused and skip the frame, never blocking. A free slot found here
+// is not a guarantee the *TSFN queue* itself has room -- Emit() still
+// separately handles that with its own drop path -- so a frame can still be
+// refused by Emit() even after successfully acquiring a slot here; see that
+// refusal branch for why the slot is released, not leaked, when that
+// happens.
+FramePayload* AcquirePooledPayload() {
+  for (int i = 0; i < kFramePoolSize; i++) {
+    bool expected = false;
+    if (g_framePayloadInUse[i].compare_exchange_strong(expected, true, std::memory_order_acquire)) {
+      return &g_framePayloadPool[i];
+    }
+  }
+  return nullptr;
+}
+
+// Marks a slot free again. Called from two places: Emit(), when
+// NonBlockingCall refuses a live payload outright (it was never queued, so
+// nothing else can be reading it), and EmitToJs, on the JS thread, once
+// Napi::Buffer::Copy has taken its own copy of `nv12` and every scalar field
+// has been read into `meta` -- i.e. once nothing downstream still needs this
+// slot's contents, not only once the JS callback has returned. Releasing
+// that early (rather than after `cb.Call`) keeps this pool's "in use" window
+// as close as possible to the TSFN's own internal queue-occupancy window;
+// see EmitToJs for the exact ordering. The release-store here is
+// AcquirePooledPayload's compare_exchange's pairing acquire, which is what
+// makes it safe for the capture thread to start overwriting this slot's
+// `nv12` for a new frame the instant this returns, without a data race.
+void ReleasePooledPayload(FramePayload* payload) {
+  const auto index = payload - g_framePayloadPool;
+  g_framePayloadInUse[index].store(false, std::memory_order_release);
+}
+
 /**
  * Frames the JS side was not ready to receive, cumulative for this session.
  *
@@ -578,9 +646,15 @@ void EmitToJs(Napi::Env env, Napi::Function cb, FramePayload* p) {
   meta.Set("grabMs", Napi::Number::New(env, p->grabMs));
   meta.Set("timestampUs", Napi::Number::New(env, p->timestampUs));
   // Safe before the call: Buffer::Copy above already took its own copy of
-  // the pixels, so nothing here outlives this scope. Leaking instead would
-  // cost a whole frame (~3MB) every time, ~180MB/s at 60fps.
-  delete p;
+  // the pixels, and every scalar field has already been read into `meta` --
+  // nothing below this line still reads `p`. Released back to the pool
+  // (item 3) rather than deleted: `p` is one of g_framePayloadPool's
+  // kFramePoolSize slots, not a heap allocation, for every live frame (see
+  // ProcessFrame/AcquirePooledPayload) -- freeing it here would double-free
+  // the moment the capture thread next wrote into that same slot. Released
+  // *before* `cb.Call`, not after: see ReleasePooledPayload's doc comment
+  // for why that ordering matters.
+  ReleasePooledPayload(p);
   cb.Call({buffer, meta});
 }
 
@@ -609,7 +683,11 @@ void Emit(FramePayload* payload) {
   if (status == napi_ok) return;
   if (!payload->isDeath) {
     g_framesRefused.fetch_add(1, std::memory_order_relaxed);
-    delete payload;
+    // Never queued (NonBlockingCall refused it outright), so nothing else
+    // can be reading this slot -- released back to the pool (item 3), not
+    // deleted: this is one of g_framePayloadPool's slots, not a heap
+    // allocation.
+    ReleasePooledPayload(payload);
     return;
   }
 
@@ -761,7 +839,16 @@ bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH, double time
     return false;
   }
 
-  auto* payload = new FramePayload();
+  // Pooled (item 3), not `new`: see AcquirePooledPayload's doc comment for
+  // what a null return means and why it is handled exactly like Emit()'s own
+  // full-queue drop rather than falling back to a heap allocation -- this
+  // function must never block or grow unboundedly on a slow JS thread any
+  // more than the queue itself does.
+  auto* payload = AcquirePooledPayload();
+  if (!payload) {
+    g_framesRefused.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
   payload->width = g_outW;
   payload->height = g_outH;
   payload->bltMs = std::chrono::duration<double, std::milli>(t1 - t0).count();

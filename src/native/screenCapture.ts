@@ -23,8 +23,11 @@ import {
   windowStateForSourceId,
 } from "./appAudio";
 
-export const SCREEN_CAPTURE_FRAME = "screenCapture:frame";
 export const SCREEN_CAPTURE_STATE = "screenCapture:state";
+/** One-time handoff channel: carries the {@link MessageChannelMain} port the
+ *  preload should use for frame delivery from here on -- see
+ *  {@link setFramePort}'s doc comment. */
+export const SCREEN_CAPTURE_FRAME_PORT = "screenCapture:framePort";
 
 // `for-web` no longer requests a capture resolution at getDisplayMedia time
 // (PR #6 removed it on purpose -- asking WGC for a smaller surface does not
@@ -362,6 +365,37 @@ let pollTimer: ReturnType<typeof setInterval> | null = null;
 let watchdogTimer: ReturnType<typeof setInterval> | null = null;
 
 /**
+ * The main-process end of the dedicated frame-delivery channel (plan PR A4
+ * item 2), set by {@link setFramePort}. Frames used to go out via
+ * `BrowserWindow.getAllWindows()[0].webContents.send` -- a guess at which
+ * window wanted them (wrong the moment a second window exists) that also put
+ * every 3MB-ish frame on the same generic `ipcMain`/`ipcRenderer` channel as
+ * everything else the app sends. A `MessageChannelMain` port is a direct pipe
+ * to the one renderer that actually asked for it, established fresh by
+ * `native/window.ts` on every `did-finish-load`.
+ */
+let framePort: Electron.MessagePortMain | null = null;
+
+/**
+ * Wire (or rewire) the frame-delivery port. `native/window.ts` calls this
+ * once per `did-finish-load` -- including a reload, which is exactly why the
+ * previous port is explicitly {@link MessagePortMain.close}d here rather than
+ * dropped on the floor: `MessagePortMain` has no finalizer that closes it for
+ * you, so leaving the old one for GC would leak one native port handle per
+ * reload for the life of the process.
+ */
+export function setFramePort(port: Electron.MessagePortMain | null) {
+  if (framePort) {
+    try {
+      framePort.close();
+    } catch {
+      /* already closed */
+    }
+  }
+  framePort = port;
+}
+
+/**
  * Cached answer from the native isSupported() probe (item 6). Each call does
  * a full RoInitialize plus a factory activation, and buildState() calls this
  * on every broadcastState() -- every frame-rate change, every watchdog
@@ -684,12 +718,24 @@ function onFrame(
     summary.refusedAtWindowStart = live.refused;
   }
 
-  const win = BrowserWindow.getAllWindows()[0];
-  if (!win || win.isDestroyed()) return;
-  win.webContents.send(SCREEN_CAPTURE_FRAME, frame, {
-    width: live.width,
-    height: live.height,
-    timestampUs: live.timestampUs,
+  // Dedicated port delivery (A4 item 2), gated on `sessionId` matching the
+  // live session, not just `framePort` existing. This is the "register the
+  // port per capture session" half of that item: rather than tracking a
+  // second, port-specific session id, it reuses the one `active.sessionId`
+  // already carries (see that field's doc comment and `stop()`'s own
+  // `sessionId` guard above) as the single source of truth for "who is
+  // allowed to deliver right now". A frame from a session already superseded
+  // -- in flight on the TSFN queue when a newer session's `active` replaced
+  // this one -- is dropped here instead of being misdelivered through the
+  // current session's port under the old session's stale width/height.
+  if (!framePort || sessionId !== active.sessionId) return;
+  framePort.postMessage({
+    frame,
+    meta: {
+      width: live.width,
+      height: live.height,
+      timestampUs: live.timestampUs,
+    },
   });
 }
 

@@ -302,6 +302,19 @@ export const APP_AUDIO_PATCH = [
   "      if (generator) {",
   "        const writer = generator.writable.getWriter();",
   "        let closed = false;",
+  // Backpressure (PR A4 item 1). Without this, a slow consumer (encoder
+  // busy, tab backgrounded, WritableStream's own internal queue full)
+  // leaves nothing to push back on: writer.write() just queues, and every
+  // queued frame is a full NV12 buffer (~3MB at 1080p), so a stalled
+  // writable grows without bound. `pending` and `desiredSize` are
+  // complementary, not redundant: `desiredSize` reflects the stream's own
+  // queue (positive means "room for at least one more write"), while
+  // `pending` is whether the write this handler most recently accepted has
+  // actually settled -- `desiredSize` can still read positive for one more
+  // write while an accepted one is in flight, and native delivers fast
+  // enough to call back again before that promise settles. Dropping (never
+  // buffering) keeps at most one frame in flight to the writer at a time.
+  "        let pending = 0;",
   "        const unsubFrame = screenCaptureBridge.onFrame((buf, meta) => {",
   "          if (closed) return;",
   "          lastWidth = meta.width; lastHeight = meta.height;",
@@ -315,7 +328,12 @@ export const APP_AUDIO_PATCH = [
   "          lastTimestampUs = meta.timestampUs;",
   "          let vf = null;",
   "          try { vf = new VideoFrame(buf, vfInit); } catch (e) { return; }",
-  "          writer.write(vf).catch(() => { /* noop */ }).finally(() => { try { vf.close(); } catch (e) { /* noop */ } });",
+  "          if (writer.desiredSize <= 0 || pending > 0) {",
+  "            try { vf.close(); } catch (e) { /* noop */ }",
+  "            return;",
+  "          }",
+  "          pending++;",
+  "          writer.write(vf).catch(() => { /* noop */ }).finally(() => { pending--; try { vf.close(); } catch (e) { /* noop */ } });",
   "        });",
   "        // The addon has no way to tell us the window died or capture",
   "        // otherwise failed -- see the long comment on the watchdogs in",
@@ -383,6 +401,16 @@ export const APP_AUDIO_PATCH = [
   "        const canvasTrack = canvasStream.getVideoTracks()[0];",
   "        if (canvasTrack) {",
   "          let closed = false;",
+  // Same backpressure motivation as the generator path above, but there is
+  // no writable queue to read here -- canvas.captureStream() samples the
+  // canvas on its own timer regardless of how often it is drawn to, so
+  // drawing faster than that (native can outrun the fallback's own `fps`
+  // when the page asked for less than the capture default) burns a GPU
+  // upload plus a compositor hop on frames captureStream will never sample.
+  // `lastDrawUs` throttles draws to one per frame interval using the same
+  // real capture timestamps buildVideoTrack already tracks for `duration`.
+  "          let lastDrawUs = null;",
+  "          const frameIntervalUs = fps > 0 ? 1e6 / fps : 0;",
   "          const unsubFrame = screenCaptureBridge.onFrame((buf, meta) => {",
   "            if (closed) return;",
   "            if (meta.width !== canvas.width || meta.height !== canvas.height) {",
@@ -397,6 +425,8 @@ export const APP_AUDIO_PATCH = [
   "            };",
   "            if (lastTimestampUs !== null) vfInit.duration = Math.max(0, meta.timestampUs - lastTimestampUs);",
   "            lastTimestampUs = meta.timestampUs;",
+  "            if (frameIntervalUs > 0 && lastDrawUs !== null && meta.timestampUs - lastDrawUs < frameIntervalUs) return;",
+  "            lastDrawUs = meta.timestampUs;",
   "            let vf = null;",
   "            try { vf = new VideoFrame(buf, vfInit); } catch (e) { return; }",
   "            try { ctx2d.drawImage(vf, 0, 0, canvas.width, canvas.height); } catch (e) { /* noop */ }",

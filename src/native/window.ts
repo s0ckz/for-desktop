@@ -4,6 +4,7 @@ import {
   BrowserWindow,
   Menu,
   MenuItem,
+  MessageChannelMain,
   app,
   desktopCapturer,
   ipcMain,
@@ -26,7 +27,9 @@ import {
 import { APP_AUDIO_PATCH } from "./appAudioPatch";
 import { config, getPersistedServer } from "./config";
 import {
+  SCREEN_CAPTURE_FRAME_PORT,
   resetNativeFailures,
+  setFramePort,
   setLiveFps as setScreenCaptureFps,
   startForSource as startScreenCapture,
   stop as stopScreenCapture,
@@ -793,6 +796,24 @@ export function createMainWindow() {
     // The picker lived in the page that just went away; whatever answer it
     // would have sent can never arrive now.
     cancelPendingPicker("page reloaded");
+
+    // Fresh frame-delivery port (A4 item 2) for this page load. Deliberately
+    // re-created on every did-finish-load, including a reload: the previous
+    // port's other end lived in a page context that is now gone, and
+    // `setFramePort` closes whatever port it already held before taking this
+    // one, so a reload can never leave the old port dangling. `port2` crosses
+    // into the renderer via `postMessage` -- delivered to the preload's
+    // `ipcRenderer` (contextIsolation keeps it out of the page's main world
+    // directly, same reason every other native/world/window.ts bridge call
+    // needs the preload as a hop), which re-exposes it to the page through
+    // the existing `window.native.screenCapture.onFrame` bridge -- see that
+    // file's `FRAME_PORT_CHANNEL` handling for the renderer side.
+    const { port1, port2 } = new MessageChannelMain();
+    setFramePort(port1);
+    mainWindow.webContents.postMessage(SCREEN_CAPTURE_FRAME_PORT, null, [
+      port2,
+    ]);
+
     const prelude =
       "window.__stoatCaptureFps = " + JSON.stringify(captureFpsCap()) + ";\n";
     mainWindow.webContents

@@ -1,6 +1,50 @@
 import { contextBridge, ipcRenderer } from "electron";
+import type { IpcRendererEvent } from "electron";
 
 import { version } from "../../package.json";
+
+// Dedicated frame-delivery port (plan PR A4 item 2), replacing a plain
+// `ipcRenderer.on("screenCapture:frame", ...)` listener bound to a channel
+// every other IPC message in the app also uses. `native/window.ts` posts a
+// fresh `MessageChannelMain` port down `FRAME_PORT_CHANNEL` on every
+// `did-finish-load` -- including a reload, so this is a mutable slot, not a
+// value claimed once at preload startup. Handlers registered through
+// `onFrame` below must survive a port swap without resubscribing (the page
+// that called `onFrame` has no idea a reload happened, and appAudioPatch.ts
+// is not touched by this item), so frames fan out to a small local listener
+// set instead of binding the caller's handler straight to the port.
+const FRAME_PORT_CHANNEL = "screenCapture:framePort";
+type FrameMeta = { width: number; height: number; timestampUs: number };
+type FrameHandler = (frame: Uint8Array, meta: FrameMeta) => void;
+let framePort: MessagePort | null = null;
+const frameHandlers = new Set<FrameHandler>();
+
+ipcRenderer.on(FRAME_PORT_CHANNEL, (event: IpcRendererEvent) => {
+  // Old port first: a reload means the previous port's other end (the main
+  // process's `framePort` in screenCapture.ts) was already closed and
+  // replaced there (see `setFramePort`'s doc comment) -- closing this end
+  // too is just tidiness, not a leak fix (this whole renderer context is
+  // about to be torn down along with it either way), but doing it
+  // explicitly means nothing is left relying on GC to notice.
+  if (framePort) {
+    try {
+      framePort.close();
+    } catch {
+      /* already closed */
+    }
+  }
+  framePort = event.ports[0] ?? null;
+  if (!framePort) return;
+  framePort.onmessage = (e: MessageEvent) => {
+    const { frame, meta } = e.data as { frame: Uint8Array; meta: FrameMeta };
+    for (const handler of frameHandlers) handler(frame, meta);
+  };
+  // Only needed for the *receiving* end of a MessagePort -- this port is
+  // otherwise idle (native capture pushes; nothing here replies), but
+  // messages queue until start() is called regardless, per the MessagePort
+  // spec.
+  framePort.start();
+});
 
 contextBridge.exposeInMainWorld("native", {
   versions: {
@@ -90,19 +134,14 @@ contextBridge.exposeInMainWorld("native", {
     // straight into app-audio.log where the rest of this diagnosis lives.
     log: (message: string) =>
       ipcRenderer.send("screenCapture:pageLog", message),
-    onFrame: (
-      handler: (
-        frame: Uint8Array,
-        meta: { width: number; height: number; timestampUs: number },
-      ) => void,
-    ) => {
-      const listener = (
-        _: unknown,
-        frame: Uint8Array,
-        meta: { width: number; height: number; timestampUs: number },
-      ) => handler(frame, meta);
-      ipcRenderer.on("screenCapture:frame", listener);
-      return () => ipcRenderer.removeListener("screenCapture:frame", listener);
+    // Delivered over the dedicated port wired above, not a plain
+    // `ipcRenderer` channel -- see `FRAME_PORT_CHANNEL`'s doc comment. The
+    // shape of this call is unchanged (register a handler, get an
+    // unsubscribe function back) so appAudioPatch.ts, which calls this, did
+    // not need to change for the port swap.
+    onFrame: (handler: FrameHandler) => {
+      frameHandlers.add(handler);
+      return () => frameHandlers.delete(handler);
     },
     // Pushed whenever capture starts, stops, or the main process detects the
     // captured window went away -- see the long comment on the watchdogs in
