@@ -25,15 +25,29 @@ import {
 export const SCREEN_CAPTURE_FRAME = "screenCapture:frame";
 export const SCREEN_CAPTURE_STATE = "screenCapture:state";
 
-// `for-web` no longer requests a capture resolution (PR #6 removed it on
-// purpose -- asking WGC for a smaller surface does not make it grab fewer
-// pixels, it just rescales what it grabbed). So this target is fixed rather
-// than negotiated: capture fit-inside 1920x1080 always, and let the 720p/1080p
-// presets downscale further on the encoder side via scaleResolutionDownBy,
-// which reads the real delivered size back off the generated track's
-// `getSettings()` override in appAudioPatch.ts.
+// `for-web` no longer requests a capture resolution at getDisplayMedia time
+// (PR #6 removed it on purpose -- asking WGC for a smaller surface does not
+// make it grab fewer pixels, it just rescales what it grabbed). So this is
+// only the INITIAL target, used until the first mid-share preset change (see
+// setLiveTarget/mod.setTarget below, PR C3 item 1): the share picker resolves
+// after capture has already started, and the chosen preset's resolution
+// arrives the same way its framerate already does, as a mid-share
+// applyConstraints() forwarded through screenCaptureBridge.setTarget() in the
+// page patch. Before that lands, native scales to fit inside this box; after,
+// it re-keys the GPU video processor to fit inside the picked box instead --
+// see EnsurePipeline in addon.cc -- so scaleResolutionDownBy (computed by
+// for-web from the generated track's `getSettings()` override in
+// appAudioPatch.ts, which reports the true delivered size) settles to 1
+// instead of doing a per-frame libyuv CPU downscale on the encoder queue.
 export const CAPTURE_TARGET_WIDTH = 1920;
 export const CAPTURE_TARGET_HEIGHT = 1080;
+
+/** Sane bounds for {@link setLiveTarget}; mirrors MIN/MAX_REQUESTABLE_FPS
+ *  below. Mostly a defence against a clearly-wrong value crossing IPC from a
+ *  remote page -- the real ceiling is EnsurePipeline's own fit-inside clamp
+ *  in addon.cc, which never upscales regardless of what is requested here. */
+const MIN_TARGET_DIMENSION = 2;
+const MAX_TARGET_DIMENSION = 8192;
 
 /**
  * How often we check that the captured window still exists.
@@ -233,6 +247,20 @@ let active: {
   fps: number;
   width: number;
   height: number;
+  /**
+   * The bounding box last REQUESTED of native (via startForSource's initial
+   * mod.start() call, or a later {@link setLiveTarget} mid-share change) --
+   * as opposed to {@link width}/{@link height} just above, which report the
+   * real delivered size once a frame has arrived (see buildState()'s own
+   * comment). Needed as a separate pair specifically so setLiveTarget can
+   * tell "no-op, already at this box" apart from "really changed": comparing
+   * against width/height instead would almost never match, since those hold
+   * the aspect-preserved *delivered* size (e.g. 1280x720) rather than the
+   * *requested* one (e.g. 1280x720 was itself derived by fitting inside some
+   * other box for-web actually asked for).
+   */
+  targetWidth: number;
+  targetHeight: number;
   lastFrameAt: number;
   /** When this session began, for the HEALTHY_SESSION_MS failure-count reset. */
   startedAt: number;
@@ -490,6 +518,8 @@ export async function startForSource(
     fps,
     width: CAPTURE_TARGET_WIDTH,
     height: CAPTURE_TARGET_HEIGHT,
+    targetWidth: CAPTURE_TARGET_WIDTH,
+    targetHeight: CAPTURE_TARGET_HEIGHT,
     lastFrameAt: Date.now(),
     startedAt: Date.now(),
     paused: false,
@@ -811,6 +841,51 @@ export function setLiveFps(fps: number): boolean {
 }
 
 /**
+ * Change the target bounding box of the capture already running (PR C3 item
+ * 1's mid-share half -- see {@link CAPTURE_TARGET_WIDTH}'s doc comment for
+ * the pre-start half).
+ *
+ * Mirrors {@link setLiveFps} exactly: for-web's share-quality picker resolves
+ * after capture has already started, so the picked preset's resolution
+ * arrives as a mid-share change forwarded from the page patch's
+ * applyConstraints() override, the same way its framerate already does.
+ * Without this the resolution stayed pinned at whatever {@link
+ * CAPTURE_TARGET_WIDTH}x{@link CAPTURE_TARGET_HEIGHT} started the session,
+ * and a 720p pick only ever reduced the delivered size via the encoder's own
+ * (CPU) scaleResolutionDownBy -- see EnsurePipeline in addon.cc for the GPU
+ * side of this fix.
+ * @returns Whether the running capture accepted it.
+ */
+export function setLiveTarget(width: number, height: number): boolean {
+  if (!active) return false;
+  if (!Number.isFinite(width) || !Number.isFinite(height)) return false;
+  const w = Math.min(
+    MAX_TARGET_DIMENSION,
+    Math.max(MIN_TARGET_DIMENSION, Math.round(width)),
+  );
+  const h = Math.min(
+    MAX_TARGET_DIMENSION,
+    Math.max(MIN_TARGET_DIMENSION, Math.round(height)),
+  );
+  if (w === active.targetWidth && h === active.targetHeight) return true;
+
+  const mod = loadNative();
+  if (!mod?.setTarget(w, h)) {
+    appAudioLog(
+      `screen capture: native refused a target change to ${w}x${h}; staying at ${active.targetWidth}x${active.targetHeight}`,
+    );
+    return false;
+  }
+  appAudioLog(
+    `screen capture: target changed ${active.targetWidth}x${active.targetHeight} -> ${w}x${h} for ${active.sourceId}`,
+  );
+  active.targetWidth = w;
+  active.targetHeight = h;
+  broadcastState();
+  return true;
+}
+
+/**
  * Reset the consecutive-failure counter kept by {@link MAX_NATIVE_FAILURES}.
  *
  * Call this when a *new* share begins -- the user answered the picker, or the
@@ -1041,6 +1116,30 @@ export function initScreenCapture() {
       Math.max(MIN_REQUESTABLE_FPS, Math.round(fps)),
     );
   });
+  // A quality change on a share that is already running (PR C3 item 1) --
+  // see {@link setLiveTarget}'s doc comment for why this exists and mirrors
+  // screenCapture:setFps rather than screenCapture:setNextFps above. Values
+  // are validated here (not trusted) for the same reason as setNextFps: they
+  // cross IPC from a remote page.
+  ipcMain.on(
+    "screenCapture:setTarget",
+    (_event, width: unknown, height: unknown) => {
+      if (
+        typeof width !== "number" ||
+        typeof height !== "number" ||
+        !Number.isFinite(width) ||
+        !Number.isFinite(height)
+      ) {
+        appAudioLog(
+          "screen capture: ignoring invalid setTarget value:",
+          width,
+          height,
+        );
+        return;
+      }
+      setLiveTarget(width, height);
+    },
+  );
   // The injected page patch's console is filtered below error level (see
   // window.ts), so it reports which video path a share actually took --
   // MediaStreamTrackGenerator, the canvas fallback, or leaving Chromium's

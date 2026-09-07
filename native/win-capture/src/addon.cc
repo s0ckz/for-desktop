@@ -194,8 +194,17 @@ void SetErrorText(std::string message) {
  */
 constexpr int kFramePoolBuffers = 2;
 
-UINT32 g_targetW = 0;
-UINT32 g_targetH = 0;
+/**
+ * Target bounding box frames are scaled to fit inside -- see EnsurePipeline's
+ * fit-inside comment for the exact math. Atomic for the same reason as g_fps
+ * just below, and changed the same way (SetTarget(), item 1 of PR C3): the
+ * web client's screen-share quality picker resolves *after* the share has
+ * already started, so a box fixed at Start() would strand every later preset
+ * change (1080p -> 720p) the same way a rate fixed at Start() used to strand
+ * a framerate change -- see SetTarget()'s own doc comment.
+ */
+std::atomic<UINT32> g_targetW{0};
+std::atomic<UINT32> g_targetH{0};
 /**
  * Delivery cadence, changeable while capture is running.
  *
@@ -225,13 +234,53 @@ ComPtr<WGC::IGraphicsCaptureSession> g_session;
 // resize.
 ComPtr<ID3D11VideoProcessorEnumerator> g_vpEnum;
 ComPtr<ID3D11VideoProcessor> g_videoProcessor;
-ComPtr<ID3D11Texture2D> g_outputTex;   // D3D11_USAGE_DEFAULT, NV12, VP output target
-ComPtr<ID3D11Texture2D> g_stagingTex;  // D3D11_USAGE_STAGING, CPU-readable copy of the above
+ComPtr<ID3D11Texture2D> g_outputTex;  // D3D11_USAGE_DEFAULT, NV12, VP output target
 ComPtr<ID3D11VideoProcessorOutputView> g_outputView;
 UINT32 g_srcW = 0;  // dimensions EnsurePipeline last built the VP/textures for
 UINT32 g_srcH = 0;
 UINT32 g_outW = 0;
 UINT32 g_outH = 0;
+UINT32 g_lastTargetW = 0;  // g_targetW/g_targetH EnsurePipeline last built the above for
+UINT32 g_lastTargetH = 0;
+
+/**
+ * Staging texture ring depth (item 2 of PR C3).
+ *
+ * Was a single D3D11_USAGE_STAGING texture: CopyResource into it, then
+ * Map(D3D11_MAP_READ) with no flags, which -- CopyResource only *starts* the
+ * GPU copy, it does not wait for it -- forced a full CPU/GPU pipeline stall
+ * on every single frame. Under game-GPU contention that stall was real time,
+ * not free synchronisation.
+ *
+ * Now: CopyResource into the NEXT slot, and Map the PREVIOUS one with
+ * D3D11_MAP_FLAG_DO_NOT_WAIT (see ProcessFrame). Whatever GPU work is still
+ * outstanding for the previous slot started a whole frame interval ago, so
+ * by the time this call reaches it, it is normally done; DO_NOT_WAIT turns
+ * "normally" into a guarantee -- Map() returns immediately either way,
+ * DXGI_ERROR_WAS_STILL_DRAWING if the GPU is for some reason still behind,
+ * in which case that frame is skipped exactly like any other pacing drop
+ * rather than blocked on.
+ *
+ * 2 is the minimum that works (one slot being written, one being read) and
+ * is what the plan asks for. A deeper ring would tolerate the GPU falling
+ * further behind before a frame gets skipped, at the cost of more latency
+ * and memory per extra slot -- not worth it unless 2 is measured to skip
+ * often in practice, which C3's own verification (grabMs, dropped-before-
+ * encode) will show if it ever needs revisiting.
+ */
+constexpr int kStagingRingSize = 2;
+struct StagingSlot {
+  ComPtr<ID3D11Texture2D> tex;  // D3D11_USAGE_STAGING, CPU-readable copy of g_outputTex
+  // This slot's own frame timestamp, captured at CopyResource time and read
+  // back out one call later alongside the pixels -- see ProcessFrame. Without
+  // this, the ring's one-frame delivery lag would pair frame N's own
+  // timestampUs with frame N-1's pixels, silently reintroducing the kind of
+  // timestamp/content mismatch PR C2 removed.
+  double timestampUs = 0;
+};
+StagingSlot g_stagingRing[kStagingRingSize];
+int g_stagingRingIndex = 0;   // next slot ProcessFrame will CopyResource into
+int g_stagingRingFilled = 0;  // slots written at least once since the last EnsurePipeline rebuild, capped at kStagingRingSize
 
 // The frame pool's own buffer size, tracked separately from g_srcW/g_srcH --
 // see EnsurePool.
@@ -309,7 +358,17 @@ bool EnsurePool(UINT32 w, UINT32 h) {
 // ---------------------------------------------------------------------------
 
 bool EnsurePipeline(UINT32 srcW, UINT32 srcH) {
-  if (srcW == g_srcW && srcH == g_srcH && g_vpEnum) return true;
+  // Re-keyed on the TARGET as well as the source size, since PR C3 item 1:
+  // SetTarget() can change g_targetW/g_targetH while this pipeline is
+  // otherwise perfectly valid for the current source size (a mid-share
+  // 1080p -> 720p preset change on a window that never resized), and that
+  // must rebuild the video processor and output/staging textures for the new
+  // output box exactly the way a source resize already does.
+  const UINT32 targetW = g_targetW.load(std::memory_order_relaxed);
+  const UINT32 targetH = g_targetH.load(std::memory_order_relaxed);
+  if (srcW == g_srcW && srcH == g_srcH && targetW == g_lastTargetW && targetH == g_lastTargetH && g_vpEnum) {
+    return true;
+  }
 
   HRESULT hr;
 
@@ -323,8 +382,8 @@ bool EnsurePipeline(UINT32 srcW, UINT32 srcH) {
   // 800x600 window against the 1920x1080 target) gets scale > 1 here and is
   // blown up to fill the box, spending bitrate on invented pixels instead of
   // the real ones. Fit-inside should only ever shrink.
-  const double scale = (std::min)({static_cast<double>(g_targetW) / srcW,
-                                    static_cast<double>(g_targetH) / srcH,
+  const double scale = (std::min)({static_cast<double>(targetW) / srcW,
+                                    static_cast<double>(targetH) / srcH,
                                     1.0});
   UINT32 outW = static_cast<UINT32>(std::lround(srcW * scale));
   UINT32 outH = static_cast<UINT32>(std::lround(srcH * scale));
@@ -371,15 +430,22 @@ bool EnsurePipeline(UINT32 srcW, UINT32 srcH) {
     return false;
   }
 
+  // Ring of kStagingRingSize staging textures -- see the struct/array's own
+  // declaration for why. Built as a local array first, same pattern as
+  // outTex/vp/vpEnum above, so a failure partway through (slot 1 of 2) never
+  // touches the globals and leaves the previous, still-valid pipeline in
+  // place for EnsurePipeline's caller to keep using.
   D3D11_TEXTURE2D_DESC stagingDesc = outDesc;
   stagingDesc.Usage = D3D11_USAGE_STAGING;
   stagingDesc.BindFlags = 0;
   stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-  ComPtr<ID3D11Texture2D> stagingTex;
-  hr = g_device->CreateTexture2D(&stagingDesc, nullptr, &stagingTex);
-  if (FAILED(hr)) {
-    SetError("CreateTexture2D(staging)", hr);
-    return false;
+  ComPtr<ID3D11Texture2D> stagingTex[kStagingRingSize];
+  for (int i = 0; i < kStagingRingSize; i++) {
+    hr = g_device->CreateTexture2D(&stagingDesc, nullptr, &stagingTex[i]);
+    if (FAILED(hr)) {
+      SetError("CreateTexture2D(staging)", hr);
+      return false;
+    }
   }
 
   D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC outViewDesc{};
@@ -395,12 +461,29 @@ bool EnsurePipeline(UINT32 srcW, UINT32 srcH) {
   g_vpEnum = vpEnum;
   g_videoProcessor = vp;
   g_outputTex = outTex;
-  g_stagingTex = stagingTex;
   g_outputView = outView;
   g_srcW = srcW;
   g_srcH = srcH;
   g_outW = outW;
   g_outH = outH;
+  g_lastTargetW = targetW;
+  g_lastTargetH = targetH;
+
+  // Every texture just built above is a fresh, never-copied-into resource,
+  // regardless of whether this rebuild was the very first one this session
+  // or a later resize/setTarget() -- so the ring's write/read bookkeeping
+  // must restart from empty here too, on the same trigger, or ProcessFrame
+  // could try to Map a "primed" slot from before this rebuild that no longer
+  // exists (a resize replaces the ComPtrs entirely, it does not reuse them).
+  // See ProcessFrame's own comment on g_stagingRingFilled for the other half
+  // of this contract, and the struct's declaration above for why the first
+  // kStagingRingSize-1 frames after any rebuild have nothing to read yet.
+  for (int i = 0; i < kStagingRingSize; i++) {
+    g_stagingRing[i].tex = stagingTex[i];
+    g_stagingRing[i].timestampUs = 0;
+  }
+  g_stagingRingIndex = 0;
+  g_stagingRingFilled = 0;
   return true;
 }
 
@@ -632,10 +715,47 @@ bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH, double time
   // path this Map() blocks on a ~20MB GPU->CPU copy under game-GPU
   // contention. Downscaling before this point (above) is what gets it to
   // ~1.5MB instead.
-  g_context->CopyResource(g_stagingTex.Get(), g_outputTex.Get());
+  //
+  // Staging ring (item 2 of PR C3): write this frame's blit result into the
+  // NEXT ring slot, but read back the PREVIOUS slot's -- already blitted a
+  // whole frame interval ago -- content, instead of the one just copied into.
+  // CopyResource only *starts* the GPU->CPU copy; it does not wait for it, so
+  // Map()'ing the slot just copied into would still pay the full pipeline
+  // stall this item exists to remove. Reading the other slot means whatever
+  // GPU work is still outstanding for it had a whole interval's head start,
+  // so D3D11_MAP_FLAG_DO_NOT_WAIT normally succeeds immediately; on the rare
+  // case it has not, Map() returns DXGI_ERROR_WAS_STILL_DRAWING right away
+  // instead of blocking, and this call skips the frame exactly like any
+  // other pacing drop -- see kStagingRingSize's declaration for more.
+  const int writeSlot = g_stagingRingIndex;
+  g_context->CopyResource(g_stagingRing[writeSlot].tex.Get(), g_outputTex.Get());
+  g_stagingRing[writeSlot].timestampUs = timestampUs;
+  g_stagingRingIndex = (writeSlot + 1) % kStagingRingSize;
+
+  // The first kStagingRingSize-1 frames after Start() or after EnsurePipeline
+  // resets this ring (a resize or a setTarget() -- see its own comment) have
+  // no N-1 slot with real content to read: every slot is a freshly created,
+  // never-copied-into STAGING texture. Returning true with nothing emitted is
+  // not a failure -- CaptureThread already treats "no Emit() this iteration"
+  // as an ordinary drop (the same path a too-fast frame or a still-drawing
+  // GPU takes), so the caller sees no difference from any other skipped
+  // frame; it is just guaranteed for a session's or a rebuild's first couple
+  // of frames instead of merely likely.
+  if (g_stagingRingFilled < kStagingRingSize) {
+    g_stagingRingFilled++;
+    return true;
+  }
+
+  const int readSlot = (writeSlot + kStagingRingSize - 1) % kStagingRingSize;
   D3D11_MAPPED_SUBRESOURCE mapped{};
-  hr = g_context->Map(g_stagingTex.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+  hr = g_context->Map(g_stagingRing[readSlot].tex.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
   const auto t2 = std::chrono::steady_clock::now();
+  if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+    // Not a failure -- see the comment above this block. The pixels are not
+    // lost, only this call's chance to read them; readSlot's own content
+    // gets another chance once the ring cycles back to it.
+    return true;
+  }
   if (FAILED(hr)) {
     SetError("Map(staging texture)", hr);
     return false;
@@ -645,8 +765,19 @@ bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH, double time
   payload->width = g_outW;
   payload->height = g_outH;
   payload->bltMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+  // No longer a GPU-wait measurement now that Map() is DO_NOT_WAIT -- it
+  // normally reads near zero, which is the point of this item, not a bug.
+  // grabMs still exists as a field so the harness/renderer can tell a
+  // healthy near-zero value apart from the rare WAS_STILL_DRAWING skip above
+  // (which never reaches here to report one).
   payload->grabMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
-  payload->timestampUs = timestampUs;
+  // This slot's OWN timestamp, captured when it was written one call ago --
+  // not the `timestampUs` argument, which belongs to the frame just blitted
+  // into the OTHER (write) slot this same call. Using the argument here
+  // would pair this frame's pixels with the next frame's timestamp, silently
+  // undoing PR C2's real-per-frame-timestamp fix for the one-frame lag this
+  // ring adds.
+  payload->timestampUs = g_stagingRing[readSlot].timestampUs;
 
   // D3D11 maps an NV12 texture as one contiguous region: the Y plane
   // (height rows of RowPitch bytes) immediately followed by the half-height,
@@ -667,7 +798,7 @@ bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH, double time
     memcpy(payload->nv12.data() + ySize + static_cast<size_t>(row) * g_outW,
            uvSrc + static_cast<size_t>(row) * mapped.RowPitch, g_outW);
   }
-  g_context->Unmap(g_stagingTex.Get(), 0);
+  g_context->Unmap(g_stagingRing[readSlot].tex.Get(), 0);
 
   Emit(payload);
   return true;
@@ -688,6 +819,19 @@ bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH, double time
 // CaptureThread's teardown: remove_FrameArrived happens, and is given the
 // chance to finish any in-flight Invoke, before the event handle is ever
 // closed).
+//
+// Belt and braces on top of that: remove_FrameArrived is the standard WinRT
+// event-source contract for "no Invoke is still in flight once this
+// returns", but nothing here depends on that guarantee being ironclad across
+// every WinRT implementation. If a straggler Invoke ever did land after
+// CaptureThread closed frameEvent, SetEvent on a stale HANDLE value is not
+// just wrong, it is dangerous: Windows recycles HANDLE values, so it could
+// signal a completely unrelated kernel object created after this one closed.
+// ClearEvent() (called from CaptureThread's teardown, strictly before the
+// close) makes that provably harmless instead: frameEvent_ is an atomic, so
+// a straggler reads nullptr and calls SetEvent(nullptr), which fails benignly
+// (returns 0, GetLastError() ERROR_INVALID_HANDLE) rather than touching
+// anything real.
 // ---------------------------------------------------------------------------
 
 class FrameArrivedHandler
@@ -696,17 +840,28 @@ class FrameArrivedHandler
           ABI::Windows::Foundation::ITypedEventHandler<WGC::Direct3D11CaptureFramePool*, IInspectable*>> {
  public:
   HRESULT RuntimeClassInitialize(HANDLE frameEvent) {
-    frameEvent_ = frameEvent;
+    frameEvent_.store(frameEvent, std::memory_order_release);
     return S_OK;
   }
 
   IFACEMETHODIMP Invoke(WGC::IDirect3D11CaptureFramePool*, IInspectable*) override {
-    SetEvent(frameEvent_);  // only this -- see the class comment above
+    // Load once rather than SetEvent(frameEvent_.load()) inline -- not for
+    // correctness (both read it exactly once either way), just so the value
+    // actually being signalled is visible in a debugger/crash dump.
+    HANDLE h = frameEvent_.load(std::memory_order_acquire);
+    if (h) SetEvent(h);  // null after ClearEvent() -- see the class comment above
     return S_OK;
   }
 
+  // Called by CaptureThread's teardown, after remove_FrameArrived and before
+  // frameEvent is closed -- see the class comment above for why this exists
+  // as a second line of defence rather than trusting remove_FrameArrived
+  // alone. Atomic: written from the capture thread, read from whatever
+  // thread WinRT happens to run Invoke() on.
+  void ClearEvent() { frameEvent_.store(nullptr, std::memory_order_release); }
+
  private:
-  HANDLE frameEvent_ = nullptr;  // not owned; CaptureThread owns and closes it
+  std::atomic<HANDLE> frameEvent_{nullptr};  // not owned; CaptureThread owns and closes it
 };
 
 // ---------------------------------------------------------------------------
@@ -735,6 +890,16 @@ void CaptureThread(HWND hwnd) {
   HANDLE frameEvent = nullptr;
   EventRegistrationToken frameArrivedToken{};
   bool frameArrivedRegistered = false;
+  // Function-scope, not the nested block it used to be built in below --
+  // kept alive here, deliberately, through the ClearEvent()/CloseHandle(
+  // frameEvent) pair in this function's teardown, so the FrameArrivedHandler
+  // object itself cannot be destroyed out from under a straggler Invoke()
+  // either -- see ClearEvent()'s own comment on the class for the handle
+  // half of this defence; this is the object-lifetime half. add_FrameArrived
+  // below takes its own reference too (the standard WinRT event-source
+  // contract), so this ComPtr is redundant in the common case -- it only
+  // matters if that reference is ever dropped before this thread expects.
+  ComPtr<FrameArrivedHandler> frameArrivedHandler;
 
   // High-resolution pacing/heartbeat timer (item 3 of this PR). Not the
   // delivery-pacing decision any more -- see lastDeliveredTs below -- just
@@ -850,25 +1015,17 @@ void CaptureThread(HWND hwnd) {
       SetError("CreateEvent(frameEvent)", HRESULT_FROM_WIN32(GetLastError()));
       break;
     }
-    {
-      ComPtr<FrameArrivedHandler> handler;
-      hr = Microsoft::WRL::MakeAndInitialize<FrameArrivedHandler>(&handler, frameEvent);
-      if (FAILED(hr)) {
-        SetError("MakeAndInitialize(FrameArrivedHandler)", hr);
-        break;
-      }
-      hr = g_framePool->add_FrameArrived(handler.Get(), &frameArrivedToken);
-      if (FAILED(hr)) {
-        SetError("Direct3D11CaptureFramePool::add_FrameArrived", hr);
-        break;
-      }
-      frameArrivedRegistered = true;
-      // handler's own ComPtr going out of scope here does not end the
-      // subscription -- add_FrameArrived above took its own reference, the
-      // same way any WinRT event source does, which is what keeps the
-      // handler alive until remove_FrameArrived (in this function's
-      // teardown, below) drops it.
+    hr = Microsoft::WRL::MakeAndInitialize<FrameArrivedHandler>(&frameArrivedHandler, frameEvent);
+    if (FAILED(hr)) {
+      SetError("MakeAndInitialize(FrameArrivedHandler)", hr);
+      break;
     }
+    hr = g_framePool->add_FrameArrived(frameArrivedHandler.Get(), &frameArrivedToken);
+    if (FAILED(hr)) {
+      SetError("Direct3D11CaptureFramePool::add_FrameArrived", hr);
+      break;
+    }
+    frameArrivedRegistered = true;
 
     hr = g_framePool->CreateCaptureSession(g_item.Get(), &g_session);
     if (FAILED(hr)) {
@@ -1118,6 +1275,14 @@ void CaptureThread(HWND hwnd) {
     g_framePool->remove_FrameArrived(frameArrivedToken);
     frameArrivedRegistered = false;
   }
+  // Second line of defence, ordered strictly after remove_FrameArrived and
+  // strictly before CloseHandle(frameEvent) below -- see ClearEvent()'s own
+  // comment on the FrameArrivedHandler class for why this exists even though
+  // remove_FrameArrived already claims to guarantee the same thing. Guarded,
+  // not unconditional: frameArrivedHandler is still null if
+  // MakeAndInitialize itself never succeeded (an early break above), in
+  // which case there was never a subscription for a straggler to invoke.
+  if (frameArrivedHandler) frameArrivedHandler->ClearEvent();
 
   // Teardown, in reverse order of acquisition. Closing the session/pool
   // (rather than only Releasing them) tells WGC to stop capturing
@@ -1132,7 +1297,7 @@ void CaptureThread(HWND hwnd) {
   }
 
   g_outputView.Reset();
-  g_stagingTex.Reset();
+  for (auto& slot : g_stagingRing) slot.tex.Reset();
   g_outputTex.Reset();
   g_videoProcessor.Reset();
   g_vpEnum.Reset();
@@ -1147,12 +1312,20 @@ void CaptureThread(HWND hwnd) {
   g_device.Reset();
   g_srcW = g_srcH = g_outW = g_outH = 0;
   g_poolW = g_poolH = 0;
+  g_lastTargetW = g_lastTargetH = 0;
+  g_stagingRingIndex = 0;
+  g_stagingRingFilled = 0;
 
   // frameEvent is safe to close now regardless of how CaptureThread got here
   // (a clean stop, a mid-setup failure, an unrecoverable per-frame error) --
-  // the remove_FrameArrived above already guarantees the one other thread
-  // that could ever touch it (FrameArrivedHandler::Invoke) can no longer be
-  // invoked. If a break happened before frameEvent was even created (an
+  // remove_FrameArrived above already guarantees the one other thread that
+  // could ever touch it (FrameArrivedHandler::Invoke) can no longer be
+  // invoked, and ClearEvent() just above means even a straggler that beat
+  // that guarantee reads nullptr instead of this about-to-be-closed value.
+  // frameArrivedHandler itself is still alive here too (it does not go out
+  // of scope until this function returns), so there is no window where the
+  // handler object exists with a dangling frameEvent_ pointing at a closed
+  // handle. If a break happened before frameEvent was even created (an
   // early device/session setup failure), it is still nullptr here and this
   // is a no-op.
   if (frameEvent) {
@@ -1282,18 +1455,23 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  g_targetW = info[1].As<Napi::Number>().Uint32Value();
-  g_targetH = info[2].As<Napi::Number>().Uint32Value();
+  const UINT32 targetW = info[1].As<Napi::Number>().Uint32Value();
+  const UINT32 targetH = info[2].As<Napi::Number>().Uint32Value();
   const double startFps = info[3].As<Napi::Number>().DoubleValue();
   g_fps.store(startFps > 0 ? startFps : 30.0);
-  if (g_targetW < 2 || g_targetH < 2) {
+  if (targetW < 2 || targetH < 2) {
     Napi::Error::New(env, "targetWidth/targetHeight must be >= 2").ThrowAsJavaScriptException();
     return env.Undefined();
   }
+  g_targetW.store(targetW, std::memory_order_relaxed);
+  g_targetH.store(targetH, std::memory_order_relaxed);
 
   SetErrorText(std::string());
   g_srcW = g_srcH = g_outW = g_outH = 0;
   g_poolW = g_poolH = 0;
+  g_lastTargetW = g_lastTargetH = 0;
+  g_stagingRingIndex = 0;
+  g_stagingRingFilled = 0;
   if (g_stopEvent) CloseHandle(g_stopEvent);
   g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
@@ -1466,11 +1644,41 @@ Napi::Value SetFps(const Napi::CallbackInfo& info) {
   return Napi::Boolean::New(env, true);
 }
 
+/**
+ * Change the target bounding box of the capture already running (item 1 of
+ * PR C3: a mid-share preset change, e.g. 1080p -> 720p).
+ *
+ * Cheap and safe at any time, same reasoning as SetFps just above: the
+ * capture thread's own EnsurePipeline call re-reads g_targetW/g_targetH
+ * every frame (see its re-key check) and rebuilds the video processor and
+ * output/staging textures for the new box on the very next frame -- there is
+ * no session to tear down and no pipeline to rebuild here on the JS thread.
+ * Returns false when nothing is capturing or the values are not usable, so
+ * the caller can log rather than assume it took, same contract as SetFps.
+ */
+Napi::Value SetTarget(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (!g_running.load()) return Napi::Boolean::New(env, false);
+  if (info.Length() < 2 || !info[0].IsNumber() || !info[1].IsNumber()) return Napi::Boolean::New(env, false);
+  const double w = info[0].As<Napi::Number>().DoubleValue();
+  const double h = info[1].As<Napi::Number>().DoubleValue();
+  // Same >= 2 floor Start() enforces (NV12's 2x2 chroma subsampling), and an
+  // upper bound generous enough to never be the limiting factor for any real
+  // preset -- EnsurePipeline's own fit-inside clamp-to-1 is what actually
+  // stops a source from being upscaled, this is only a sanity check against
+  // a clearly-wrong value crossing IPC from a remote page.
+  if (!(w >= 2) || !(h >= 2) || w > 8192 || h > 8192) return Napi::Boolean::New(env, false);
+  g_targetW.store(static_cast<UINT32>(w), std::memory_order_relaxed);
+  g_targetH.store(static_cast<UINT32>(h), std::memory_order_relaxed);
+  return Napi::Boolean::New(env, true);
+}
+
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("isSupported", Napi::Function::New(env, IsSupported));
   exports.Set("start", Napi::Function::New(env, Start));
   exports.Set("stop", Napi::Function::New(env, Stop));
   exports.Set("setFps", Napi::Function::New(env, SetFps));
+  exports.Set("setTarget", Napi::Function::New(env, SetTarget));
   exports.Set("lastError", Napi::Function::New(env, LastError));
 
   // Item 5 / R5: nothing previously stopped native capture on quit. Left

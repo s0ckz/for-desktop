@@ -81,6 +81,18 @@ declare const winCapture: {
    * frame -- no session teardown.
    */
   setFps(fps: number): boolean;
+  /**
+   * Change the target bounding box of the capture already running -- a
+   * mid-share preset change (e.g. 1080p -> 720p). Frames continue to be
+   * fit inside `width` x `height` the same way `start()`'s targetWidth/
+   * targetHeight are (aspect preserved, never upscaled, both dimensions
+   * rounded to even). Scaling happens on the GPU before readback, so this is
+   * how a 720p pick actually shrinks the per-frame CPU copy instead of
+   * relying on a downstream `scaleResolutionDownBy` CPU scale. Returns false
+   * if nothing is capturing or the values are unusable. Takes effect on the
+   * next frame -- no session teardown.
+   */
+  setTarget(width: number, height: number): boolean;
   lastError(): string;
 };
 

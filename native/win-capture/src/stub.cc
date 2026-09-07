@@ -37,6 +37,12 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("isSupported", Napi::Function::New(env, NotSupported));
   exports.Set("start", Napi::Function::New(env, FalseNoop));
   exports.Set("stop", Napi::Function::New(env, ResolvedStop));
+  // setFps/setTarget mid-share changes: nothing is ever running on this
+  // platform for either to affect, so both just report "did not take" like
+  // every other stub call here -- same FalseNoop, ignoring whatever args
+  // real addon.cc's versions take.
+  exports.Set("setFps", Napi::Function::New(env, FalseNoop));
+  exports.Set("setTarget", Napi::Function::New(env, FalseNoop));
   exports.Set("lastError", Napi::Function::New(env, EmptyString));
   return exports;
 }

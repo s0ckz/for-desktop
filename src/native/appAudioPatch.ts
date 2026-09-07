@@ -238,6 +238,25 @@ export const APP_AUDIO_PATCH = [
   "    return 0;",
   "  };",
   "",
+  // Same shape as frameRateOf, for width/height (PR C3 item 1): the desktop
+  // side (native/screenCapture.ts's setLiveTarget, screenCaptureBridge.
+  // setTarget here) is fully wired for this, forwarding whatever generator.
+  // applyConstraints below is called with straight through to the native GPU
+  // scaler. The for-web side that would actually CALL applyConstraints with
+  // { width, height } after a preset pick -- state.tsx's counterpart to the
+  // frameRate forwarding already below -- is a separate, not-yet-made change
+  // in the other repo; see the desktop PR notes. Until that lands this is
+  // dead code on a healthy path, not a bug: dimOf(c, 'width'/'height') simply
+  // returns 0 for a constraints object that never carries them, same as
+  // frameRateOf does for one without frameRate.
+  "  const dimOf = (c, key) => {",
+  "    if (!c || typeof c !== 'object') return 0;",
+  "    const v = c[key];",
+  "    if (typeof v === 'number') return v;",
+  "    if (v && typeof v === 'object') return v.ideal || v.exact || v.max || 0;",
+  "    return 0;",
+  "  };",
+  "",
   "  const fpsCap = window.__stoatCaptureFps;",
   "  const withFpsCap = (c) => {",
   "    if (!fpsCap || !c || typeof c !== 'object') return c;",
@@ -334,6 +353,8 @@ export const APP_AUDIO_PATCH = [
   "        generator.applyConstraints = function (c) {",
   "          const next = frameRateOf(c);",
   "          if (next) { try { screenCaptureBridge.setFps(next); } catch (e) { /* noop */ } }",
+  "          const w = dimOf(c, 'width'); const h = dimOf(c, 'height');",
+  "          if (w && h && screenCaptureBridge.setTarget) { try { screenCaptureBridge.setTarget(w, h); } catch (e) { /* noop */ } }",
   "          return Promise.resolve();",
   "        };",
   "        return {",
@@ -398,6 +419,8 @@ export const APP_AUDIO_PATCH = [
   "          canvasTrack.applyConstraints = function (c) {",
   "            const next = frameRateOf(c);",
   "            if (next) { try { screenCaptureBridge.setFps(next); } catch (e) { /* noop */ } }",
+  "            const w = dimOf(c, 'width'); const h = dimOf(c, 'height');",
+  "            if (w && h && screenCaptureBridge.setTarget) { try { screenCaptureBridge.setTarget(w, h); } catch (e) { /* noop */ } }",
   "            return Promise.resolve();",
   "          };",
   "          return {",
