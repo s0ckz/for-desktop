@@ -903,7 +903,23 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
   // Three slots absorb that jitter while still bounding latency to two extra
   // frames (~33ms at 60fps) and still dropping rather than growing without
   // limit, so Emit()'s drop path stays real.
-  g_tsfn = Napi::ThreadSafeFunction::New(env, info[4].As<Napi::Function>(), "winCapture", 1, 3);
+  //
+  // New()'s signature is (env, callback, resourceName, maxQueueSize,
+  // initialThreadCount) -- the "3" below is the queue depth just argued for
+  // above, NOT a thread count. initialThreadCount is 1 because exactly one
+  // native thread ever touches g_tsfn: CaptureThread does every
+  // NonBlockingCall (via Emit(), polling on its own loop -- see the file
+  // header for why this module polls instead of subscribing to WGC's
+  // FrameArrived event, which would hand us a callback on a WinRT-owned
+  // thread instead) and also owns the one and only Release() in its own
+  // teardown further down this file. initialThreadCount has to equal the
+  // number of Release() calls that will ever happen: N-API seeds the TSFN's
+  // reference count at this value instead of requiring N separate Acquire()
+  // calls, and the TSFN only finalises -- freeing its libuv handle -- once
+  // that count is released back to zero. Set this above the number of
+  // Release() calls actually made and the count never reaches zero: the TSFN
+  // is never finalised and a libuv handle leaks every session.
+  g_tsfn = Napi::ThreadSafeFunction::New(env, info[4].As<Napi::Function>(), "winCapture", 3, 1);
   // Per-session, so a later share does not inherit an earlier one's count.
   g_framesRefused.store(0);
   g_poolResizes.store(0);
