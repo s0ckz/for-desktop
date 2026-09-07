@@ -1063,38 +1063,46 @@ class FrameArrivedHandler
 /**
  * Monotonic fallback for frame delivery pacing, in the same 100ns units as
  * frame->get_SystemRelativeTime() (see CaptureThread's pacing comment above
- * lastDeliveredTs).
+ * nextDeliverTs/lastDeliveredTs).
  *
  * get_SystemRelativeTime() can fail, and -- observed in the wild, not just
  * hypothesised -- some drivers hand back a "successful" HRESULT with
  * Duration == 0. Either way, the caller must never treat that as a genuine
- * timestamp: the pacing check below is `(ts - lastDeliveredTs) < 0.9 *
- * interval100ns`, so a `ts` of exactly 0 is only wrong for one frame if
- * lastDeliveredTs was already >= 0 -- but the FIRST time this happens,
- * lastDeliveredTs itself becomes 0, and every later frame's own (also
- * fabricated-as-0-on-failure, or worse, genuinely small) value keeps
- * satisfying that inequality, permanently. A single bad read used to be
- * enough to end delivery for the rest of the session with nothing in the
- * logs to explain why.
+ * timestamp: the pacing check below is `ts < nextDeliverTs`, and nothing but
+ * an actual delivery ever advances nextDeliverTs. A `ts` of exactly 0 only
+ * costs one dropped frame if nextDeliverTs was already ahead of it -- but if
+ * THIS were the very first frame of the session, nextDeliverTs would latch
+ * onto `0 + interval100ns` as the schedule's starting point, and every later
+ * frame's own (also fabricated-as-0-on-failure, or worse, genuinely small)
+ * value would keep failing to reach that mark, permanently. A single bad
+ * read used to be enough to end delivery for the rest of the session with
+ * nothing in the logs to explain why -- which is exactly why `ts` is never
+ * allowed to actually be a fabricated 0 in the first place: substituting
+ * QpcNow100ns() below keeps `ts` itself genuinely, unboundedly advancing
+ * even when get_SystemRelativeTime() never recovers, so the schedule stays
+ * reachable.
  *
  * QueryPerformanceCounter is this thread's own monotonic wall clock -- not
  * comparable to WGC's SystemRelativeTime in absolute terms (different
- * epochs), and pacing here only ever looks at a DELTA between two
- * consecutive values -- so switching which clock backs `ts`, in either
- * direction, can make that delta go negative instead of merely small. Left
- * unguarded, that is not "at most one wrongly-paced frame": it is the exact
+ * epochs), and pacing here compares a given `ts` against either the running
+ * delivery schedule (nextDeliverTs) or the previously delivered frame's own
+ * timestamp (lastDeliveredTs, kept solely for the discontinuity guard) -- so
+ * switching which clock backs `ts`, in either direction, can make either of
+ * those comparisons land wrong instead of merely imprecise. Left unguarded,
+ * that is not "at most one wrongly-paced frame": a `ts` from the new clock
+ * landing far behind the old clock's epoch would fail `ts < nextDeliverTs`
+ * forever, since nothing but a delivery advances nextDeliverTs -- the exact
  * same permanent-stall shape described above, just triggered by a clock
- * switch instead of a fabricated 0 -- a negative delta satisfies the pacing
- * check's `< 0.9 * interval100ns` forever, since lastDeliveredTs is only
- * updated on the non-dropped path. What actually makes the epoch mismatch
+ * switch instead of a fabricated 0. What actually makes the epoch mismatch
  * survivable is CaptureThread's own discontinuity guard, immediately before
  * the pacing check: any `ts` that reads BEFORE lastDeliveredTs re-baselines
- * pacing (resets to the "take the next frame unconditionally" sentinel) the
- * moment it happens, rather than trusting the two clocks to ever agree on
- * absolute values. With that guard in place, a one-time epoch mismatch on
- * the frame where a clock switch happens costs at most one re-baselined
- * frame, not a stall -- see g_timestampDiscontinuities for the counter that
- * makes a session which actually hits this leave a trace.
+ * pacing (resets both lastDeliveredTs and nextDeliverTs to the "take the
+ * next frame unconditionally" sentinel) the moment it happens, rather than
+ * trusting the two clocks to ever agree on absolute values. With that guard
+ * in place, a one-time epoch mismatch on the frame where a clock switch
+ * happens costs at most one re-baselined frame, not a stall -- see
+ * g_timestampDiscontinuities for the counter that makes a session which
+ * actually hits this leave a trace.
  * QueryPerformanceFrequency cannot fail on any Windows version this addon
  * targets (Vista+); the cached frequency is read once and reused, same
  * reasoning as every other per-process-constant cache in this file.
@@ -1297,6 +1305,17 @@ void CaptureThread(HWND hwnd) {
     // when a fixed-cadence poll landed.
     double lastDeliveredTs = -1.0;  // 100ns units; negative = "always take the first frame"
 
+    // The delivery SCHEDULE, distinct from lastDeliveredTs just above (which
+    // exists purely to feed the discontinuity guard in the loop below).
+    // Advanced by exactly one interval100ns per delivery, never by a delta
+    // computed from `ts` -- see the comment above the pacing check in the
+    // loop for why a delta from the last DELIVERED frame aliases against
+    // certain source/target fps ratios and an evenly-ticking schedule does
+    // not. Same sentinel convention as lastDeliveredTs: negative means "no
+    // schedule yet -- take the next frame unconditionally", which is also
+    // how a clock-discontinuity re-baseline (below) un-parks it.
+    double nextDeliverTs = -1.0;
+
     // nextTick now only drives pacingTimer -- see that HANDLE's own comment
     // above for why it no longer has any say in which frames get delivered.
     auto nextTick = std::chrono::steady_clock::now();
@@ -1378,22 +1397,50 @@ void CaptureThread(HWND hwnd) {
       if (!frame) continue;  // nothing new since last wait
 
       // Pace on the frame's own timestamp -- see the comment above
-      // lastDeliveredTs's declaration for why wall-clock time would not do.
-      // 0.9x instead of a strict >= interval100ns leaves headroom for
-      // ordinary sub-frame jitter in exactly when WGC stamps (and this
-      // thread observes) each present -- without it, a delivery landing a
-      // hair under one full interval late would be pushed out to two
-      // intervals instead of one.
+      // lastDeliveredTs's declaration for why wall-clock time would not do --
+      // against a running SCHEDULE (nextDeliverTs), not a delta from the
+      // last DELIVERED frame. This used to be delta-based: drop unless
+      // `(ts - lastDeliveredTs) >= 0.9 * interval100ns`, i.e. unless the new
+      // frame landed at least ~0.9 intervals past the previous DELIVERY.
+      // That aliases badly whenever the source's own interval does not
+      // divide evenly into the target interval, because each delivery moves
+      // the base the next comparison is measured from, so a shortfall never
+      // averages out -- it repeats every single time. Concretely, a 70fps
+      // source into a 30fps target: target interval 33.33ms, 0.9x threshold
+      // 30ms, source interval 14.29ms. 1 source interval (14.29ms) is below
+      // 30ms -- drop. 2 (28.57ms) are STILL below it, by 1.4ms -- drop. 3
+      // (42.86ms) finally clears it -- deliver. Every delivered frame resets
+      // the base to itself, so this 1-in-3 pattern holds for the entire
+      // session: 70/3 = 23.3fps delivered, never the 30fps target, no matter
+      // how long the share runs (this is the exact shape measured in
+      // production: 24.7fps delivered against a 30fps target). A schedule
+      // does not have this failure mode because it never re-bases on the
+      // frame that happened to satisfy it: nextDeliverTs ticks forward by
+      // exactly one interval100ns per delivery regardless of how early or
+      // late the frame that crossed it arrived, so every 33.33ms window
+      // takes exactly one frame -- whichever source frame is first to reach
+      // it -- and the long-run delivered rate is min(sourceFps, targetFps)
+      // for any source/target ratio, not just the ones that divide evenly
+      // (144fps into 60fps: one frame every ~16.67ms window, i.e. 60fps
+      // delivered, not some 144-vs-60 aliased rate). The old 0.9x fudge
+      // factor existed purely to absorb jitter under delta-based pacing -- a
+      // frame landing a hair under one full interval since the last
+      // DELIVERY still needed to count as "on time" instead of being pushed
+      // out an extra interval. Schedule-based pacing needs no equivalent: a
+      // frame arriving before nextDeliverTs simply is not this window's
+      // frame yet, and the next frame to reach the mark is -- there is no
+      // "last delivery" for jitter to be measured against, so nothing here
+      // needs fudging.
       ABI::Windows::Foundation::TimeSpan relativeTime{};
       hr = frame->get_SystemRelativeTime(&relativeTime);
       // FAILED(hr) is the obvious failure; Duration == 0 is the one observed
       // in the wild that is not -- some drivers report S_OK with a zero
       // timestamp. Both get the same fallback: a fabricated 0.0 here is
       // indistinguishable from a genuine one to the pacing check below, and
-      // once lastDeliveredTs latches onto a fabricated 0 every later frame's
-      // own (also-possibly-fabricated) value keeps satisfying `(ts - 0) <
-      // 0.9 * interval100ns` forever -- see QpcNow100ns's doc comment for
-      // the full failure mode this replaces.
+      // if nextDeliverTs ever latched onto a fabricated 0's schedule, every
+      // later frame's own (also-possibly-fabricated) value could keep
+      // failing to reach it -- see QpcNow100ns's doc comment for the full
+      // failure mode this replaces.
       double ts;
       if (SUCCEEDED(hr) && relativeTime.Duration != 0) {
         ts = static_cast<double>(relativeTime.Duration);
@@ -1410,27 +1457,57 @@ void CaptureThread(HWND hwnd) {
       // fallback, leaving it, or flapping between the two on alternating
       // frames if a driver's Duration==0 glitch is itself intermittent -- the
       // new `ts` can land BEFORE lastDeliveredTs, not just too close to it.
-      // Falling through to the pacing check below with that still equal to
-      // an earlier reading from the OTHER clock would be wrong in exactly the
-      // way this fallback was added to fix: `(ts - lastDeliveredTs) < 0.9 *
-      // interval100ns` is satisfied forever by a hugely negative delta, and
-      // lastDeliveredTs is only ever updated on the non-dropped path just
-      // below -- so every later frame this session would be dropped,
-      // silently, for the same structural reason the fabricated-0 bug was
-      // (see QpcNow100ns's doc comment), just reached by a clock switch
-      // instead of a fabricated value. Re-baseline instead of clamping or
-      // skipping: reset to the same "always take the next frame" sentinel
-      // the very first frame of the session uses (lastDeliveredTs's own
-      // declaration above), so this frame is delivered unconditionally and
-      // every frame after it paces off whichever clock is now in use.
+      // Falling through to the pacing check below with nextDeliverTs still
+      // anchored to a schedule built from an earlier reading on the OTHER
+      // clock would be wrong in exactly the way this guard exists to fix:
+      // `ts < nextDeliverTs` would be satisfied forever, since nextDeliverTs
+      // is a schedule the new clock's `ts` values may never reach, and
+      // nothing but an actual delivery ever advances it -- so every later
+      // frame this session would be dropped, silently, for the same
+      // structural reason the fabricated-0 bug was (see QpcNow100ns's doc
+      // comment), just reached by a clock switch instead of a fabricated
+      // value. Re-baseline instead of clamping or skipping: reset BOTH
+      // lastDeliveredTs and nextDeliverTs to the same "always take the next
+      // frame"/"no schedule yet" sentinel the very first frame of the
+      // session uses, so this frame is delivered unconditionally, a fresh
+      // schedule starts from it, and every frame after it paces off
+      // whichever clock is now in use. Resetting only one of the two would
+      // not be enough to fix anything: nextDeliverTs is what the pacing
+      // check below actually tests, so leaving it parked at the old clock's
+      // epoch would keep rejecting every subsequent frame even after
+      // lastDeliveredTs itself was cleared -- exactly the kind of
+      // permanently-stalled schedule this whole guard exists to prevent.
       if (lastDeliveredTs >= 0.0 && ts < lastDeliveredTs) {
         g_timestampDiscontinuities.fetch_add(1, std::memory_order_relaxed);
         lastDeliveredTs = -1.0;
+        nextDeliverTs = -1.0;
       }
-      if (lastDeliveredTs >= 0.0 && (ts - lastDeliveredTs) < 0.9 * interval100ns) {
-        continue;  // faster than the requested delivery rate -- drop (Release only, same as any other drop)
+      if (nextDeliverTs >= 0.0 && ts < nextDeliverTs) {
+        continue;  // before the next scheduled delivery -- drop (Release only, same as any other drop)
       }
       lastDeliveredTs = ts;
+      if (nextDeliverTs < 0.0) {
+        // First delivery this session, or the first since a re-baseline
+        // above: start the schedule exactly one interval past this frame.
+        nextDeliverTs = ts + interval100ns;
+      } else {
+        nextDeliverTs += interval100ns;
+        if (nextDeliverTs <= ts) {
+          // The schedule fell a full interval or more behind `ts` -- the
+          // source stalled, this thread got descheduled for a while, or
+          // setFps() just changed the target rate out from under a schedule
+          // computed for the old one. Resync to this frame instead of
+          // leaving nextDeliverTs in the past: ticking it forward one
+          // interval100ns at a time from here would let every frame until
+          // the deficit is paid off through as a burst of catch-up
+          // deliveries, which is exactly the "producing nothing, then
+          // everything at once" failure this file has already had to fix in
+          // more than one shape (see nextTick's own resync above, and its
+          // comment on why repeatedly adding one interval to a stale base is
+          // a busy-spin waiting to happen).
+          nextDeliverTs = ts + interval100ns;
+        }
+      }
 
       WG::SizeInt32 contentSize{};
       frame->get_ContentSize(&contentSize);
