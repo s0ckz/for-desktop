@@ -732,7 +732,13 @@ export function createMainWindow() {
       if (armed && Date.now() - armed.at < ARMED_TTL_MS) {
         appAudioLog("answering with re-acquired source", armed.source.id);
         stopAppAudio();
-        stopScreenCapture();
+        // "superseded", not the "stopped" default: this ends the previous
+        // native session because a new one (the re-acquired source) is about
+        // to replace it, not because the user asked to stop sharing. The
+        // companion for-web PR keys its recovery-budget accounting off this
+        // field, and a supersede must not look like a user stop -- see
+        // StopReason's doc comment in screenCapture.ts.
+        stopScreenCapture("superseded");
         void respondToDisplayMedia(
           armed.source,
           armed.audio && request.audioRequested,
@@ -764,7 +770,9 @@ export function createMainWindow() {
         .then((sources) => {
           // Any previous share is over by the time a new one is requested.
           stopAppAudio();
-          stopScreenCapture();
+          // "superseded", not "stopped" -- see the comment on the other
+          // stopScreenCapture() call above.
+          stopScreenCapture("superseded");
           // Everything past this point is a *new* share, not a recovery of
           // the one the armed fast path above would have answered -- the
           // Wayland single-source shortcut and a fresh picker answer both

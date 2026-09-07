@@ -56,12 +56,40 @@ export const CAPTURE_TARGET_HEIGHT = 1080;
  */
 const WINDOW_POLL_MS = 1000;
 /**
- * Safety net for capture deaths the window-existence poll cannot see (the
- * window is still open but VideoProcessorBlt/Map started failing, say). If no
- * frame has arrived in this long while we still believe capture is active,
- * treat it as dead. Generous relative to any fps we ask for.
+ * Safety net for capture deaths the window-existence/visibility poll cannot
+ * see on its own -- the window is still there and, as far as the poll can
+ * tell, not hidden, but frames have simply stopped, e.g.
+ * VideoProcessorBlt/Map started failing every frame. If no frame has arrived
+ * in this long while we still expect them, treat the session as suspect and
+ * pause it (see {@link startWatchdogs}) -- but, since this PR, NOT dead: a
+ * window can legitimately go quiet for reasons the poll does not catch
+ * (occluded but not iconic, moved to another virtual desktop, a fullscreen
+ * exclusive app briefly taking the whole output, ...), and ending the native
+ * session over that used to cost the share one of for-web's three
+ * recoveries per 60s (MAX_RECOVERIES in rtc/state.tsx) for no better reason
+ * than a frame gap that would have cleared itself. On the state-readable
+ * path this threshold only pauses -- there is deliberately no time-based
+ * teardown on this path at all; see the REJECTED note above
+ * {@link startWatchdogs} for why. The session is torn down only by the
+ * separate fatal no-window-state path at FRAME_WATCHDOG_NO_STATE_MS.
  */
 const FRAME_WATCHDOG_MS = 4000;
+/**
+ * Same idea as FRAME_WATCHDOG_MS, but for the one case where the frame
+ * watchdog is genuinely all we have: `windowStateForSourceId`
+ * (win-app-audio) returned null, meaning that module never loaded, so the
+ * poll in {@link startWatchdogs} cannot tell "window hidden" from "window
+ * gone" from "capture thread died" -- it just returns without touching
+ * anything. With no visibility signal at all, a stalled frame stream is the
+ * only evidence of death this module can see, so on this path alone the
+ * watchdog stays fatal, the way the single unconditional FRAME_WATCHDOG_MS
+ * did for every session before this PR. The threshold is longer than that
+ * old value (15s vs 4s) because it is now this path's ONLY safety net rather
+ * than one signal among several, and a share is worth a few extra seconds of
+ * frozen frame to avoid ending it over a window that may simply be minimised
+ * with no way here to prove otherwise.
+ */
+const FRAME_WATCHDOG_NO_STATE_MS = 15000;
 /**
  * Consecutive abnormal capture deaths before we stop attempting the native
  * path at all and leave the share on Chromium capture.
@@ -102,6 +130,50 @@ let consecutiveFailures = 0;
  * entirely. Null while a session is active.
  */
 let lastFallbackReason: string | null = null;
+
+/**
+ * Why the native capture session that was last running ended. Exposed on
+ * {@link buildState}'s separate `stopReason` field -- deliberately NOT the
+ * same field as `reason` (`lastFallbackReason` above), which answers "why
+ * did native capture never engage for this share" and is already consumed
+ * by the injected page patch at appAudioPatch.ts:518-519. Overloading one
+ * field to answer both questions would make e.g. `reason: "window-gone"`
+ * ambiguous between "capture never started because the source wasn't a
+ * window" (not actually a real value today, but the shape of the ambiguity)
+ * and "capture started, then the window went away" -- two different
+ * situations for the page's own logging, and for for-web's recovery-budget
+ * accounting, to tell apart.
+ *
+ * - "stopped": the ordinary case -- the `screenCapture:stop` IPC handler,
+ *   i.e. a user- or page-driven end of the share.
+ * - "window-gone": the window-existence poll in {@link startWatchdogs} found
+ *   `state.exists === false`.
+ * - "capture-error": the fatal FRAME_WATCHDOG_NO_STATE_MS watchdog path
+ *   fired (no window-state signal available at all). See the REJECTED
+ *   comment above {@link startWatchdogs} for why `lastError()` itself is not
+ *   what decides this, and the note there for why the state-readable path
+ *   has no time-based equivalent -- A3 item 5 will add the real signal for
+ *   that path.
+ * - "superseded": {@link startForSource}'s own pre-start `stop()` call, or
+ *   one of window.ts's two pre-start calls (the armed-reacquire fast path
+ *   and the fresh-picker-answer path) -- the session is not ending on its
+ *   own, it is being replaced by the one about to start. for-web's
+ *   recovery-budget accounting keys off this to avoid counting a supersede
+ *   as a failure.
+ *
+ * Null while a session is active, and cleared the moment a new one starts
+ * successfully -- same lifecycle as `lastFallbackReason`, just answering a
+ * different question. See {@link stop} and {@link startForSource} for where
+ * it is set and cleared.
+ */
+export type StopReason =
+  | "stopped"
+  | "window-gone"
+  | "capture-error"
+  | "superseded";
+
+/** See {@link StopReason}'s doc comment. */
+let stopReason: StopReason | null = null;
 
 /** Sane bounds for {@link takeNextRequestedFps}; see its doc comment. */
 const MIN_REQUESTABLE_FPS = 1;
@@ -172,11 +244,47 @@ let active: {
   /** When this session began, for the HEALTHY_SESSION_MS failure-count reset. */
   startedAt: number;
   /**
-   * The window is minimised, so WGC has nothing to hand us. The capture
-   * session is deliberately still running -- see the poll in
-   * {@link startWatchdogs} for why we do not tear down over this.
+   * Set by the frame watchdog in {@link startWatchdogs} the instant no frame
+   * has arrived for FRAME_WATCHDOG_MS, cleared by {@link onFrame} the moment
+   * a frame arrives again. This is the *only* thing that sets or clears this
+   * field -- {@link hiddenByPoll} below exists as a separate field for
+   * exactly this reason. Before this PR both concerns shared one `paused`
+   * flag, and the window-existence/visibility poll (every 1s) and the frame
+   * watchdog (also every 1s, on its own clock) fought over who got to set
+   * and clear it -- a window that was hidden-but-not-iconic could get marked
+   * paused by the frame watchdog and then immediately un-paused by the
+   * poll's own resume branch even though it was still hidden, or the reverse.
+   * Splitting them means each owns exactly the signal it can actually
+   * observe: the poll knows window visibility, the watchdog knows frame
+   * arrival, neither has to guess at the other's reason for the current
+   * state, and the capture session survives either kind of pause -- see both
+   * fields' call sites for why.
    */
   paused: boolean;
+  /**
+   * Set true by the {@link startWatchdogs} poll when `windowStateForSourceId`
+   * reports the window minimised OR simply not visible (occluded, on
+   * another virtual desktop, etc. -- anything short of "gone"), cleared when
+   * it reports neither. Distinct from {@link paused} -- see that field's doc
+   * comment for why they cannot be the same flag. This is purely descriptive
+   * bookkeeping for the transition log lines below; the frame watchdog does
+   * not read it, because a hidden window naturally stops producing frames on
+   * its own and will hit the ordinary FRAME_WATCHDOG_MS pause a few seconds
+   * later regardless of this flag.
+   */
+  hiddenByPoll: boolean;
+  /**
+   * Whether the most recent poll tick could read `windowStateForSourceId` at
+   * all. False for the whole process life whenever win-app-audio failed to
+   * load (see that function's null return) -- there is no retry, so in
+   * practice this is either always true or always false for a given
+   * process, but it is tracked per-session rather than re-derived from a
+   * module-level flag so the frame watchdog only has to look in one place.
+   * Selects which of FRAME_WATCHDOG_MS (state readable: non-fatal pause) or
+   * FRAME_WATCHDOG_NO_STATE_MS (state unreadable: fatal) the watchdog
+   * applies -- see both constants' doc comments.
+   */
+  stateReadable: boolean;
   /**
    * Latest counters off the frame metadata (see native/win-capture/index.d.ts),
    * kept here so the watchdog's death log can report them alongside
@@ -266,7 +374,11 @@ export function startForSource(sourceId: string, fps: number): boolean {
     return false;
   }
 
-  stop();
+  // "superseded", not the "stopped" default: whatever was running before
+  // this attempt is being replaced by it, not user/page-stopped. See
+  // StopReason's doc comment. If the attempt below fails to actually start,
+  // the `!started`/catch branches undo this -- see their comments.
+  stop("superseded");
 
   try {
     const started = mod.start(
@@ -278,6 +390,12 @@ export function startForSource(sourceId: string, fps: number): boolean {
     );
     if (!started) {
       lastFallbackReason = `native start() returned false: ${mod.lastError()}`;
+      // This attempt never actually started, so the `stop("superseded")`
+      // call above must not leave buildState() claiming the *previous*
+      // session was superseded by something that never took over --
+      // lastFallbackReason (the `reason` field) already carries the real
+      // story for this failed attempt. See StopReason's doc comment.
+      stopReason = null;
       appAudioLog(
         "screen capture: native start() returned false, falling back to Chromium capture:",
         mod.lastError(),
@@ -286,6 +404,8 @@ export function startForSource(sourceId: string, fps: number): boolean {
     }
   } catch (err) {
     lastFallbackReason = `native start() threw: ${String(err)}`;
+    // See the comment on the `!started` branch above -- same reasoning.
+    stopReason = null;
     appAudioLog(
       "screen capture: native start() threw, falling back to Chromium capture:",
       String(err),
@@ -296,6 +416,9 @@ export function startForSource(sourceId: string, fps: number): boolean {
   }
 
   lastFallbackReason = null;
+  // A new session is starting cleanly, so whatever ended the last one is no
+  // longer news -- see StopReason's doc comment.
+  stopReason = null;
   active = {
     sourceId,
     hwnd,
@@ -305,6 +428,8 @@ export function startForSource(sourceId: string, fps: number): boolean {
     lastFrameAt: Date.now(),
     startedAt: Date.now(),
     paused: false,
+    hiddenByPoll: false,
+    stateReadable: true,
     refused: 0,
     poolResizes: 0,
   };
@@ -329,11 +454,21 @@ function onFrame(
 ) {
   if (!active) return;
   const now = Date.now();
+  const wasPaused = active.paused;
   active.lastFrameAt = now;
   active.width = meta.width;
   active.height = meta.height;
   active.refused = meta.refused;
   active.poolResizes = meta.poolResizes;
+
+  // One-shot, alongside the lastFrameAt update above: the frame watchdog in
+  // {@link startWatchdogs} is the only thing that sets `paused`, this is the
+  // only thing that clears it, and this is the transition, not every frame
+  // while already unpaused.
+  if (wasPaused) {
+    active.paused = false;
+    appAudioLog("screen capture: frames resuming for", active.sourceId);
+  }
 
   // Frames have been flowing long enough to call this session good, so
   // whatever failed before it no longer counts against the native path.
@@ -352,79 +487,162 @@ function onFrame(
   });
 }
 
+/**
+ * REJECTED: stopping (or counting as a native-path failure) whenever
+ * `mod.lastError()` reports something, on the theory that a real capture
+ * error means the capture thread has exited. The original plan for this PR
+ * said exactly that ("stop when lastError() reports a real capture error --
+ * thread exited"), and it is wrong. Checked against
+ * native/win-capture/src/addon.cc:
+ *
+ * - `g_lastError` is cleared ONLY inside `Start()` (addon.cc:887) -- it is
+ *   sticky for the whole session. Once anything sets it, `lastError()` keeps
+ *   returning that same message on every later call until the next
+ *   `start()`, whether or not the capture thread is still running and
+ *   perfectly healthy.
+ * - It gets set on several transient, self-recovering per-frame paths where
+ *   the capture thread carries on regardless: `get_Surface` (addon.cc:651),
+ *   `QueryInterface(IDirect3DDxgiInterfaceAccess)` (addon.cc:660) and
+ *   `GetInterface` (addon.cc:666) each just `continue;` the loop afterward;
+ *   and `VideoProcessorBlt` (addon.cc:449) / `Map(staging texture)`
+ *   (addon.cc:462) return `false` out of `ProcessFrame`, whose return value
+ *   is discarded at its one call site (addon.cc:720) -- the loop does not
+ *   even look at it before moving on to the next frame.
+ * - The comment block at addon.cc:671-712 documents exactly this: a
+ *   `VideoProcessorBlt` failure with `E_INVALIDARG` during a continuous
+ *   window resize is an observed, self-recovering condition, not a thread
+ *   death -- the fix that block describes exists specifically so that case
+ *   stops dropping frames, let alone ending the session.
+ * - `Init()` (addon.cc:951-957) exports only `isSupported` / `start` /
+ *   `stop` / `setFps` / `lastError` -- there is no run-state export, so
+ *   nothing in TypeScript today can distinguish "thread still running, had a
+ *   transient hiccup a while ago" from "thread exited" by polling
+ *   `lastError()`.
+ *
+ * Treating `lastError()` as fatal would have ended a share within about one
+ * second of the first harmless VideoProcessorBlt hiccup (WINDOW_POLL_MS
+ * polling against a value that a resize can set at any moment and that never
+ * clears itself), and done it twice over: once by ending the session
+ * outright, and again by counting toward MAX_NATIVE_FAILURES and eventually
+ * disabling the native path for the rest of the process's life over
+ * something that was never a failure to begin with.
+ *
+ * So `lastError()` is called ONLY as diagnostic context appended to the log
+ * line of the one path that actually stops the session below
+ * (FRAME_WATCHDOG_NO_STATE_MS) -- exactly how the pre-this-PR code used it.
+ * The correct fatal signal does not exist yet: PR A3 item 5 has the addon
+ * invoke the ThreadSafeFunction once on loop exit with a null frame and a
+ * reason, and once that lands, `stop("capture-error")` on that path should
+ * be driven by that callback instead of by this timeout guessing.
+ */
+/**
+ * REJECTED: a second, longer timeout on the state-readable path (there used
+ * to be one here, FRAME_WATCHDOG_HARD_LEAK_MS) ending the session after
+ * minutes of silence even though the poll keeps confirming the window is
+ * fine. `state.visible` is `IsWindowVisible`, reflecting only WS_VISIBLE --
+ * it stays true for an occluded or alt-tabbed window, so the headline
+ * scenario (share a fullscreen game, alt-tab away) leaves `hiddenByPoll`
+ * false and the guard fires anyway. That is worse than the bug it guarded
+ * against: `stop()` ends native capture but leaves the page's generated
+ * track frozen instead of `ended`, so for-web never recovers -- permanently
+ * frozen, no path back. No unbounded leak to guard against either: the poll
+ * ends the session the instant the window closes (`state.exists === false`
+ * above). The genuine "capture thread died" signal does not exist yet (A3
+ * item 5 above); that, not a clock, should drive `stop("capture-error")`
+ * here once it lands.
+ */
 function startWatchdogs() {
   stopWatchdogs();
   pollTimer = setInterval(() => {
     if (!active) return;
     const state = windowStateForSourceId(active.sourceId);
+    active.stateReadable = state !== null;
     // No native audio module loaded means no way to tell this way; the frame
-    // watchdog below is what's left.
+    // watchdog below (at FRAME_WATCHDOG_NO_STATE_MS) is what's left.
     if (!state) return;
     if (!state.exists) {
       appAudioLog(
         "screen capture: captured window is gone, ending native capture for",
         active.sourceId,
       );
-      stop();
+      stop("window-gone");
       return;
     }
 
-    // Minimised is not gone. WGC cannot produce frames for an iconic window,
-    // but the capture session survives it -- the addon's loop only bails on
-    // !IsWindow(), which a minimised window still satisfies. So tearing the
-    // share down here is unnecessary, and actively harmful: every teardown
-    // spends one of for-web's three recoveries per 60s (MAX_RECOVERIES in
-    // rtc/state.tsx), and minimising a few times in quick succession used to
-    // exhaust that budget and kill the share for good.
+    // Minimised OR simply not visible (occluded by another window, moved to
+    // another virtual desktop, ...) both mean WGC has nothing to hand us
+    // right now, but neither means the window is gone, and the capture
+    // session survives either just fine -- the addon's loop only bails on
+    // !IsWindow(), which both states still satisfy. Before this PR only
+    // `iconic` was checked here, so a window that was merely occluded (not
+    // minimised) fell straight through to the frame watchdog's old,
+    // unconditionally fatal path the moment frames stopped. Tearing the
+    // share down over either case is unnecessary, and actively harmful:
+    // every teardown used to spend one of for-web's three recoveries per 60s
+    // (MAX_RECOVERIES in rtc/state.tsx), and minimising or losing focus a
+    // few times in quick succession could exhaust that budget and kill the
+    // share for good.
     //
     // Leave the session running instead. The viewer sees the last frame held
     // until the window comes back, which is a far better outcome than the
-    // share ending.
-    if (state.iconic) {
-      if (!active.paused) {
-        active.paused = true;
-        appAudioLog(
-          "screen capture: window minimised, holding the session open (no frames until restored) for",
-          active.sourceId,
-        );
-      }
-      return;
-    }
-    if (active.paused) {
-      active.paused = false;
-      // Not a resubscribe: WGC resumes delivering into the same session, so
-      // there is nothing to restart here.
-      active.lastFrameAt = Date.now();
+    // share ending. This sets `hiddenByPoll`, deliberately not `paused` --
+    // see that field's doc comment for why the two must not be the same
+    // flag.
+    const hidden = state.iconic || !state.visible;
+    if (hidden && !active.hiddenByPoll) {
+      active.hiddenByPoll = true;
       appAudioLog(
-        "screen capture: window restored, frames resuming for",
+        "screen capture: window hidden or minimised, holding the session open (no frames until restored) for",
+        active.sourceId,
+      );
+    } else if (!hidden && active.hiddenByPoll) {
+      active.hiddenByPoll = false;
+      // Deliberately not "frames resuming" -- that wording belongs to
+      // {@link onFrame}, which is the only place that can actually confirm a
+      // frame arrived. All the poll can confirm is that the window is
+      // visible again; whether WGC has delivered anything yet is a separate
+      // question the frame watchdog below answers.
+      appAudioLog(
+        "screen capture: window restored, resuming normal capture for",
         active.sourceId,
       );
     }
   }, WINDOW_POLL_MS);
   watchdogTimer = setInterval(() => {
-    // While minimised there are legitimately no frames, so the watchdog must
-    // not read that as a dead capture.
-    if (!active || active.paused) return;
-    if (Date.now() - active.lastFrameAt > FRAME_WATCHDOG_MS) {
-      const mod = loadNative();
-      // An abnormal death: the window is still there and not minimised, but
-      // frames stopped. Count it -- enough of these and we stop using the
-      // native path rather than letting it kill the share.
-      consecutiveFailures++;
-      // poolResizes climbing says this session was mid-resize when it died --
-      // a discrete or continuous window resize that (correctly) never drops a
-      // frame can still coincide with a death from something else entirely,
-      // so this doesn't prove causation, but a death with poolResizes at 0 is
-      // a real capture failure unrelated to resizing, which is exactly the
-      // distinction app-audio.log needs to tell those apart at a glance.
+    if (!active) return;
+    const now = Date.now();
+    const droughtMs = now - active.lastFrameAt;
+
+    if (!active.stateReadable) {
+      // Fatal path -- see FRAME_WATCHDOG_NO_STATE_MS's doc comment for why
+      // this one alone stays fatal instead of pausing like the
+      // state-readable path below.
+      if (droughtMs > FRAME_WATCHDOG_NO_STATE_MS) {
+        const mod = loadNative();
+        consecutiveFailures++;
+        appAudioLog(
+          "screen capture: no frames for",
+          FRAME_WATCHDOG_NO_STATE_MS,
+          `ms with no window-state signal available, ending native capture (failure ${consecutiveFailures}/${MAX_NATIVE_FAILURES}); lastError:`,
+          mod?.lastError() ?? "(unknown)",
+          `; refused=${active.refused} poolResizes=${active.poolResizes}`,
+        );
+        stop("capture-error");
+      }
+      return;
+    }
+
+    // Non-fatal: see FRAME_WATCHDOG_MS's doc comment. Logged once on the
+    // transition into paused -- {@link onFrame} is the only thing that
+    // clears `paused`, and does its own one-shot "resuming" log there.
+    if (droughtMs > FRAME_WATCHDOG_MS && !active.paused) {
+      active.paused = true;
       appAudioLog(
         "screen capture: no frames for",
         FRAME_WATCHDOG_MS,
-        `ms, ending native capture (failure ${consecutiveFailures}/${MAX_NATIVE_FAILURES}); lastError:`,
-        mod?.lastError() ?? "(unknown)",
-        `; refused=${active.refused} poolResizes=${active.poolResizes}`,
+        "ms, holding the session open (window state does not explain the gap) for",
+        active.sourceId,
       );
-      stop();
     }
   }, WINDOW_POLL_MS);
 }
@@ -509,7 +727,13 @@ function stopNative() {
   }
 }
 
-export function stop() {
+/**
+ * Ends whatever native capture session is running, if any.
+ * @param reason Why -- see {@link StopReason}'s doc comment. Defaults to the
+ *   ordinary "stopped" (a user- or page-driven end); every call site that
+ *   ends a session for a more specific reason passes one explicitly.
+ */
+export function stop(reason: StopReason = "stopped") {
   stopWatchdogs();
   // Unconditionally, not `if (active)`. Native stop() is a no-op when nothing
   // is capturing, so this is free in the common case -- and `active` is not a
@@ -524,8 +748,23 @@ export function stop() {
   // lastFallbackReason's doc comment for why this must happen here rather
   // than only inside startForSource.
   lastFallbackReason = null;
+  // Also touched unconditionally, same scoping reason as lastFallbackReason
+  // above -- but only *records* `reason` when a session was truly active.
+  // startForSource's pre-start call and window.ts's two pre-start calls all
+  // run `stop("superseded")` whether or not native was actually running (a
+  // screen source, or a share that never reaches native start(), never had
+  // a session to supersede), so buildState() must not report "superseded"
+  // for a session that never existed; null it instead of leaving an
+  // unrelated earlier session's reason lingering. startForSource's own
+  // `!started`/catch branches still explicitly null this out afterward --
+  // needed when `reason` above *was* recorded (a real session really was
+  // superseded, then the replacement failed to start). See StopReason's doc
+  // comment.
+  stopReason = active ? reason : null;
   if (!active) return;
-  appAudioLog(`screen capture: stopped native capture for ${active.sourceId}`);
+  appAudioLog(
+    `screen capture: stopped native capture for ${active.sourceId} (${reason})`,
+  );
   active = null;
   broadcastState();
 }
@@ -553,6 +792,10 @@ function buildState() {
     // app-audio.log always did, from the appAudioLog call next to each
     // assignment.
     reason: active ? null : lastFallbackReason,
+    // Why the most recently active session ended -- a different question
+    // from `reason` just above (see StopReason's doc comment for the split).
+    // Null while a session is active.
+    stopReason: active ? null : stopReason,
   };
 }
 
@@ -577,7 +820,7 @@ export function initScreenCapture() {
   // decide whether to swap in the generated track -- same pattern as
   // appAudio:getState.
   ipcMain.handle("screenCapture:getState", () => buildState());
-  ipcMain.on("screenCapture:stop", () => stop());
+  ipcMain.on("screenCapture:stop", () => stop("stopped"));
   // The value arrives from a remote page, so it is validated, not trusted:
   // reject anything that isn't a finite number (same distrust as
   // RENDERER_WRITABLE_KEYS in config.ts) and clamp the rest to a sane range
