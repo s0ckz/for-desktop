@@ -230,6 +230,27 @@ let nextPickerId = 0;
 const PICKER_LEAK_GUARD_MS = 10 * 60 * 1000;
 
 /**
+ * Backstop for the load itself: how long to wait after `loadURL()` for
+ * `did-finish-load` before assuming the load is stuck and recovering with a
+ * single `reload()`.
+ *
+ * This covers a race between `purgeCachedClient()` (clears the service
+ * worker + cache storage) and the load it kicks off immediately afterwards --
+ * on some launches the page parses (DevTools shows the right URL and a
+ * "Stoat" title) but `did-finish-load` never fires and no client JS runs.
+ * Neither `did-finish-load` nor `did-fail-load` shows up in that state, so
+ * nothing else in this file notices.
+ *
+ * Sized generously above any real load time: the client is a small SPA
+ * shell served from a CDN-backed origin, and `did-finish-load` normally
+ * fires within a second or two of `loadURL` even on a slow connection or a
+ * cold cache after the purge above. A few seconds of margin makes it very
+ * unlikely to trip on a merely-slow load, while still recovering long
+ * before a user would give up and force-quit.
+ */
+const LOAD_WATCHDOG_MS = 8_000;
+
+/**
  * Supersede whatever picker is currently pending, answering it with a cancel
  * so the renderer gets a clean NotAllowedError instead of a request that
  * never resolves. Safe to call when nothing is pending.
@@ -744,12 +765,75 @@ export function createMainWindow() {
     mainWindow.maximize();
   }
 
+  // Load watchdog state for *this* window instance. Scoped to the closure
+  // (not module-level) so "reload at most once" naturally means once per
+  // window/launch: `createMainWindow()` runs again for a fresh window (e.g.
+  // reopening from the tray) and gets its own untouched guard.
+  let loadWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
+  let loadWatchdogReloaded = false;
+
+  function clearLoadWatchdog() {
+    if (loadWatchdogTimer !== null) {
+      clearTimeout(loadWatchdogTimer);
+      loadWatchdogTimer = null;
+    }
+  }
+
+  // Armed right after loadURL() is *called*, not after its promise settles --
+  // the failure mode this guards against is exactly the case where neither
+  // did-finish-load nor did-fail-load ever arrives, so loadURL()'s own
+  // promise never settles either. Armed once per load attempt: the initial
+  // loadURL() below, and again after the recovery reload() this function
+  // triggers, so a recovery that itself hangs is not silent either -- the
+  // `loadWatchdogReloaded` flag (not a missing re-arm) is what keeps that
+  // second attempt from reloading forever.
+  function armLoadWatchdog() {
+    clearLoadWatchdog();
+    loadWatchdogTimer = setTimeout(() => {
+      loadWatchdogTimer = null;
+      // The window can be closed/destroyed while this is pending; touching
+      // webContents on a destroyed window throws.
+      if (mainWindow.isDestroyed()) return;
+      if (loadWatchdogReloaded) {
+        // Already spent our one reload this launch and the load is still
+        // stuck. Reloading again would risk looping forever against a
+        // genuinely unreachable server, which is a worse failure than a
+        // blank window -- so stop here and just make sure it's in the log.
+        appAudioLog(
+          "load watchdog: did-finish-load still hasn't fired after the recovery reload; giving up (server likely unreachable) --",
+          getBuildUrl().toString(),
+        );
+        return;
+      }
+      loadWatchdogReloaded = true;
+      // This is a recovery from a failed load, not a routine event -- see
+      // LOAD_WATCHDOG_MS for the race being worked around.
+      appAudioLog(
+        `load watchdog: did-finish-load did not fire within ${LOAD_WATCHDOG_MS}ms of loadURL; recovering with a single reload() --`,
+        getBuildUrl().toString(),
+      );
+      mainWindow.webContents.reload();
+      // Re-arm so a recovery reload that itself never resolves is caught
+      // too -- otherwise the "giving up" branch above can never run, and a
+      // hung recovery reload would fail exactly as silently as the original
+      // hang this watchdog exists to report. `loadWatchdogReloaded` is
+      // already true at this point, so this second timer can only take the
+      // giving-up branch above; it will not trigger another reload().
+      armLoadWatchdog();
+    }, LOAD_WATCHDOG_MS);
+  }
+
   // Whatever goes wrong loading the remote client should end up in the log file
   // rather than a console nobody can see. A blank or grey window is almost
   // always one of these.
   mainWindow.webContents.on(
     "did-fail-load",
     (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+      // A real did-fail-load means we got a definitive answer -- the
+      // watchdog's job (catching a load that never resolves either way) is
+      // done, and reloading on top of this would just race the OS/network
+      // error handling that already ran.
+      clearLoadWatchdog();
       appAudioLog(
         `page failed to load (${isMainFrame ? "main frame" : "subframe"}):`,
         `${errorCode} ${errorDescription}`,
@@ -792,6 +876,10 @@ export function createMainWindow() {
   // The web app is remote, so the getDisplayMedia override has to be injected
   // into its main world on every load (contextIsolation keeps the preload out).
   mainWindow.webContents.on("did-finish-load", () => {
+    // The load we were waiting on landed -- whether or not the watchdog's
+    // own reload() is what got us here, there is nothing left to recover
+    // from.
+    clearLoadWatchdog();
     appAudioLog("page loaded:", mainWindow.webContents.getURL());
     // The picker lived in the page that just went away; whatever answer it
     // would have sent can never arrive now.
@@ -856,7 +944,30 @@ export function createMainWindow() {
   // load to work. The leftover reload() only doubled did-finish-load (so
   // the page patch above injects twice) and briefly re-flashed the window
   // on every launch, with nothing behind it once the real fix landed.
-  purgeCachedClient().then(() => mainWindow.loadURL(getBuildUrl().toString()));
+  //
+  // That said, this exact interaction -- purge immediately before load -- is
+  // itself the grey-window race: on some launches did-finish-load simply
+  // never fires afterwards. `armLoadWatchdog()` below is the real backstop
+  // for that (a targeted single reload if it actually happens), rather than
+  // reinstating the blind unconditional double load removed above.
+  //
+  // `config.lastServer = getBuildUrl().origin` inside purgeCachedClient()
+  // runs outside its own try/catch, so a throw there (or anything else
+  // unexpected) would otherwise reject this promise silently and skip
+  // loadURL() entirely -- a blank window forever with nothing logged. A
+  // failed cache purge must never prevent the client from loading, so catch
+  // and load anyway.
+  purgeCachedClient()
+    .catch((err) => {
+      appAudioLog(
+        "could not purge cached client, loading anyway:",
+        String(err),
+      );
+    })
+    .then(() => {
+      armLoadWatchdog();
+      mainWindow.loadURL(getBuildUrl().toString());
+    });
 
   // minimise window to tray
   mainWindow.on("close", (event) => {
@@ -868,8 +979,12 @@ export function createMainWindow() {
 
   // Unlike "close" above, this fires only once the window is actually gone
   // (never on a minimise-to-tray hide), so a picker waiting on it truly has
-  // no answer coming.
-  mainWindow.on("closed", () => cancelPendingPicker("window closed"));
+  // no answer coming. Also the load watchdog's last chance to be cleared --
+  // webContents is gone by the time its timer would otherwise fire.
+  mainWindow.on("closed", () => {
+    clearLoadWatchdog();
+    cancelPendingPicker("window closed");
+  });
 
   // update tray menu when window is shown/hidden
   mainWindow.on("show", updateTrayMenu);
