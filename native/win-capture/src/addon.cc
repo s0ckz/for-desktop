@@ -280,7 +280,11 @@ struct StagingSlot {
 };
 StagingSlot g_stagingRing[kStagingRingSize];
 int g_stagingRingIndex = 0;   // next slot ProcessFrame will CopyResource into
-int g_stagingRingFilled = 0;  // slots written at least once since the last EnsurePipeline rebuild, capped at kStagingRingSize
+// Priming counter, not a slot-written count: it only ever climbs to
+// kStagingRingSize - 1 (see ProcessFrame's priming check) -- the point at
+// which the slot about to be read next already has real content, one whole
+// frame interval old, not kStagingRingSize (every slot ever written).
+int g_stagingRingFilled = 0;
 
 // The frame pool's own buffer size, tracked separately from g_srcW/g_srcH --
 // see EnsurePool.
@@ -613,12 +617,64 @@ std::atomic<uint64_t> g_framesRefused{0};
  */
 std::atomic<uint64_t> g_poolResizes{0};
 
+/**
+ * Times ProcessFrame's Map(readSlot, D3D11_MAP_FLAG_DO_NOT_WAIT) returned
+ * DXGI_ERROR_WAS_STILL_DRAWING, cumulative for this session -- see the
+ * comment on that branch for why this is an ordinary pacing drop, not a
+ * failure. It used to be silent: the early `return true` reported nothing,
+ * so a run of these -- e.g. every frame, if the missing Flush() this counter
+ * was added alongside were ever reintroduced -- looked identical to a
+ * healthy session that simply had nothing to deliver. Reported alongside
+ * `refused`/`poolResizes` so the 10s summary in screenCapture.ts can name
+ * this specific stage instead of a share that produces nothing being
+ * indistinguishable from one that was never asked to produce anything.
+ */
+std::atomic<uint64_t> g_framesStillDrawing{0};
+
+/**
+ * Times CaptureThread's frame->get_SystemRelativeTime() read failed, or
+ * "succeeded" with Duration == 0, and pacing fell back to QpcNow100ns()
+ * instead -- cumulative for this session. See QpcNow100ns's own doc comment
+ * for why a failed read must never be treated as a genuine 0. Surfaced the
+ * same way as the other counters above so screenCapture.ts can log once, on
+ * the 0 -> nonzero edge, rather than the native side owning a log line of
+ * its own -- see this file's SetErrorText/lastError() split for why a
+ * transient, self-recovering condition like this one does not belong there.
+ */
+std::atomic<uint64_t> g_timestampFallbacks{0};
+
+/**
+ * Times CaptureThread's pacing clock reset because `ts` (from whichever of
+ * get_SystemRelativeTime()/QpcNow100ns() was used for this frame -- see
+ * g_timestampFallbacks just above) landed BEFORE lastDeliveredTs instead of
+ * merely too close to it -- cumulative for this session. Deliberately a
+ * separate counter from g_timestampFallbacks, not a reuse of it: falling
+ * back to QpcNow100ns() and hitting this backward jump are not the same
+ * event. A session can use the fallback on every frame after the first
+ * without ever landing here (the QPC-derived value stays consistently ahead
+ * of lastDeliveredTs), and this can just as well fire coming BACK OUT of the
+ * fallback -- a genuine, smaller get_SystemRelativeTime() read following a
+ * larger QpcNow100ns() one -- which never touches g_timestampFallbacks at
+ * all, since that frame took the successful-read branch. Counting them
+ * together would blur "we used a substitute clock" (harmless by itself, per
+ * QpcNow100ns's doc comment) with "the two clocks just disagreed about
+ * order" (the actual precondition for the stall this counter exists to make
+ * visible -- see the re-baseline just above the pacing check in
+ * CaptureThread for the fix, and QpcNow100ns's doc comment for why the
+ * re-baseline, not this counter, is what keeps it from recurring).
+ */
+std::atomic<uint64_t> g_timestampDiscontinuities{0};
+
 // Named (not an inline lambda at the call site) so Emit() below can pass it
 // to more than one NonBlockingCall attempt when retrying a death payload.
 void EmitToJs(Napi::Env env, Napi::Function cb, FramePayload* p) {
   auto meta = Napi::Object::New(env);
   meta.Set("refused", Napi::Number::New(env, static_cast<double>(g_framesRefused.load())));
   meta.Set("poolResizes", Napi::Number::New(env, static_cast<double>(g_poolResizes.load())));
+  meta.Set("stillDrawing", Napi::Number::New(env, static_cast<double>(g_framesStillDrawing.load())));
+  meta.Set("timestampFallbacks", Napi::Number::New(env, static_cast<double>(g_timestampFallbacks.load())));
+  meta.Set("timestampDiscontinuities",
+           Napi::Number::New(env, static_cast<double>(g_timestampDiscontinuities.load())));
   if (p->isDeath) {
     // No pixel buffer for a death signal -- see FramePayload::isDeath.
     meta.Set("reason", Napi::String::New(env, p->reason));
@@ -810,6 +866,21 @@ bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH, double time
   g_stagingRing[writeSlot].timestampUs = timestampUs;
   g_stagingRingIndex = (writeSlot + 1) % kStagingRingSize;
 
+  // CopyResource above only *records* the GPU->CPU copy into the immediate
+  // context's command list -- it does not submit it, and with no Present()
+  // anywhere in this headless capture path nothing else submits it either,
+  // short of the driver eventually auto-flushing on a full command buffer
+  // (bursty at best, and in practice never happens before the caller gives
+  // up). Flush() here is what actually hands the copy to the GPU. Without
+  // it, Map(..., D3D11_MAP_FLAG_DO_NOT_WAIT) below has nothing to poll but
+  // work that was never submitted, so it returns DXGI_ERROR_WAS_STILL_DRAWING
+  // -- forever, not just on the rare occasion the comment above the read
+  // slot describes -- and this function never delivers a single frame. This
+  // is a plain Flush(), not a wait: it costs a driver call to hand off the
+  // command list, not a pipeline stall, so it does not undo the point of
+  // moving Map() to DO_NOT_WAIT above.
+  g_context->Flush();
+
   // The first kStagingRingSize-1 frames after Start() or after EnsurePipeline
   // resets this ring (a resize or a setTarget() -- see its own comment) have
   // no N-1 slot with real content to read: every slot is a freshly created,
@@ -817,9 +888,22 @@ bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH, double time
   // not a failure -- CaptureThread already treats "no Emit() this iteration"
   // as an ordinary drop (the same path a too-fast frame or a still-drawing
   // GPU takes), so the caller sees no difference from any other skipped
-  // frame; it is just guaranteed for a session's or a rebuild's first couple
-  // of frames instead of merely likely.
-  if (g_stagingRingFilled < kStagingRingSize) {
+  // frame; it is just guaranteed for a session's or a rebuild's first
+  // kStagingRingSize-1 frame(s) instead of merely likely.
+  //
+  // Compared against kStagingRingSize - 1, not kStagingRingSize: filled==0
+  // means writeSlot's own copy (just issued above) is the only content the
+  // ring has ever held, so priming this call's own return is correct. But by
+  // the very next call filled==1 already means kStagingRingSize-1 (==1 for
+  // the current ring depth) slots have been written at least once -- the
+  // slot this call is about to read (a DIFFERENT slot than the one just
+  // written, see readSlot below) already has real content from the previous
+  // call, one whole frame interval old, exactly like the steady-state case.
+  // The old `< kStagingRingSize` bound primed for filled 0 AND 1, discarding
+  // a second frame that was already readable, on every EnsurePipeline
+  // rebuild -- and `0c836e28` made those rebuilds happen on every quality
+  // change, not just at session start.
+  if (g_stagingRingFilled < kStagingRingSize - 1) {
     g_stagingRingFilled++;
     return true;
   }
@@ -831,7 +915,12 @@ bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH, double time
   if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
     // Not a failure -- see the comment above this block. The pixels are not
     // lost, only this call's chance to read them; readSlot's own content
-    // gets another chance once the ring cycles back to it.
+    // gets another chance once the ring cycles back to it. Counted (not
+    // just silently returned) so a session that skips every single frame
+    // this way -- e.g. the Flush() above being lost again some future PR --
+    // is visible in the 10s summary (screenCapture.ts) instead of looking
+    // identical to a healthy session with nothing to deliver.
+    g_framesStillDrawing.fetch_add(1, std::memory_order_relaxed);
     return true;
   }
   if (FAILED(hr)) {
@@ -921,10 +1010,30 @@ bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH, double time
 // anything real.
 // ---------------------------------------------------------------------------
 
+// This handler MUST be agile. The frame pool it subscribes to (created above
+// via CreateFreeThreaded) is itself free-threaded, and a free-threaded
+// source is entitled to raise FrameArrived on whatever thread pool thread it
+// pleases -- never guaranteed to be the thread that called add_FrameArrived.
+// WinRT enforces that guarantee at subscription time, not delivery time: the
+// free-threaded frame pool's add_FrameArrived calls QueryInterface for
+// IAgileObject on the handler it's given, and if that fails, refuses the
+// subscription outright with RO_E_MUST_BE_AGILE (0x8000001C) rather than
+// risk marshalling a non-agile object across apartments later. Plain
+// RuntimeClassFlags<ClassicCom> gets none of that: it's a bare classic-COM
+// object with no apartment/marshalling story of its own, so it fails that
+// QueryInterface. Adding Microsoft::WRL::FtmBase to the template list mixes
+// in IAgileObject (satisfying the check) plus the free-threaded marshaler's
+// IMarshal implementation (satisfying the ACTUAL cross-apartment call once
+// subscribed) -- both for free, without changing anything about how Invoke()
+// runs or on which thread. Do not remove FtmBase: without it, add_FrameArrived
+// fails every single time against a free-threaded pool, silently -- the
+// event-driven capture path never fires and every share falls back to
+// Chromium's capturer with only a log line (see SetError below) to show why.
 class FrameArrivedHandler
     : public Microsoft::WRL::RuntimeClass<
           Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
-          ABI::Windows::Foundation::ITypedEventHandler<WGC::Direct3D11CaptureFramePool*, IInspectable*>> {
+          ABI::Windows::Foundation::ITypedEventHandler<WGC::Direct3D11CaptureFramePool*, IInspectable*>,
+          Microsoft::WRL::FtmBase> {
  public:
   HRESULT RuntimeClassInitialize(HANDLE frameEvent) {
     frameEvent_.store(frameEvent, std::memory_order_release);
@@ -950,6 +1059,64 @@ class FrameArrivedHandler
  private:
   std::atomic<HANDLE> frameEvent_{nullptr};  // not owned; CaptureThread owns and closes it
 };
+
+/**
+ * Monotonic fallback for frame delivery pacing, in the same 100ns units as
+ * frame->get_SystemRelativeTime() (see CaptureThread's pacing comment above
+ * nextDeliverTs/lastDeliveredTs).
+ *
+ * get_SystemRelativeTime() can fail, and -- observed in the wild, not just
+ * hypothesised -- some drivers hand back a "successful" HRESULT with
+ * Duration == 0. Either way, the caller must never treat that as a genuine
+ * timestamp: the pacing check below is `ts < nextDeliverTs`, and nothing but
+ * an actual delivery ever advances nextDeliverTs. A `ts` of exactly 0 only
+ * costs one dropped frame if nextDeliverTs was already ahead of it -- but if
+ * THIS were the very first frame of the session, nextDeliverTs would latch
+ * onto `0 + interval100ns` as the schedule's starting point, and every later
+ * frame's own (also fabricated-as-0-on-failure, or worse, genuinely small)
+ * value would keep failing to reach that mark, permanently. A single bad
+ * read used to be enough to end delivery for the rest of the session with
+ * nothing in the logs to explain why -- which is exactly why `ts` is never
+ * allowed to actually be a fabricated 0 in the first place: substituting
+ * QpcNow100ns() below keeps `ts` itself genuinely, unboundedly advancing
+ * even when get_SystemRelativeTime() never recovers, so the schedule stays
+ * reachable.
+ *
+ * QueryPerformanceCounter is this thread's own monotonic wall clock -- not
+ * comparable to WGC's SystemRelativeTime in absolute terms (different
+ * epochs), and pacing here compares a given `ts` against either the running
+ * delivery schedule (nextDeliverTs) or the previously delivered frame's own
+ * timestamp (lastDeliveredTs, kept solely for the discontinuity guard) -- so
+ * switching which clock backs `ts`, in either direction, can make either of
+ * those comparisons land wrong instead of merely imprecise. Left unguarded,
+ * that is not "at most one wrongly-paced frame": a `ts` from the new clock
+ * landing far behind the old clock's epoch would fail `ts < nextDeliverTs`
+ * forever, since nothing but a delivery advances nextDeliverTs -- the exact
+ * same permanent-stall shape described above, just triggered by a clock
+ * switch instead of a fabricated 0. What actually makes the epoch mismatch
+ * survivable is CaptureThread's own discontinuity guard, immediately before
+ * the pacing check: any `ts` that reads BEFORE lastDeliveredTs re-baselines
+ * pacing (resets both lastDeliveredTs and nextDeliverTs to the "take the
+ * next frame unconditionally" sentinel) the moment it happens, rather than
+ * trusting the two clocks to ever agree on absolute values. With that guard
+ * in place, a one-time epoch mismatch on the frame where a clock switch
+ * happens costs at most one re-baselined frame, not a stall -- see
+ * g_timestampDiscontinuities for the counter that makes a session which
+ * actually hits this leave a trace.
+ * QueryPerformanceFrequency cannot fail on any Windows version this addon
+ * targets (Vista+); the cached frequency is read once and reused, same
+ * reasoning as every other per-process-constant cache in this file.
+ */
+double QpcNow100ns() {
+  static const LARGE_INTEGER kFrequency = [] {
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    return f;
+  }();
+  LARGE_INTEGER counter;
+  QueryPerformanceCounter(&counter);
+  return static_cast<double>(counter.QuadPart) * 1.0e7 / static_cast<double>(kFrequency.QuadPart);
+}
 
 // ---------------------------------------------------------------------------
 // Capture thread: owns the whole session lifetime. FrameArrived (subscribed
@@ -1138,6 +1305,17 @@ void CaptureThread(HWND hwnd) {
     // when a fixed-cadence poll landed.
     double lastDeliveredTs = -1.0;  // 100ns units; negative = "always take the first frame"
 
+    // The delivery SCHEDULE, distinct from lastDeliveredTs just above (which
+    // exists purely to feed the discontinuity guard in the loop below).
+    // Advanced by exactly one interval100ns per delivery, never by a delta
+    // computed from `ts` -- see the comment above the pacing check in the
+    // loop for why a delta from the last DELIVERED frame aliases against
+    // certain source/target fps ratios and an evenly-ticking schedule does
+    // not. Same sentinel convention as lastDeliveredTs: negative means "no
+    // schedule yet -- take the next frame unconditionally", which is also
+    // how a clock-discontinuity re-baseline (below) un-parks it.
+    double nextDeliverTs = -1.0;
+
     // nextTick now only drives pacingTimer -- see that HANDLE's own comment
     // above for why it no longer has any say in which frames get delivered.
     auto nextTick = std::chrono::steady_clock::now();
@@ -1219,19 +1397,117 @@ void CaptureThread(HWND hwnd) {
       if (!frame) continue;  // nothing new since last wait
 
       // Pace on the frame's own timestamp -- see the comment above
-      // lastDeliveredTs's declaration for why wall-clock time would not do.
-      // 0.9x instead of a strict >= interval100ns leaves headroom for
-      // ordinary sub-frame jitter in exactly when WGC stamps (and this
-      // thread observes) each present -- without it, a delivery landing a
-      // hair under one full interval late would be pushed out to two
-      // intervals instead of one.
+      // lastDeliveredTs's declaration for why wall-clock time would not do --
+      // against a running SCHEDULE (nextDeliverTs), not a delta from the
+      // last DELIVERED frame. This used to be delta-based: drop unless
+      // `(ts - lastDeliveredTs) >= 0.9 * interval100ns`, i.e. unless the new
+      // frame landed at least ~0.9 intervals past the previous DELIVERY.
+      // That aliases badly whenever the source's own interval does not
+      // divide evenly into the target interval, because each delivery moves
+      // the base the next comparison is measured from, so a shortfall never
+      // averages out -- it repeats every single time. Concretely, a 70fps
+      // source into a 30fps target: target interval 33.33ms, 0.9x threshold
+      // 30ms, source interval 14.29ms. 1 source interval (14.29ms) is below
+      // 30ms -- drop. 2 (28.57ms) are STILL below it, by 1.4ms -- drop. 3
+      // (42.86ms) finally clears it -- deliver. Every delivered frame resets
+      // the base to itself, so this 1-in-3 pattern holds for the entire
+      // session: 70/3 = 23.3fps delivered, never the 30fps target, no matter
+      // how long the share runs (this is the exact shape measured in
+      // production: 24.7fps delivered against a 30fps target). A schedule
+      // does not have this failure mode because it never re-bases on the
+      // frame that happened to satisfy it: nextDeliverTs ticks forward by
+      // exactly one interval100ns per delivery regardless of how early or
+      // late the frame that crossed it arrived, so every 33.33ms window
+      // takes exactly one frame -- whichever source frame is first to reach
+      // it -- and the long-run delivered rate is min(sourceFps, targetFps)
+      // for any source/target ratio, not just the ones that divide evenly
+      // (144fps into 60fps: one frame every ~16.67ms window, i.e. 60fps
+      // delivered, not some 144-vs-60 aliased rate). The old 0.9x fudge
+      // factor existed purely to absorb jitter under delta-based pacing -- a
+      // frame landing a hair under one full interval since the last
+      // DELIVERY still needed to count as "on time" instead of being pushed
+      // out an extra interval. Schedule-based pacing needs no equivalent: a
+      // frame arriving before nextDeliverTs simply is not this window's
+      // frame yet, and the next frame to reach the mark is -- there is no
+      // "last delivery" for jitter to be measured against, so nothing here
+      // needs fudging.
       ABI::Windows::Foundation::TimeSpan relativeTime{};
       hr = frame->get_SystemRelativeTime(&relativeTime);
-      const double ts = SUCCEEDED(hr) ? static_cast<double>(relativeTime.Duration) : 0.0;
-      if (lastDeliveredTs >= 0.0 && (ts - lastDeliveredTs) < 0.9 * interval100ns) {
-        continue;  // faster than the requested delivery rate -- drop (Release only, same as any other drop)
+      // FAILED(hr) is the obvious failure; Duration == 0 is the one observed
+      // in the wild that is not -- some drivers report S_OK with a zero
+      // timestamp. Both get the same fallback: a fabricated 0.0 here is
+      // indistinguishable from a genuine one to the pacing check below, and
+      // if nextDeliverTs ever latched onto a fabricated 0's schedule, every
+      // later frame's own (also-possibly-fabricated) value could keep
+      // failing to reach it -- see QpcNow100ns's doc comment for the full
+      // failure mode this replaces.
+      double ts;
+      if (SUCCEEDED(hr) && relativeTime.Duration != 0) {
+        ts = static_cast<double>(relativeTime.Duration);
+      } else {
+        ts = QpcNow100ns();
+        g_timestampFallbacks.fetch_add(1, std::memory_order_relaxed);
+      }
+      // Guard against a clock discontinuity before trusting the pacing check
+      // below at all. `ts` above can come from either clock on any given
+      // frame -- a genuine frame->get_SystemRelativeTime() read, or the
+      // QpcNow100ns() fallback -- and those two are not comparable in
+      // absolute terms (different epochs; see QpcNow100ns's doc comment).
+      // Whenever this session switches from one to the other -- entering the
+      // fallback, leaving it, or flapping between the two on alternating
+      // frames if a driver's Duration==0 glitch is itself intermittent -- the
+      // new `ts` can land BEFORE lastDeliveredTs, not just too close to it.
+      // Falling through to the pacing check below with nextDeliverTs still
+      // anchored to a schedule built from an earlier reading on the OTHER
+      // clock would be wrong in exactly the way this guard exists to fix:
+      // `ts < nextDeliverTs` would be satisfied forever, since nextDeliverTs
+      // is a schedule the new clock's `ts` values may never reach, and
+      // nothing but an actual delivery ever advances it -- so every later
+      // frame this session would be dropped, silently, for the same
+      // structural reason the fabricated-0 bug was (see QpcNow100ns's doc
+      // comment), just reached by a clock switch instead of a fabricated
+      // value. Re-baseline instead of clamping or skipping: reset BOTH
+      // lastDeliveredTs and nextDeliverTs to the same "always take the next
+      // frame"/"no schedule yet" sentinel the very first frame of the
+      // session uses, so this frame is delivered unconditionally, a fresh
+      // schedule starts from it, and every frame after it paces off
+      // whichever clock is now in use. Resetting only one of the two would
+      // not be enough to fix anything: nextDeliverTs is what the pacing
+      // check below actually tests, so leaving it parked at the old clock's
+      // epoch would keep rejecting every subsequent frame even after
+      // lastDeliveredTs itself was cleared -- exactly the kind of
+      // permanently-stalled schedule this whole guard exists to prevent.
+      if (lastDeliveredTs >= 0.0 && ts < lastDeliveredTs) {
+        g_timestampDiscontinuities.fetch_add(1, std::memory_order_relaxed);
+        lastDeliveredTs = -1.0;
+        nextDeliverTs = -1.0;
+      }
+      if (nextDeliverTs >= 0.0 && ts < nextDeliverTs) {
+        continue;  // before the next scheduled delivery -- drop (Release only, same as any other drop)
       }
       lastDeliveredTs = ts;
+      if (nextDeliverTs < 0.0) {
+        // First delivery this session, or the first since a re-baseline
+        // above: start the schedule exactly one interval past this frame.
+        nextDeliverTs = ts + interval100ns;
+      } else {
+        nextDeliverTs += interval100ns;
+        if (nextDeliverTs <= ts) {
+          // The schedule fell a full interval or more behind `ts` -- the
+          // source stalled, this thread got descheduled for a while, or
+          // setFps() just changed the target rate out from under a schedule
+          // computed for the old one. Resync to this frame instead of
+          // leaving nextDeliverTs in the past: ticking it forward one
+          // interval100ns at a time from here would let every frame until
+          // the deficit is paid off through as a burst of catch-up
+          // deliveries, which is exactly the "producing nothing, then
+          // everything at once" failure this file has already had to fix in
+          // more than one shape (see nextTick's own resync above, and its
+          // comment on why repeatedly adding one interval to a stale base is
+          // a busy-spin waiting to happen).
+          nextDeliverTs = ts + interval100ns;
+        }
+      }
 
       WG::SizeInt32 contentSize{};
       frame->get_ContentSize(&contentSize);
@@ -1596,6 +1872,9 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
   // Per-session, so a later share does not inherit an earlier one's count.
   g_framesRefused.store(0);
   g_poolResizes.store(0);
+  g_framesStillDrawing.store(0);
+  g_timestampFallbacks.store(0);
+  g_timestampDiscontinuities.store(0);
   g_running.store(true);
   g_thread = std::thread(CaptureThread, hwnd);
   return Napi::Boolean::New(env, true);

@@ -134,6 +134,15 @@ contextBridge.exposeInMainWorld("native", {
     // straight into app-audio.log where the rest of this diagnosis lives.
     log: (message: string) =>
       ipcRenderer.send("screenCapture:pageLog", message),
+    // Per-frame drop counter (plan PR "no frames" item 6), distinct from
+    // `log` above -- this fires on every drop the injected patch sees (a
+    // `new VideoFrame(...)` construction failure so far), not once per
+    // session, so screenCapture.ts's 10s rolling summary can report a count
+    // for this window instead of only a one-shot log line. `stage` names
+    // which drop this was; screenCapture.ts validates it, the same distrust
+    // as every other value crossing this bridge from a remote page.
+    reportDrop: (stage: string) =>
+      ipcRenderer.send("screenCapture:pageDrop", stage),
     // Delivered over the dedicated port wired above, not a plain
     // `ipcRenderer` channel -- see `FRAME_PORT_CHANNEL`'s doc comment. The
     // shape of this call is unchanged (register a handler, get an
