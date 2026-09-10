@@ -82,8 +82,12 @@ contextBridge.exposeInMainWorld("native", {
   // Wait for a screen share that Chromium ended -- a window that toggled
   // fullscreen or was minimised -- to become shareable again. Resolves true
   // once the main process has the window lined up, at which point re-requesting
-  // getDisplayMedia is answered with it and no picker appears.
-  reacquireScreenShare: (): Promise<boolean> =>
+  // getDisplayMedia is answered with it and no picker appears. Resolves the
+  // terminal string "gone" instead when the shared window is confirmed
+  // destroyed (closed, not just minimised/occluded) -- for-web treats that as
+  // "stop retrying and end the share" rather than parking it forever; a bare
+  // `false` still means "not found yet, keep trying".
+  reacquireScreenShare: (): Promise<boolean | "gone"> =>
     ipcRenderer.invoke("screenShare:reacquire"),
 
   // Per-application screen share audio (Windows). The injected main-world

@@ -498,27 +498,46 @@ async function respondToDisplayMedia(
 }
 
 /**
- * Look for the remembered window among the sources on offer: same id first,
- * then any window of the same process, preferring an identical title. WGC
- * refuses minimised windows, so an iconic match does not count as found.
+ * Enumerate capturable windows for the reacquire poll -- shared by
+ * `findRememberedWindow` and `isWindowConfirmedGone` so a single poll tick
+ * only ever enumerates once, not once per caller.
+ *
+ * `thumbnailSize` defaults to 150x150, which makes Electron capture a live
+ * frame of *every* window on the system. Chromium does that through the
+ * Windows Graphics Capture window capturer, so each call builds and tears
+ * down a WGC item plus a D3D11 frame pool per window -- once a second, for
+ * as long as this poll runs. That is enough to wedge dwm.exe and take the
+ * shell (alt-tab, Start menu) down with it. We only read ids, names and
+ * pids, so ask for no thumbnails at all.
  */
-async function findRememberedWindow(target: {
-  sourceId: string;
-  pid: number;
-  name: string;
-}): Promise<Electron.DesktopCapturerSource | null> {
-  // `thumbnailSize` defaults to 150x150, which makes Electron capture a live
-  // frame of *every* window on the system. Chromium 150 does that through the
-  // Windows Graphics Capture window capturer, so each call builds and tears
-  // down a WGC item plus a D3D11 frame pool per window -- once a second, for
-  // as long as this poll runs. That is enough to wedge dwm.exe and take the
-  // shell (alt-tab, Start menu) down with it. We only read ids, names and
-  // pids, so ask for no thumbnails at all.
-  const sources = await desktopCapturer.getSources({
+function getCapturableWindowSources(): Promise<
+  Electron.DesktopCapturerSource[]
+> {
+  return desktopCapturer.getSources({
     types: ["window"],
     thumbnailSize: { width: 0, height: 0 },
   });
+}
 
+/**
+ * Look for the remembered window among a fresh `getCapturableWindowSources()`
+ * enumeration: same id first, then any window of the same process,
+ * preferring an identical title. WGC refuses minimised windows, so an
+ * iconic match does not count as found.
+ *
+ * Takes `sources` rather than fetching them itself -- the caller (the
+ * reacquire poll below) enumerates once per tick and passes the same list
+ * to this and to `isWindowConfirmedGone`, rather than each doing its own
+ * `desktopCapturer.getSources()` call.
+ */
+function findRememberedWindow(
+  sources: Electron.DesktopCapturerSource[],
+  target: {
+    sourceId: string;
+    pid: number;
+    name: string;
+  },
+): Electron.DesktopCapturerSource | null {
   const capturable = (source: Electron.DesktopCapturerSource) => {
     const state = windowStateForSourceId(source.id);
     // No native module means no way to tell; take the source at face value.
@@ -535,9 +554,19 @@ async function findRememberedWindow(target: {
   const samePid = sources.filter(
     (source) => pidForSourceId(source.id) === target.pid && capturable(source),
   );
-  return (
-    samePid.find((source) => source.name === target.name) ?? samePid[0] ?? null
-  );
+  const nameMatch = samePid.find((source) => source.name === target.name);
+  if (nameMatch) return nameMatch;
+  // Only safe to guess when there is nothing to disambiguate from: the
+  // fullscreen-toggle recovery this fallback exists for is one recreated
+  // window on the same process, so if that process now offers exactly one
+  // capturable window, it has to be the one we were sharing. With several
+  // candidate windows and no name match, guessing which one the user meant
+  // to keep sharing would silently rebind the share to a window they never
+  // picked -- a second flavour of "closing the window doesn't stop the
+  // share", and a privacy leak (the viewer starts seeing something the
+  // sharer didn't choose). Treat that case as not-found instead; the
+  // reacquire handler's `"gone"` / retry logic takes it from there.
+  return samePid.length === 1 ? samePid[0] : null;
 }
 
 /**
@@ -581,17 +610,6 @@ async function primaryScreenSource(): Promise<Electron.DesktopCapturerSource | n
 }
 
 /**
- * Wait for the last shared window to come back.
- *
- * Chromium ends the capture track when the shared window is destroyed (an app
- * toggling fullscreen recreates its window) or minimised, and the web client
- * tears the share down. It calls this, and on `true` re-requests
- * getDisplayMedia -- which we then answer with the window we found.
- *
- * Resolves false on timeout, if there is nothing to re-acquire, or if another
- * call supersedes this one.
- */
-/**
  * A quality change on a share that is already running.
  *
  * for-web resolves its picker *after* `setScreenShareEnabled`, so the chosen
@@ -612,7 +630,59 @@ ipcMain.on("screenCapture:setFps", (_event, fps: unknown) => {
   setScreenCaptureFps(cap !== null ? Math.min(fps, cap) : fps);
 });
 
-ipcMain.handle("screenShare:reacquire", async () => {
+/**
+ * Whether a window share's target is confirmed destroyed rather than merely
+ * unreachable right now (minimised, hidden, or a transient enumeration
+ * miss). Only ever called for window shares -- a screen cannot be "closed",
+ * so screen shares never resolve `"gone"` (see the reacquire handler below).
+ *
+ * Two independent signals have to agree before we call it gone:
+ *  - `windowStateForSourceId` (native, HWND-based) reports `exists: false`.
+ *    `exists` is deliberately the only field this checks: `visible`/`iconic`
+ *    govern the "hold the session open while minimised/occluded" path in
+ *    screenCapture.ts (see its doc comment there) and must never be
+ *    conflated with "destroyed" -- a minimised window still exists and must
+ *    keep taking the ordinary retry path, never `"gone"`.
+ *  - No source in a fresh enumeration shares the remembered pid either, so
+ *    this isn't just the same window re-appearing under a new id (the
+ *    fullscreen-toggle case `findRememberedWindow`'s same-pid fallback
+ *    already handles that without ever reaching here).
+ *
+ * Requiring both guards against `windowStateForSourceId` returning stale
+ * cached state for a handle the OS has already recycled, and against a
+ * native-module hiccup on one signal alone.
+ */
+function isWindowConfirmedGone(
+  sources: Electron.DesktopCapturerSource[],
+  target: {
+    sourceId: string;
+    pid: number;
+  },
+): boolean {
+  const state = windowStateForSourceId(target.sourceId);
+  if (state === null || state.exists) return false;
+  if (!target.pid) return true;
+  return !sources.some((source) => pidForSourceId(source.id) === target.pid);
+}
+
+/**
+ * Wait for the last shared window to come back.
+ *
+ * Chromium ends the capture track when the shared window is destroyed (an app
+ * toggling fullscreen recreates its window) or minimised, and the web client
+ * tears the share down. It calls this, and on `true` re-requests
+ * getDisplayMedia -- which we then answer with the window we found.
+ *
+ * Resolves `true` when found, `false` if there is nothing to re-acquire yet
+ * (still minimised/hidden, timed out after REACQUIRE_TIMEOUT_MS, the native
+ * module is unavailable, or another call superseded this one), and `"gone"`
+ * when a window share's target is confirmed destroyed (see
+ * `isWindowConfirmedGone`) -- a terminal verdict resolved immediately rather
+ * than running out the poll, so for-web can end the share instead of parking
+ * it forever. Screen shares never resolve `"gone"`: a display cannot be
+ * "closed".
+ */
+ipcMain.handle("screenShare:reacquire", async (): Promise<boolean | "gone"> => {
   const target = lastShare;
   if (!target) {
     appAudioLog("reacquire: no remembered share");
@@ -655,11 +725,20 @@ ipcMain.handle("screenShare:reacquire", async () => {
       return false;
     }
 
+    // Window sources are enumerated at most once per tick here and handed to
+    // both `findRememberedWindow` and `isWindowConfirmedGone` below, rather
+    // than each making its own `desktopCapturer.getSources()` call -- see
+    // `getCapturableWindowSources`'s doc comment for why a second guess-at-
+    // every-window enumeration per tick is worth avoiding.
+    let windowSources: Electron.DesktopCapturerSource[] | null = null;
     let match: Electron.DesktopCapturerSource | null = null;
     try {
-      match = isWindow
-        ? await findRememberedWindow(target)
-        : await findRememberedScreen(target);
+      if (isWindow) {
+        windowSources = await getCapturableWindowSources();
+        match = findRememberedWindow(windowSources, target);
+      } else {
+        match = await findRememberedScreen(target);
+      }
     } catch (err) {
       appAudioLog("reacquire: could not list sources:", String(err));
     }
@@ -668,6 +747,22 @@ ipcMain.handle("screenShare:reacquire", async () => {
       appAudioLog("reacquire: found", match.id, match.name);
       armedShare = { source: match, audio: target.audio, at: Date.now() };
       return true;
+    }
+
+    // A window share whose target is confirmed destroyed has no reason to
+    // burn the rest of REACQUIRE_TIMEOUT_MS -- it is never coming back, so
+    // resolve a terminal "gone" right away instead of polling out the clock.
+    // Screen shares skip this: a display cannot be "closed", so they only
+    // ever resolve true/false, unchanged. `windowSources` can be `null` here
+    // if the enumeration above threw -- skip the gone-check rather than
+    // guess at destruction from no data.
+    if (
+      isWindow &&
+      windowSources &&
+      isWindowConfirmedGone(windowSources, target)
+    ) {
+      appAudioLog("reacquire: window confirmed destroyed, giving up early");
+      return "gone";
     }
 
     await new Promise((resolve) => setTimeout(resolve, pollMs));
