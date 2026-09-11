@@ -60,6 +60,12 @@ contextBridge.exposeInMainWorld("native", {
 
   setBadgeCount: (count: number) => ipcRenderer.send("setBadgeCount", count),
 
+  // Lets the main process know whether a voice call is currently active, so
+  // it can gate the F5/Ctrl+R reload shortcut behind a confirmation instead
+  // of silently dropping the call -- see the `voice:inCall` handler and the
+  // `before-input-event` listener in native/window.ts.
+  setInCall: (inCall: boolean) => ipcRenderer.send("voice:inCall", inCall),
+
   onceScreenPicker: (
     onScreenPick: (
       sources: {

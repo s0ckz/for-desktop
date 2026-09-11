@@ -7,6 +7,7 @@ import {
   MessageChannelMain,
   app,
   desktopCapturer,
+  dialog,
   ipcMain,
   nativeImage,
   session,
@@ -86,6 +87,26 @@ function resolveBuildUrl(): URL {
 
 // internal window state
 let shouldQuit = false;
+
+/**
+ * Whether the page currently reports a live voice call -- see the
+ * `voice:inCall` handler below. Gates the F5/Ctrl+R reload shortcut in
+ * `before-input-event`: with no call active, behaviour is unchanged from
+ * before this flag existed (immediate reload, no dialog), which is also
+ * what an old for-web build that never sends `voice:inCall` gets, since the
+ * flag simply never leaves its `false` default.
+ */
+let inCall = false;
+
+/**
+ * Guards against a stacked pile of confirm dialogs if the user mashes F5 (or
+ * Ctrl+R) while one is already up -- `showMessageBox` is async, so without
+ * this every additional press before the first dialog resolves would open
+ * another. Reset in the dialog's own `finally` so a throw from
+ * `showMessageBox` itself can never leave it stuck `true` and lock out every
+ * later reload attempt for the rest of the session.
+ */
+let reloadConfirmOpen = false;
 
 // load the window icon
 const windowIcon = nativeImage.createFromDataURL(windowIconAsset);
@@ -631,6 +652,26 @@ ipcMain.on("screenCapture:setFps", (_event, fps: unknown) => {
 });
 
 /**
+ * The renderer's own record of whether a voice call is live -- see
+ * `Voice`'s effect on `channel` in for-web's rtc state, which is the single
+ * place that reports every path in and out of a call (join, leave, channel
+ * switch, unexpected drop, auto-rejoin). Reload (F5/Ctrl+R) in
+ * `before-input-event` below reads this flag to decide whether to confirm
+ * first instead of reloading immediately.
+ *
+ * Crosses IPC from a remote page, so the payload is validated the same way
+ * `screenCapture:setFps` above validates its own -- an unexpected shape is
+ * logged and ignored rather than trusted.
+ */
+ipcMain.on("voice:inCall", (_event, value: unknown) => {
+  if (typeof value !== "boolean") {
+    appAudioLog("voice: ignoring invalid inCall value:", value);
+    return;
+  }
+  inCall = value;
+});
+
+/**
  * Whether a window share's target is confirmed destroyed rather than merely
  * unreachable right now (minimised, hidden, or a transient enumeration
  * miss). Only ever called for window shares -- a screen cannot be "closed",
@@ -945,6 +986,11 @@ export function createMainWindow() {
     );
     console.error("RENDERER CRASHED:", details.reason, details.exitCode);
     cancelPendingPicker("renderer process gone");
+    // Whatever call the page thought it was in died with the renderer --
+    // clear the flag so a subsequent reload (recovering from the crash)
+    // isn't wrongly gated behind a "you're in a call" confirmation for a
+    // call that no longer exists.
+    inCall = false;
   });
 
   mainWindow.webContents.on("unresponsive", () => {
@@ -979,6 +1025,13 @@ export function createMainWindow() {
     // The picker lived in the page that just went away; whatever answer it
     // would have sent can never arrive now.
     cancelPendingPicker("page reloaded");
+    // A fresh load means a fresh page with no idea whether a call is
+    // active -- it will report in again if one actually is (see the
+    // `voice:inCall` handler's doc comment). Without this reset, a call that
+    // was live right up until this exact reload would leave the flag stuck
+    // `true`, and the *next* F5 press -- with no call left to protect --
+    // would wrongly show the "you're in a call" confirmation for nothing.
+    inCall = false;
 
     // Fresh frame-delivery port (A4 item 2) for this page load. Deliberately
     // re-created on every did-finish-load, including a reload: the previous
@@ -1124,7 +1177,54 @@ export function createMainWindow() {
       ((input.control || input.meta) && input.key.toLowerCase() === "r")
     ) {
       event.preventDefault();
-      mainWindow.webContents.reload();
+      if (!inCall) {
+        // No call active: identical to this handler's behaviour before the
+        // call-aware guard existed, and what an old for-web build that never
+        // sends `voice:inCall` gets forever -- immediate reload, no dialog.
+        mainWindow.webContents.reload();
+        return;
+      }
+      // `before-input-event` is synchronous, but confirming has to wait on
+      // the user, so the reload (if any) happens inside the promise below
+      // rather than this handler returning it.
+      if (reloadConfirmOpen) {
+        // A dialog is already up -- F5 mashed again while it's pending.
+        // Dropping the extra key here (rather than opening a second dialog)
+        // is deliberate: see `reloadConfirmOpen`'s doc comment.
+        return;
+      }
+      reloadConfirmOpen = true;
+      void dialog
+        .showMessageBox(mainWindow, {
+          type: "warning",
+          buttons: ["Reload", "Cancel"],
+          // Both the default (Enter) and the Escape/close-button response
+          // point at Cancel: the whole scenario this guards against is an
+          // *accidental* F5, so a reflexive Enter or Escape right after
+          // pressing it must land on Cancel, not confirm the very reload
+          // being warned about.
+          defaultId: 1,
+          cancelId: 1,
+          title: "Reload Stoat?",
+          message: "You're in a call",
+          detail:
+            "Reloading now will disconnect you from your current voice call.",
+        })
+        .then(({ response }) => {
+          if (response === 0) {
+            mainWindow.webContents.reload();
+          }
+        })
+        .catch((err) => {
+          // A rejection here (e.g. the window was destroyed while the
+          // dialog was up) must not crash this synchronous input handler --
+          // just log it and leave the reload not happening, same as if the
+          // user had cancelled.
+          appAudioLog("reload confirmation dialog failed:", String(err));
+        })
+        .finally(() => {
+          reloadConfirmOpen = false;
+        });
     }
   });
 
