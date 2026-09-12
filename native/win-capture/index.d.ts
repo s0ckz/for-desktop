@@ -78,6 +78,20 @@ declare const winCapture: {
            *  `timestamp`, and the delta between consecutive values as its
            *  `duration` -- see appAudioPatch.ts. */
           timestampUs: number;
+          /** Result of IDXGIDevice1::SetGPUThreadPriority(7), set once per
+           *  session right after device creation -- e.g. "SetGPUThreadPriority(7)=ok"
+           *  or a failure string with the HRESULT. Never fails the session; a
+           *  rejected/unsupported call just means this device's GPU work gets
+           *  no scheduling boost. Same value on every frame this session --
+           *  see addon.cc's g_gpuThreadPriorityInfo. */
+          gpuThreadPriority: string;
+          /** Result of D3DKMTSetProcessSchedulingPriorityClass(..., HIGH), set
+           *  once per session right after device creation -- e.g. a failure
+           *  string with the NTSTATUS is EXPECTED on a normal, non-elevated
+           *  install (this needs SeIncreaseBasePriorityPrivilege). Never fails
+           *  the session. Same value on every frame this session -- see
+           *  addon.cc's g_schedulingPriorityInfo. */
+          schedulingPriority: string;
         },
       ): void;
       /** The one death-signal call on capture-thread exit -- see above. No
@@ -91,6 +105,10 @@ declare const winCapture: {
           stillDrawing: number;
           timestampFallbacks: number;
           timestampDiscontinuities: number;
+          /** See the live-frame signature's doc comment on the same field. */
+          gpuThreadPriority: string;
+          /** See the live-frame signature's doc comment on the same field. */
+          schedulingPriority: string;
           reason: string;
         },
       ): void;

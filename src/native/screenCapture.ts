@@ -360,6 +360,16 @@ let active: {
    *  slot rather than sharing `timestampFallbacks`'s. */
   timestampDiscontinuities: number;
   /**
+   * Whether {@link onFrame} has already logged this session's
+   * `gpuThreadPriority`/`schedulingPriority` outcome (see
+   * native/win-capture/index.d.ts) once. Both are set by CaptureThread a
+   * single time per session, right after device creation, and never change
+   * again for the life of the session -- so unlike `timestampFallbacks`/
+   * `timestampDiscontinuities` above there is no 0 -> nonzero numeric edge to
+   * detect, just a plain "log it once, on the first live frame" flag.
+   */
+  gpuPriorityLogged: boolean;
+  /**
    * Identifies which request started this session. Assigned by window.ts at
    * the top of each display-media request, before any `await` -- so two
    * requests racing through the async chain in `respondToDisplayMedia` still
@@ -653,6 +663,7 @@ export async function startForSource(
     stillDrawing: 0,
     timestampFallbacks: 0,
     timestampDiscontinuities: 0,
+    gpuPriorityLogged: false,
     sessionId,
     summary: {
       windowStartMs: Date.now(),
@@ -706,6 +717,15 @@ type LiveFrameMeta = {
    *  doc comment on the same field for what it's relative to and how the
    *  page patch uses it. */
   timestampUs: number;
+  /** Result of IDXGIDevice1::SetGPUThreadPriority(7), set once per session --
+   *  see index.d.ts's doc comment. Constant for the whole session; {@link
+   *  onFrame} logs it once, on the first live frame. */
+  gpuThreadPriority: string;
+  /** Result of D3DKMTSetProcessSchedulingPriorityClass(..., HIGH), set once
+   *  per session -- see index.d.ts's doc comment. A failure string is
+   *  EXPECTED on a normal, non-elevated install. Constant for the whole
+   *  session; {@link onFrame} logs it once, alongside `gpuThreadPriority`. */
+  schedulingPriority: string;
 };
 
 /** Meta for the one death-signal call on capture-thread exit (`frame` null)
@@ -716,6 +736,8 @@ type DeathFrameMeta = {
   stillDrawing: number;
   timestampFallbacks: number;
   timestampDiscontinuities: number;
+  gpuThreadPriority: string;
+  schedulingPriority: string;
   reason: string;
 };
 
@@ -743,7 +765,7 @@ function onFrame(
     appAudioLog(
       "screen capture: native capture thread exited:",
       death.reason || "(no reason given)",
-      `; refused=${death.refused} poolResizes=${death.poolResizes} stillDrawing=${death.stillDrawing} timestampFallbacks=${death.timestampFallbacks} timestampDiscontinuities=${death.timestampDiscontinuities}`,
+      `; refused=${death.refused} poolResizes=${death.poolResizes} stillDrawing=${death.stillDrawing} timestampFallbacks=${death.timestampFallbacks} timestampDiscontinuities=${death.timestampDiscontinuities} gpuThreadPriority=${death.gpuThreadPriority} schedulingPriority=${death.schedulingPriority}`,
     );
     // onFrame is a native callback, not an async context, so this cannot
     // await -- fire it and move on. Safe to leave unhandled: stop()'s
@@ -806,6 +828,22 @@ function onFrame(
     );
   }
   active.timestampDiscontinuities = live.timestampDiscontinuities;
+
+  // One-shot, not an edge-detect: `gpuThreadPriority`/`schedulingPriority`
+  // are set once by CaptureThread, before its very first live frame, and
+  // never change again this session (see LiveFrameMeta's doc comments), so
+  // "first live frame seen" is the whole condition -- there is no numeric
+  // transition to watch for the way `timestampFallbacks`/
+  // `timestampDiscontinuities` above have one. This is also the earliest
+  // point either result CAN be logged: `start()` (see above) returns as soon
+  // as the capture thread is spawned, well before that thread has even
+  // created the D3D11 device these two calls depend on.
+  if (!active.gpuPriorityLogged) {
+    active.gpuPriorityLogged = true;
+    appAudioLog(
+      `screen capture: native GPU priority for ${active.sourceId}: gpuThreadPriority=${live.gpuThreadPriority} schedulingPriority=${live.schedulingPriority}`,
+    );
+  }
 
   // One-shot, alongside the lastFrameAt update above: the frame watchdog in
   // {@link startWatchdogs} is the only thing that sets `paused`, this is the
