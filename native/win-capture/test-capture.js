@@ -99,6 +99,8 @@ let lastRefused = 0; // cumulative refused-frame count off the most recent frame
 let lastStillDrawing = 0; // cumulative DXGI_ERROR_WAS_STILL_DRAWING skip count off the most recent frame's metadata
 let lastTimestampFallbacks = 0; // cumulative QpcNow100ns() pacing-fallback count off the most recent frame's metadata
 let lastTimestampDiscontinuities = 0; // cumulative pacing-clock-rebaseline count off the most recent frame's metadata
+let lastGpuThreadPriority = null; // IDXGIDevice1::SetGPUThreadPriority(7) outcome, set once per session by CaptureThread
+let lastSchedulingPriority = null; // D3DKMTSetProcessSchedulingPriorityClass(HIGH) outcome, set once per session by CaptureThread
 
 const testStart = Date.now();
 
@@ -128,6 +130,10 @@ try {
       lastTimestampFallbacks = meta.timestampFallbacks;
     if (typeof meta.timestampDiscontinuities === "number")
       lastTimestampDiscontinuities = meta.timestampDiscontinuities;
+    if (typeof meta.gpuThreadPriority === "string")
+      lastGpuThreadPriority = meta.gpuThreadPriority;
+    if (typeof meta.schedulingPriority === "string")
+      lastSchedulingPriority = meta.schedulingPriority;
   });
 } catch (err) {
   console.error("start() threw:", err.message);
@@ -223,6 +229,12 @@ setTimeout(async () => {
     lastTimestampDiscontinuities,
   );
   console.log("lastError()          :", capture.lastError() || "(none)");
+  // Set once per session by CaptureThread right after device creation --
+  // see addon.cc's g_gpuThreadPriorityInfo/g_schedulingPriorityInfo. A
+  // failure string for schedulingPriority is EXPECTED on a normal,
+  // non-elevated install (needs SeIncreaseBasePriorityPrivilege).
+  console.log("gpuThreadPriority    :", lastGpuThreadPriority || "(no frame delivered)");
+  console.log("schedulingPriority   :", lastSchedulingPriority || "(no frame delivered)");
   console.log("");
 
   if (frames === 0) {

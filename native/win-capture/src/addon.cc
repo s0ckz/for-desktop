@@ -170,6 +170,80 @@ void SetErrorText(std::string message) {
   g_lastError = std::move(message);
 }
 
+// ---------------------------------------------------------------------------
+// GPU scheduling priority (items 2 and 3 of the focused-game-FPS fix,
+// alongside the deeper staging ring above). Both are best-effort asks of the
+// OS/driver scheduler that this capture's own GPU work -- VideoProcessorBlt +
+// CopyResource in ProcessFrame -- not sit behind a focused game's queued work
+// indefinitely; see kStagingRingSize's own doc comment for the measurement
+// that motivated all of this. Set once per session in CaptureThread, right
+// after D3D11CreateDevice succeeds.
+//
+// Deliberately NOT routed through g_lastError/SetErrorText: that channel is
+// read as "the terminal reason this session ended" (LastError(), the death
+// signal's `reason`) and is overwritten by SetError() on the next real
+// failure -- exactly wrong for two calls that are expected to often "fail"
+// (see D3DKMTSetProcessSchedulingPriorityClass below) without the session
+// failing, and whose result needs to survive, unmolested, for as long as the
+// session runs so the FIRST live frame's meta can report it. A separate
+// mutex-guarded pair of strings, read the same way g_lastError is (never the
+// bare variable), keeps that information addressable on its own instead of
+// competing with real errors for the one slot.
+std::mutex g_gpuPriorityMutex;
+std::string g_gpuThreadPriorityInfo = "not attempted";
+std::string g_schedulingPriorityInfo = "not attempted";
+
+std::string GetGpuThreadPriorityInfo() {
+  std::lock_guard<std::mutex> lock(g_gpuPriorityMutex);
+  return g_gpuThreadPriorityInfo;
+}
+
+void SetGpuThreadPriorityInfo(std::string message) {
+  std::lock_guard<std::mutex> lock(g_gpuPriorityMutex);
+  g_gpuThreadPriorityInfo = std::move(message);
+}
+
+std::string GetSchedulingPriorityInfo() {
+  std::lock_guard<std::mutex> lock(g_gpuPriorityMutex);
+  return g_schedulingPriorityInfo;
+}
+
+void SetSchedulingPriorityInfo(std::string message) {
+  std::lock_guard<std::mutex> lock(g_gpuPriorityMutex);
+  g_schedulingPriorityInfo = std::move(message);
+}
+
+// D3DKMTSetProcessSchedulingPriorityClass lives in d3dkmthk.h, a driver-kit
+// header this project does not otherwise need and gdi32.lib, a link
+// dependency it does not otherwise have -- pulling in either for three lines
+// of best-effort code is not worth it, so both the enum value and the
+// function's signature are declared by hand here (this is the whole ABI
+// contract; it does not change across Windows versions) and the function
+// itself is resolved dynamically from gdi32.dll, which is already loaded in
+// every Windows process. See CaptureThread for the GetProcAddress call and
+// why a missing/failing export is expected, not an error.
+// NTSTATUS is not otherwise declared in this translation unit (it normally
+// comes from winternl.h/ntdef.h, neither of which this file includes) --
+// but it is always a plain LONG typedef, never a macro, so redeclaring it
+// identically here is legal C++ even if some other header this file already
+// includes happens to have typedef'd it too; there is nothing to guard
+// against, unlike a #define.
+typedef LONG NTSTATUS;
+enum D3DKMT_SCHEDULINGPRIORITYCLASS {
+  D3DKMT_SCHEDULINGPRIORITYCLASS_IDLE = 0,
+  D3DKMT_SCHEDULINGPRIORITYCLASS_BELOW_NORMAL = 1,
+  D3DKMT_SCHEDULINGPRIORITYCLASS_NORMAL = 2,
+  D3DKMT_SCHEDULINGPRIORITYCLASS_ABOVE_NORMAL = 3,
+  D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH = 4,
+  D3DKMT_SCHEDULINGPRIORITYCLASS_REALTIME = 5,
+};
+// NOTE: the enum above intentionally mirrors the real d3dkmthk.h layout in
+// full (IDLE..REALTIME) even though only HIGH is used, so the numeric value
+// passed to the real driver-validated API matches what d3dkmthk.h itself
+// would generate -- a hand-declared enum that omitted the earlier members
+// would still compile but silently send the wrong ordinal.
+typedef NTSTATUS(APIENTRY* PFN_D3DKMTSetProcessSchedulingPriorityClass)(HANDLE, D3DKMT_SCHEDULINGPRIORITYCLASS);
+
 /**
  * Buffers in the WGC frame pool.
  *
@@ -252,38 +326,57 @@ UINT32 g_lastTargetH = 0;
  * on every single frame. Under game-GPU contention that stall was real time,
  * not free synchronisation.
  *
- * Now: CopyResource into the NEXT slot, and Map the PREVIOUS one with
- * D3D11_MAP_FLAG_DO_NOT_WAIT (see ProcessFrame). Whatever GPU work is still
- * outstanding for the previous slot started a whole frame interval ago, so
- * by the time this call reaches it, it is normally done; DO_NOT_WAIT turns
- * "normally" into a guarantee -- Map() returns immediately either way,
+ * Now: CopyResource into the NEXT slot, and Map the OLDEST one -- the slot
+ * whose own CopyResource is kStagingRingSize-1 frame intervals in the past,
+ * not merely the one written last call (see ProcessFrame's readSlot for why
+ * "oldest", not "previous", is the correct target at any ring depth) -- with
+ * D3D11_MAP_FLAG_DO_NOT_WAIT. Whatever GPU work is still outstanding for the
+ * oldest slot has had kStagingRingSize-1 intervals to land, so by the time
+ * this call reaches it, it is normally done; DO_NOT_WAIT turns "normally"
+ * into a guarantee -- Map() returns immediately either way,
  * DXGI_ERROR_WAS_STILL_DRAWING if the GPU is for some reason still behind,
  * in which case that frame is skipped exactly like any other pacing drop
  * rather than blocked on.
  *
- * 2 is the minimum that works (one slot being written, one being read) and
- * is what the plan asks for. A deeper ring would tolerate the GPU falling
- * further behind before a frame gets skipped, at the cost of more latency
- * and memory per extra slot -- not worth it unless 2 is measured to skip
- * often in practice, which C3's own verification (grabMs, dropped-before-
- * encode) will show if it ever needs revisiting.
+ * 2 was shipped as "the minimum that works" on the theory that it would only
+ * be worth going deeper if it was measured to skip often in practice. It has
+ * now been measured: a user's app-audio.log 10s summaries showed `refused=0`,
+ * `bltMs=0.00`, `grabMs<0.5` throughout -- nothing CPU-side was slow and
+ * nothing was queued -- while `stillDrawing` jumped from 0 to ~270-390 per
+ * 10s (~27/s) exactly when the shared window (a game) had focus, and
+ * `produced` collapsed from ~53fps to 1-14fps in the same window. A focused
+ * game saturates the GPU's own queue; this module's VideoProcessorBlt +
+ * CopyResource then regularly takes longer than one frame interval to reach
+ * the front of it, so by the time Map(DO_NOT_WAIT) polls the slot, the copy
+ * has not landed and the frame is skipped.
+ *
+ * 3 gives the GPU two frame intervals of head start instead of one (see
+ * ProcessFrame's readSlot -- the slot read is always the OLDEST of the ring,
+ * not merely the previous one) at the cost of one extra ~1.5MB staging
+ * texture and one more frame of latency (~17ms at 60fps). Not going straight
+ * to 4+: each extra slot buys diminishing head start against a fixed cost in
+ * memory and glass-to-glass latency, and the 10s summary already reports
+ * `stillDrawing` for free -- so the move is to ship 3, watch that counter
+ * under real contention, and only go deeper if it is still nonzero.
  */
-constexpr int kStagingRingSize = 2;
+constexpr int kStagingRingSize = 3;
 struct StagingSlot {
   ComPtr<ID3D11Texture2D> tex;  // D3D11_USAGE_STAGING, CPU-readable copy of g_outputTex
   // This slot's own frame timestamp, captured at CopyResource time and read
-  // back out one call later alongside the pixels -- see ProcessFrame. Without
-  // this, the ring's one-frame delivery lag would pair frame N's own
-  // timestampUs with frame N-1's pixels, silently reintroducing the kind of
-  // timestamp/content mismatch PR C2 removed.
+  // back out kStagingRingSize-1 calls later alongside the pixels -- see
+  // ProcessFrame. Without this, the ring's kStagingRingSize-1-frame delivery
+  // lag would pair frame N's own timestampUs with frame N-(kStagingRingSize-1)'s
+  // pixels, silently reintroducing the kind of timestamp/content mismatch PR
+  // C2 removed.
   double timestampUs = 0;
 };
 StagingSlot g_stagingRing[kStagingRingSize];
 int g_stagingRingIndex = 0;   // next slot ProcessFrame will CopyResource into
 // Priming counter, not a slot-written count: it only ever climbs to
 // kStagingRingSize - 1 (see ProcessFrame's priming check) -- the point at
-// which the slot about to be read next already has real content, one whole
-// frame interval old, not kStagingRingSize (every slot ever written).
+// which the slot about to be read next already has real content,
+// kStagingRingSize-1 intervals old, not kStagingRingSize (every slot ever
+// written).
 int g_stagingRingFilled = 0;
 
 // The frame pool's own buffer size, tracked separately from g_srcW/g_srcH --
@@ -436,9 +529,9 @@ bool EnsurePipeline(UINT32 srcW, UINT32 srcH) {
 
   // Ring of kStagingRingSize staging textures -- see the struct/array's own
   // declaration for why. Built as a local array first, same pattern as
-  // outTex/vp/vpEnum above, so a failure partway through (slot 1 of 2) never
-  // touches the globals and leaves the previous, still-valid pipeline in
-  // place for EnsurePipeline's caller to keep using.
+  // outTex/vp/vpEnum above, so a failure partway through (e.g. slot 1 of
+  // kStagingRingSize) never touches the globals and leaves the previous,
+  // still-valid pipeline in place for EnsurePipeline's caller to keep using.
   D3D11_TEXTURE2D_DESC stagingDesc = outDesc;
   stagingDesc.Usage = D3D11_USAGE_STAGING;
   stagingDesc.BindFlags = 0;
@@ -675,6 +768,13 @@ void EmitToJs(Napi::Env env, Napi::Function cb, FramePayload* p) {
   meta.Set("timestampFallbacks", Napi::Number::New(env, static_cast<double>(g_timestampFallbacks.load())));
   meta.Set("timestampDiscontinuities",
            Napi::Number::New(env, static_cast<double>(g_timestampDiscontinuities.load())));
+  // Set once per session by CaptureThread, right after D3D11CreateDevice --
+  // see g_gpuThreadPriorityInfo's own comment. Read on every frame/death
+  // signal exactly like the counters above rather than plumbed through a
+  // separate one-shot channel, so it is visible on the very first frame
+  // without screenCapture.ts having to special-case "first frame" itself.
+  meta.Set("gpuThreadPriority", Napi::String::New(env, GetGpuThreadPriorityInfo()));
+  meta.Set("schedulingPriority", Napi::String::New(env, GetSchedulingPriorityInfo()));
   if (p->isDeath) {
     // No pixel buffer for a death signal -- see FramePayload::isDeath.
     meta.Set("reason", Napi::String::New(env, p->reason));
@@ -850,17 +950,19 @@ bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH, double time
   // contention. Downscaling before this point (above) is what gets it to
   // ~1.5MB instead.
   //
-  // Staging ring (item 2 of PR C3): write this frame's blit result into the
-  // NEXT ring slot, but read back the PREVIOUS slot's -- already blitted a
-  // whole frame interval ago -- content, instead of the one just copied into.
-  // CopyResource only *starts* the GPU->CPU copy; it does not wait for it, so
-  // Map()'ing the slot just copied into would still pay the full pipeline
-  // stall this item exists to remove. Reading the other slot means whatever
-  // GPU work is still outstanding for it had a whole interval's head start,
-  // so D3D11_MAP_FLAG_DO_NOT_WAIT normally succeeds immediately; on the rare
-  // case it has not, Map() returns DXGI_ERROR_WAS_STILL_DRAWING right away
-  // instead of blocking, and this call skips the frame exactly like any
-  // other pacing drop -- see kStagingRingSize's declaration for more.
+  // Staging ring (item 2 of PR C3, deepened by the focused-game-FPS fix):
+  // write this frame's blit result into the NEXT ring slot, but read back
+  // the OLDEST slot's -- blitted kStagingRingSize-1 frame intervals ago --
+  // content, instead of the one just copied into. CopyResource only
+  // *starts* the GPU->CPU copy; it does not wait for it, so Map()'ing the
+  // slot just copied into would still pay the full pipeline stall this item
+  // exists to remove. Reading the oldest slot means whatever GPU work is
+  // still outstanding for it had the longest possible head start this ring
+  // depth can offer, so D3D11_MAP_FLAG_DO_NOT_WAIT normally succeeds
+  // immediately; on the rare case it has not, Map() returns
+  // DXGI_ERROR_WAS_STILL_DRAWING right away instead of blocking, and this
+  // call skips the frame exactly like any other pacing drop -- see
+  // kStagingRingSize's declaration for more.
   const int writeSlot = g_stagingRingIndex;
   g_context->CopyResource(g_stagingRing[writeSlot].tex.Get(), g_outputTex.Get());
   g_stagingRing[writeSlot].timestampUs = timestampUs;
@@ -883,43 +985,72 @@ bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH, double time
 
   // The first kStagingRingSize-1 frames after Start() or after EnsurePipeline
   // resets this ring (a resize or a setTarget() -- see its own comment) have
-  // no N-1 slot with real content to read: every slot is a freshly created,
-  // never-copied-into STAGING texture. Returning true with nothing emitted is
-  // not a failure -- CaptureThread already treats "no Emit() this iteration"
-  // as an ordinary drop (the same path a too-fast frame or a still-drawing
-  // GPU takes), so the caller sees no difference from any other skipped
-  // frame; it is just guaranteed for a session's or a rebuild's first
-  // kStagingRingSize-1 frame(s) instead of merely likely.
+  // no OLDEST slot with real content to read: every slot is a freshly
+  // created, never-copied-into STAGING texture. Returning true with nothing
+  // emitted is not a failure -- CaptureThread already treats "no Emit() this
+  // iteration" as an ordinary drop (the same path a too-fast frame or a
+  // still-drawing GPU takes), so the caller sees no difference from any
+  // other skipped frame; it is just guaranteed for a session's or a
+  // rebuild's first kStagingRingSize-1 frame(s) instead of merely likely.
   //
-  // Compared against kStagingRingSize - 1, not kStagingRingSize: filled==0
+  // Compared against kStagingRingSize - 1, not kStagingRingSize: this
+  // reasoning is depth-independent, not specific to N=2 or N=3. filled==0
   // means writeSlot's own copy (just issued above) is the only content the
-  // ring has ever held, so priming this call's own return is correct. But by
-  // the very next call filled==1 already means kStagingRingSize-1 (==1 for
-  // the current ring depth) slots have been written at least once -- the
-  // slot this call is about to read (a DIFFERENT slot than the one just
-  // written, see readSlot below) already has real content from the previous
-  // call, one whole frame interval old, exactly like the steady-state case.
-  // The old `< kStagingRingSize` bound primed for filled 0 AND 1, discarding
-  // a second frame that was already readable, on every EnsurePipeline
-  // rebuild -- and `0c836e28` made those rebuilds happen on every quality
-  // change, not just at session start.
+  // ring has ever held, so priming this call's own return is correct. Each
+  // subsequent call increments filled by exactly one, and once filled
+  // reaches kStagingRingSize-1, that many DISTINCT slots (every slot except
+  // the one just written this call) have each been written at least once --
+  // which is exactly the set the ring can ever read from, so the oldest of
+  // them (readSlot below) is guaranteed to hold real content, one whole
+  // priming phase old, exactly like the steady-state case. The old
+  // `< kStagingRingSize` bound primed for one call too many, discarding a
+  // frame that was already readable, on every EnsurePipeline rebuild -- and
+  // `0c836e28` made those rebuilds happen on every quality change, not just
+  // at session start.
   if (g_stagingRingFilled < kStagingRingSize - 1) {
     g_stagingRingFilled++;
     return true;
   }
 
-  const int readSlot = (writeSlot + kStagingRingSize - 1) % kStagingRingSize;
+  // The OLDEST slot, not "one behind" writeSlot: g_stagingRingIndex advances
+  // by exactly 1 (mod kStagingRingSize) every single call, so the slot whose
+  // content is furthest from being overwritten again is always the one
+  // immediately AHEAD of writeSlot in the cycle, i.e. (writeSlot + 1) % N --
+  // the slot this same call will become the write target for, N calls from
+  // now (N-1 calls from the NEXT call). This looks identical to "one behind"
+  // at N=2, where +1 and -1 land on the same single other slot, which is why
+  // the collapse to (writeSlot + N - 1) % N is behaviour-preserving at N=2
+  // but WRONG for any N>2, where it keeps reading the slot written just one
+  // interval ago no matter how deep the ring is declared -- silently giving
+  // a deeper ring zero extra GPU head start. Bumping kStagingRingSize alone,
+  // without also moving this expression to the true oldest slot, changes
+  // nothing about how much head start a read gets.
+  const int readSlot = (writeSlot + 1) % kStagingRingSize;
   D3D11_MAPPED_SUBRESOURCE mapped{};
   hr = g_context->Map(g_stagingRing[readSlot].tex.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
   const auto t2 = std::chrono::steady_clock::now();
   if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
-    // Not a failure -- see the comment above this block. The pixels are not
-    // lost, only this call's chance to read them; readSlot's own content
-    // gets another chance once the ring cycles back to it. Counted (not
-    // just silently returned) so a session that skips every single frame
-    // this way -- e.g. the Flush() above being lost again some future PR --
-    // is visible in the 10s summary (screenCapture.ts) instead of looking
-    // identical to a healthy session with nothing to deliver.
+    // Not a failure -- see the comment above this block. The pixels
+    // themselves are not corrupted, only unread -- but there is no "gets
+    // another chance once the ring cycles back to it" at any ring depth,
+    // because of phase-locking: readSlot is a FIXED function of writeSlot
+    // ((writeSlot + 1) % N, always), and writeSlot advances by exactly 1
+    // (mod N) every single call with no dependence on whether the previous
+    // read succeeded. A fixed function of a value that itself advances in
+    // lockstep visits each ring position exactly once per N-call cycle, at
+    // the same fixed phase offset relative to writeSlot every time -- so
+    // read and write visit each slot at a fixed relative distance, cycle
+    // after cycle, never drifting apart to open a second read window. Here
+    // that fixed distance is one call (readSlot this call == writeSlot next
+    // call, by construction), i.e. zero room for a retry: whatever this call
+    // just failed to read is the very slot CopyResource overwrites on the
+    // next iteration. So a failed Map() is a dropped frame, full stop. What
+    // a deeper ring buys is not a retry, it is more elapsed GPU time before
+    // this one attempt -- lowering how often the attempt fails at all.
+    // Counted (not just silently returned) so a session that skips every
+    // single frame this way -- e.g. the Flush() above being lost again some
+    // future PR -- is visible in the 10s summary (screenCapture.ts) instead
+    // of looking identical to a healthy session with nothing to deliver.
     g_framesStillDrawing.fetch_add(1, std::memory_order_relaxed);
     return true;
   }
@@ -947,11 +1078,12 @@ bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH, double time
   // healthy near-zero value apart from the rare WAS_STILL_DRAWING skip above
   // (which never reaches here to report one).
   payload->grabMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
-  // This slot's OWN timestamp, captured when it was written one call ago --
-  // not the `timestampUs` argument, which belongs to the frame just blitted
-  // into the OTHER (write) slot this same call. Using the argument here
-  // would pair this frame's pixels with the next frame's timestamp, silently
-  // undoing PR C2's real-per-frame-timestamp fix for the one-frame lag this
+  // This slot's OWN timestamp, captured when it was written
+  // kStagingRingSize-1 calls ago -- not the `timestampUs` argument, which
+  // belongs to the frame just blitted into writeSlot (a DIFFERENT slot than
+  // readSlot) this same call. Using the argument here would pair this
+  // frame's pixels with a future frame's timestamp, silently undoing PR C2's
+  // real-per-frame-timestamp fix for the kStagingRingSize-1-frame lag this
   // ring adds.
   payload->timestampUs = g_stagingRing[readSlot].timestampUs;
 
@@ -1206,6 +1338,85 @@ void CaptureThread(HWND hwnd) {
     if (FAILED(hr)) {
       SetError("QueryInterface(ID3D11VideoContext)", hr);
       break;
+    }
+
+    // GPU scheduling priority (items 2 and 3 of the focused-game-FPS fix --
+    // see g_gpuThreadPriorityInfo's own comment for why this is a separate
+    // channel from SetErrorText/g_lastError). Neither call can fail this
+    // session: a rejected or unavailable priority bump leaves capture exactly
+    // as it would have run without this block, just slower under contention
+    // than it would otherwise be -- the ring-depth fix above is what actually
+    // has to work. Both go right here, immediately after device creation,
+    // because (2) needs g_device already created and (3) is a one-time,
+    // process-wide call that has no reason to wait for anything later in this
+    // function -- doing both before the (failure-prone, WinRT-heavy) setup
+    // below means a session that fails further down still recorded whether
+    // the GPU/scheduler cooperated, instead of that information depending on
+    // how far setup got.
+
+    // (2) IDXGIDevice::SetGPUThreadPriority -- the documented, no-privilege-
+    // required knob for "this device's GPU work should be scheduled ahead of
+    // others sharing the GPU". Range is -7..7; 7 is the maximum boost this
+    // API allows. SetGPUThreadPriority is declared on the base IDXGIDevice
+    // interface itself, not IDXGIDevice1 (which only adds the unrelated
+    // SetMaximumFrameLatency/GetMaximumFrameLatency pair), so this is the
+    // same interface the WGC bridge QIs for below -- QueryInterface'd
+    // separately here anyway since that one is not obtained until after this
+    // block and QI itself is cheap.
+    {
+      ComPtr<IDXGIDevice> priorityDxgiDevice;
+      HRESULT priHr = g_device.As(&priorityDxgiDevice);
+      if (SUCCEEDED(priHr)) {
+        priHr = priorityDxgiDevice->SetGPUThreadPriority(7);
+      }
+      char buf[128];
+      if (SUCCEEDED(priHr)) {
+        snprintf(buf, sizeof(buf), "SetGPUThreadPriority(7)=ok");
+      } else {
+        snprintf(buf, sizeof(buf), "SetGPUThreadPriority(7) failed (hr=0x%08lX)",
+                 static_cast<unsigned long>(priHr));
+      }
+      SetGpuThreadPriorityInfo(buf);
+    }
+
+    // (3) D3DKMTSetProcessSchedulingPriorityClass(..., HIGH) -- what OBS's
+    // own "GPU priority" option calls under the hood. Unlike (2) above, this
+    // changes the whole PROCESS's GPU scheduling class, not just this one
+    // device's queue, and is the lever that actually solves starvation under
+    // a focused game rather than merely reducing it -- but raising a
+    // process's scheduling priority above NORMAL requires
+    // SeIncreaseBasePriorityPrivilege, which an ordinary, non-elevated Stoat
+    // install does not hold. On a normal install this call is EXPECTED to
+    // fail (typically STATUS_PRIVILEGE_NOT_HELD) -- that is not an error
+    // condition, just a fact about this install worth recording, exactly
+    // like a rejected SetGPUThreadPriority above. See
+    // PFN_D3DKMTSetProcessSchedulingPriorityClass's own declaration for why
+    // this is resolved dynamically instead of linked.
+    {
+      auto fn = reinterpret_cast<PFN_D3DKMTSetProcessSchedulingPriorityClass>(
+          GetProcAddress(GetModuleHandleW(L"gdi32.dll"), "D3DKMTSetProcessSchedulingPriorityClass"));
+      // 256, not 128: the failure branch's message (status code plus the
+      // "expected without SeIncreaseBasePriorityPrivilege" reassurance) runs
+      // to 151 chars, which a 128-byte buffer silently truncates -- cutting
+      // off exactly the part of the message that explains the failure is
+      // expected, right when a reader needs it most.
+      char buf[256];
+      if (!fn) {
+        snprintf(buf, sizeof(buf), "D3DKMTSetProcessSchedulingPriorityClass not available on this Windows build");
+      } else {
+        const NTSTATUS status = fn(GetCurrentProcess(), D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH);
+        if (status >= 0) {
+          // NTSTATUS success codes are non-negative; there is no single
+          // STATUS_SUCCESS-only convention worth special-casing here.
+          snprintf(buf, sizeof(buf), "D3DKMTSetProcessSchedulingPriorityClass(HIGH)=ok");
+        } else {
+          snprintf(buf, sizeof(buf),
+                   "D3DKMTSetProcessSchedulingPriorityClass(HIGH) failed (status=0x%08lX) -- expected without "
+                   "SeIncreaseBasePriorityPrivilege (i.e. an elevated install)",
+                   static_cast<unsigned long>(status));
+        }
+      }
+      SetSchedulingPriorityInfo(buf);
     }
 
     // WGC frames arrive as WinRT surfaces; bridge our own D3D11 device into
@@ -1875,6 +2086,11 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
   g_framesStillDrawing.store(0);
   g_timestampFallbacks.store(0);
   g_timestampDiscontinuities.store(0);
+  // Same reasoning: a later share should never look like it inherited an
+  // earlier session's GPU-priority outcome before CaptureThread (below) has
+  // had a chance to run its own attempt and overwrite this.
+  SetGpuThreadPriorityInfo("not attempted");
+  SetSchedulingPriorityInfo("not attempted");
   g_running.store(true);
   g_thread = std::thread(CaptureThread, hwnd);
   return Napi::Boolean::New(env, true);
