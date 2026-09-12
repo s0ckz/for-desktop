@@ -1149,7 +1149,17 @@ export function setLiveFps(fps: number): boolean {
   if (wanted === active.fps) return true;
 
   const mod = loadNative();
-  if (!mod?.setFps(wanted)) {
+  // Guard the method itself, not just `mod`: a wrapper/binary mismatch (an
+  // addon export the wrapper forgot to forward -- see index.js's own
+  // warning) must degrade to "refused" here, not throw and take down the
+  // main process the way `mod?.setFps` alone would.
+  if (typeof mod?.setFps !== "function") {
+    appAudioLog(
+      `screen capture: native module has no setFps -- wrapper/binary mismatch, rate stays at ${active.fps}fps`,
+    );
+    return false;
+  }
+  if (!mod.setFps(wanted)) {
     appAudioLog(
       `screen capture: native refused a rate change to ${wanted}fps; staying at ${active.fps}fps`,
     );
@@ -1193,7 +1203,18 @@ export function setLiveTarget(width: number, height: number): boolean {
   if (w === active.targetWidth && h === active.targetHeight) return true;
 
   const mod = loadNative();
-  if (!mod?.setTarget(w, h)) {
+  // Guard the method itself, not just `mod`: `setTarget` shipped in
+  // index.d.ts before index.js forwarded it (see index.js's own warning),
+  // and `mod?.setTarget(...)` alone throws "is not a function" straight
+  // through the IPC handler into an uncaught main-process exception instead
+  // of just declining the change.
+  if (typeof mod?.setTarget !== "function") {
+    appAudioLog(
+      `screen capture: native module has no setTarget -- wrapper/binary mismatch, target stays at ${active.targetWidth}x${active.targetHeight}`,
+    );
+    return false;
+  }
+  if (!mod.setTarget(w, h)) {
     appAudioLog(
       `screen capture: native refused a target change to ${w}x${h}; staying at ${active.targetWidth}x${active.targetHeight}`,
     );

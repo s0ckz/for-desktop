@@ -485,6 +485,12 @@ jobs:
           # else would ever complain.
           find node_modules/win-capture -name '*.node' -print
           test -f node_modules/win-capture/build/Release/win_capture.node
+          # Catches the index.js/index.d.ts drift that shipped 1.7.3/1.7.5's
+          # `setTarget is not a function` main-process crash: index.js
+          # hand-forwards each addon method by name, so a method the addon
+          # exports (or index.d.ts declares) that nobody added there is
+          # invisible until a user's IPC call throws.
+          node node_modules/win-capture/check-exports.js
 
       - name: Lint
         run: pnpm lint
