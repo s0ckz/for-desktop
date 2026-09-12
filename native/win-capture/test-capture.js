@@ -142,6 +142,13 @@ try {
   process.exit(1);
 }
 
+// Exercises setTarget too -- otherwise this harness only ever calls
+// isSupported/lastError/start/stop, so a wrapper method that silently drops
+// out of index.js (like setTarget once did) would pass here forever. Same
+// size the session already started at, so this is a no-op for capture
+// itself and only proves the wrapper forwards the call.
+console.log("setTarget()   :", capture.setTarget(TARGET_W, TARGET_H));
+
 console.log(`capture started, running for ${DURATION_MS / 1000}s ...`);
 
 setTimeout(async () => {
