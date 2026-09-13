@@ -878,6 +878,15 @@ export function createMainWindow() {
     ].filter((flag) => app.commandLine.hasSwitch(flag));
     appAudioLog("capture flags:", flags.length ? flags.join(", ") : "(none)");
     appAudioLog("capture fps cap:", String(captureFpsCap() ?? "none"));
+    // Read back what Chromium actually received (not what main.ts intended
+    // to pass) -- an unknown/misspelled enable-features entry is silently
+    // dropped with no error, so logging main.ts's own list wouldn't catch
+    // that.
+    const enabledFeatures = app.commandLine.getSwitchValue("enable-features");
+    appAudioLog("enable-features:", enabledFeatures || "(none)");
+    // A user-facing toggle (config.hardwareAcceleration) that was previously
+    // unrecorded in this log.
+    appAudioLog("hardwareAcceleration:", String(config.hardwareAcceleration));
   }
 
   // restore last position if it was moved previously
@@ -1007,7 +1016,20 @@ export function createMainWindow() {
   mainWindow.webContents.on(
     "console-message",
     (_event, level, message, line, sourceId) => {
-      if (level < 3) return; // 3 = error
+      if (level < 3) {
+        // Below error level, but the client's screen-share codec verdict
+        // (state.tsx's "[rtc] screen share codec ..." / "... probe ... timed
+        // out ..." console.info lines) is logged here specifically because
+        // it's the one line that explains *why* a given share ended up on
+        // VP9 instead of hardware H.264 -- without it there is no way to
+        // tell, after the fact, whether that was a deliberate choice or a
+        // probe failure. Same rate limiter as the error path below so a
+        // chatty page still can't flood the log.
+        if (message.startsWith("[rtc]") && consoleMessageRateLimit()) {
+          appAudioLog(`page rtc: ${message} (${sourceId}:${line})`);
+        }
+        return;
+      }
       if (consoleMessageRateLimit()) {
         appAudioLog(`page error: ${message} (${sourceId}:${line})`);
       }
