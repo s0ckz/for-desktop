@@ -1,4 +1,5 @@
 #include "src/capture_policy.h"
+#include "src/capture_metrics.h"
 #include <cassert>
 #include <iostream>
 
@@ -35,6 +36,18 @@ int main() {
   assert(capture_policy::Expired(250001, 1, 2));
   assert(!capture_policy::Expired(250000, 1, 2));
   assert(!capture_policy::Expired(1e9, 2, 2));
+  capture_policy::RecoveryBudget recovery;
+  for (int i = 0; i < 5; ++i) assert(recovery.Take());
+  assert(!recovery.Take());
+  recovery.Healthy(); assert(recovery.Take());
+  capture_metrics::Distribution distribution;
+  assert(distribution.Read().count == 0);
+  for (int i = 0; i < 100; ++i) distribution.Add(i < 95 ? 3 : 200);
+  auto metric = distribution.Read();
+  assert(metric.count == 100 && metric.p50 == 4 && metric.p95 == 4 && metric.p99 == 250 && metric.maximum == 200);
+  distribution.Add(INFINITY); distribution.Add(-1);
+  assert(distribution.Read().count == 100);
+  distribution.Reset(); assert(distribution.Read().count == 0);
   const auto size = capture_policy::Fit(3440, 1440, 1279, 719);
   assert(size.width <= 1279 && size.height <= 719 && !(size.width % 2) && !(size.height % 2));
   std::cout << "CAPTURE POLICY PASS\n";

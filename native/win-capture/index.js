@@ -65,8 +65,24 @@ module.exports = {
    * index.d.ts), at up to `fps` times per second. Frames produced faster than
    * that are dropped on the native side, never queued.
    */
-  start: (hwnd, targetWidth, targetHeight, fps, onFrame, monitorOrigin) =>
-    api.start(hwnd, targetWidth, targetHeight, fps, onFrame, monitorOrigin),
+  start: (
+    hwnd,
+    targetWidth,
+    targetHeight,
+    fps,
+    onFrame,
+    monitorOrigin,
+    backend = "wgc",
+  ) =>
+    api.start(
+      hwnd,
+      targetWidth,
+      targetHeight,
+      fps,
+      onFrame,
+      monitorOrigin,
+      backend,
+    ),
   /**
    * Resolves once the capture thread has actually joined (see index.d.ts).
    * screenCapture.ts's stopNative() awaits this specifically to know when

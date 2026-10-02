@@ -17,6 +17,8 @@
 
 #include <d3d11.h>
 #include <dxgi.h>
+#include <dxgi1_2.h>
+#include <dxgi1_5.h>
 
 #include <windows.graphics.h>
 #include <windows.graphics.capture.h>
@@ -34,6 +36,8 @@
 #include <thread>
 #include <vector>
 #include "capture_policy.h"
+#include "capture_metrics.h"
+#include "duplication_bridge.h"
 
 using Microsoft::WRL::ComPtr;
 namespace WG = ABI::Windows::Graphics;
@@ -273,6 +277,7 @@ struct StagingSlot {
   ComPtr<ID3D11Texture2D> tex;
   double timestampUs = 0;
   double bltMs = 0;
+  double submittedAt100ns = 0;
   uint64_t sequence = 0;
   bool pending = false;
 };
@@ -635,8 +640,37 @@ std::atomic<uint64_t> g_maxLoopGapUs{0};
 std::atomic<uint64_t> g_submittedFrames{0}, g_emittedFrames{0}, g_readbackCoalesced{0}, g_ringFull{0};
 std::atomic<uint64_t> g_expiredReadbacks{0}, g_maxFrameAgeUs{0};
 std::atomic<double> g_lastLoopAt100ns{0};
+capture_metrics::Distribution g_sourceGap, g_acquireAge, g_readbackWait, g_frameAge, g_acquireCpu, g_pipelineCpu, g_bridgeCpu;
+std::atomic<uint64_t> g_sourceExtent{0};
+std::atomic<uint64_t> g_acquireTimeouts{0}, g_pointerOnlyFrames{0}, g_accumulatedDesktopFrames{0};
+std::atomic<uint64_t> g_accessLosses{0}, g_recoveryAttempts{0};
+std::mutex g_identityMutex;
+struct CaptureIdentity {
+  std::string backend = "wgc", requestedBackend = "wgc", fallbackReason;
+  std::string adapter, adapterLuid, monitor, sourceConversion = "none";
+  bool adapterMatchesMonitor = false;
+  double refreshHz = 0;
+} g_identity;
 
 double QpcNow100ns();
+
+Napi::Object DistributionToJs(Napi::Env env, const capture_metrics::Distribution& metric) {
+  auto value = Napi::Object::New(env);
+  const auto s = metric.Read();
+  value.Set("count", Napi::Number::New(env, static_cast<double>(s.count)));
+  auto field = [&](const char* name, double number) {
+    value.Set(name, s.count ? static_cast<Napi::Value>(Napi::Number::New(env, number)) : static_cast<Napi::Value>(env.Null()));
+  };
+  field("meanMs", s.mean); field("maxMs", s.maximum);
+  field("p50UpperMs", s.p50); field("p95UpperMs", s.p95); field("p99UpperMs", s.p99);
+  return value;
+}
+
+void ObserveSource(double ts, double& previous) {
+  if (previous > 0 && ts > previous) g_sourceGap.Add((ts - previous) / 10000);
+  previous = ts;
+  g_acquireAge.Add((std::max)(0.0, (QpcNow100ns() - ts) / 10000));
+}
 
 Napi::Value Diagnostics(const Napi::CallbackInfo& info) {
   auto result = Napi::Object::New(info.Env());
@@ -657,6 +691,11 @@ Napi::Value Diagnostics(const Napi::CallbackInfo& info) {
   CAPTURE_COUNTER("readbackCoalesced", g_readbackCoalesced);
   CAPTURE_COUNTER("ringFull", g_ringFull);
   CAPTURE_COUNTER("expiredReadbacks", g_expiredReadbacks);
+  CAPTURE_COUNTER("acquireTimeouts", g_acquireTimeouts);
+  CAPTURE_COUNTER("pointerOnlyFrames", g_pointerOnlyFrames);
+  CAPTURE_COUNTER("accumulatedDesktopFrames", g_accumulatedDesktopFrames);
+  CAPTURE_COUNTER("accessLosses", g_accessLosses);
+  CAPTURE_COUNTER("recoveryAttempts", g_recoveryAttempts);
 #undef CAPTURE_COUNTER
   result.Set("maxLoopGapMs", Napi::Number::New(info.Env(), g_maxLoopGapUs.load() / 1000.0));
   result.Set("maxFrameAgeMs", Napi::Number::New(info.Env(), g_maxFrameAgeUs.load() / 1000.0));
@@ -665,6 +704,29 @@ Napi::Value Diagnostics(const Napi::CallbackInfo& info) {
   result.Set("ready", Napi::Boolean::New(info.Env(), g_ready.load()));
   result.Set("running", Napi::Boolean::New(info.Env(), g_running.load()));
   result.Set("lastError", Napi::String::New(info.Env(), GetErrorText()));
+  result.Set("nativeBuild", "capture-batch3 " __DATE__ " " __TIME__);
+  auto timings = Napi::Object::New(info.Env());
+  timings.Set("sourceGap", DistributionToJs(info.Env(), g_sourceGap));
+  timings.Set("acquisitionAge", DistributionToJs(info.Env(), g_acquireAge));
+  timings.Set("readbackWait", DistributionToJs(info.Env(), g_readbackWait));
+  timings.Set("frameAge", DistributionToJs(info.Env(), g_frameAge));
+  timings.Set("acquireCpu", DistributionToJs(info.Env(), g_acquireCpu));
+  timings.Set("pipelineCpu", DistributionToJs(info.Env(), g_pipelineCpu));
+  timings.Set("bridgeCpu", DistributionToJs(info.Env(), g_bridgeCpu));
+  result.Set("timings", timings);
+  const auto sourceSize = g_sourceExtent.load();
+  result.Set("sourceWidth", Napi::Number::New(info.Env(), sourceSize >> 32));
+  result.Set("sourceHeight", Napi::Number::New(info.Env(), sourceSize & 0xffffffff));
+  {
+    std::lock_guard<std::mutex> lock(g_identityMutex);
+    auto identity = Napi::Object::New(info.Env());
+    identity.Set("backend", g_identity.backend); identity.Set("requestedBackend", g_identity.requestedBackend);
+    identity.Set("fallbackReason", g_identity.fallbackReason); identity.Set("adapter", g_identity.adapter);
+    identity.Set("adapterLuid", g_identity.adapterLuid); identity.Set("monitor", g_identity.monitor);
+    identity.Set("sourceConversion", g_identity.sourceConversion);
+    identity.Set("adapterMatchesMonitor", g_identity.adapterMatchesMonitor); identity.Set("refreshHz", g_identity.refreshHz);
+    result.Set("identity", identity);
+  }
   return result;
 }
 
@@ -816,6 +878,12 @@ void Emit(FramePayload* payload) {
 // Submit a GPU scale/convert and staging copy. srcW/srcH bound valid content
 // inside the source texture, excluding undefined pixels during a resize.
 bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH, double timestampUs) {
+  const auto startCpu = std::chrono::steady_clock::now();
+  struct RecordCpu {
+    std::chrono::steady_clock::time_point start;
+    ~RecordCpu() { g_pipelineCpu.Add(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count()); }
+  } recordCpu{startCpu};
+  g_sourceExtent.store((static_cast<uint64_t>(srcW) << 32) | srcH);
   if (!EnsurePipeline(srcW, srcH)) return false;
   StagingSlot* writeSlot = nullptr;
   for (auto& slot : g_stagingRing) if (!slot.pending) { writeSlot = &slot; break; }
@@ -829,7 +897,11 @@ bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH, double time
   ComPtr<ID3D11VideoProcessorInputView> inputView;
   HRESULT hr = g_videoDevice->CreateVideoProcessorInputView(srcTex, g_vpEnum.Get(), &inDesc, &inputView);
   if (FAILED(hr)) {
-    SetError("CreateVideoProcessorInputView", hr);
+    D3D11_TEXTURE2D_DESC actual{}; srcTex->GetDesc(&actual);
+    UINT supported = 0; g_vpEnum->CheckVideoProcessorFormat(actual.Format, &supported);
+    char details[256];
+    snprintf(details, sizeof(details), "CreateVideoProcessorInputView failed hr=0x%08lX format=%u usage=%u bind=0x%X sample=%u mips=%u array=%u supported=0x%X source=%ux%u", static_cast<unsigned long>(hr), actual.Format, actual.Usage, actual.BindFlags, actual.SampleDesc.Count, actual.MipLevels, actual.ArraySize, supported, actual.Width, actual.Height);
+    SetErrorText(details);
     return false;
   }
 
@@ -852,6 +924,7 @@ bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH, double time
   g_context->CopyResource(writeSlot->tex.Get(), g_outputTex.Get());
   writeSlot->bltMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - beforeBlt).count();
   writeSlot->timestampUs = timestampUs;
+  writeSlot->submittedAt100ns = QpcNow100ns();
   writeSlot->sequence = ++g_submissionSequence;
   writeSlot->pending = true;
   g_context->Flush();
@@ -888,6 +961,8 @@ bool DrainReadback() {
     }
     ScopedReadMap unmap{g_context.Get(), slot->tex.Get()};
     const double ageUs = (std::max)(0.0, QpcNow100ns() / 10 - slot->timestampUs);
+    g_readbackWait.Add((std::max)(0.0, (QpcNow100ns() - slot->submittedAt100ns) / 10000));
+    g_frameAge.Add(ageUs / 1000);  // includes expired copies, avoiding survivor bias
     if (capture_policy::Expired(ageUs, slot->sequence, g_submissionSequence)) {
       slot->pending = false;  // scoped Unmap precedes slot reuse
       g_expiredReadbacks.fetch_add(1);
@@ -1027,7 +1102,171 @@ double QpcNow100ns() {
 // waits on.
 // ---------------------------------------------------------------------------
 
-void CaptureThread(HWND hwnd, HMONITOR monitor) {
+std::string Utf8(const wchar_t* input) {
+  const int count = WideCharToMultiByte(CP_UTF8, 0, input, -1, nullptr, 0, nullptr, nullptr);
+  if (count <= 1) return {};
+  std::string value(static_cast<size_t>(count), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, input, -1, value.data(), count, nullptr, nullptr);
+  value.pop_back();
+  return value;
+}
+
+bool FindMonitorOutput(HMONITOR monitor, ComPtr<IDXGIAdapter1>& adapter, ComPtr<IDXGIOutput1>& output) {
+  ComPtr<IDXGIFactory1> factory;
+  if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
+  for (UINT i = 0; ; ++i) {
+    ComPtr<IDXGIAdapter1> candidate;
+    if (factory->EnumAdapters1(i, &candidate) == DXGI_ERROR_NOT_FOUND) break;
+    if (!candidate) break;
+    for (UINT j = 0; ; ++j) {
+      ComPtr<IDXGIOutput> raw;
+      if (candidate->EnumOutputs(j, &raw) == DXGI_ERROR_NOT_FOUND) break;
+      if (!raw) break;
+      DXGI_OUTPUT_DESC desc{};
+      if (SUCCEEDED(raw->GetDesc(&desc)) && desc.Monitor == monitor && desc.AttachedToDesktop) {
+        if (FAILED(raw.As(&output))) return false;
+        adapter = candidate;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+void RecordIdentity(HMONITOR monitor, IDXGIAdapter1* displayAdapter) {
+  std::lock_guard<std::mutex> lock(g_identityMutex);
+  ComPtr<IDXGIDevice> dxgi;
+  ComPtr<IDXGIAdapter> adapter;
+  DXGI_ADAPTER_DESC desc{};
+  if (SUCCEEDED(g_device.As(&dxgi)) && SUCCEEDED(dxgi->GetAdapter(&adapter)) && SUCCEEDED(adapter->GetDesc(&desc))) {
+    g_identity.adapter = Utf8(desc.Description);
+    char luid[32];
+    snprintf(luid, sizeof(luid), "%08lX:%08lX", static_cast<unsigned long>(desc.AdapterLuid.HighPart), static_cast<unsigned long>(desc.AdapterLuid.LowPart));
+    g_identity.adapterLuid = luid;
+    DXGI_ADAPTER_DESC1 selected{};
+    if (displayAdapter && SUCCEEDED(displayAdapter->GetDesc1(&selected))) {
+      g_identity.adapterMatchesMonitor = selected.AdapterLuid.HighPart == desc.AdapterLuid.HighPart && selected.AdapterLuid.LowPart == desc.AdapterLuid.LowPart;
+    }
+  }
+  MONITORINFOEXW info{}; info.cbSize = sizeof(info);
+  if (monitor && GetMonitorInfoW(monitor, &info)) {
+    g_identity.monitor = Utf8(info.szDevice);
+    DEVMODEW mode{}; mode.dmSize = sizeof(mode);
+    if (EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &mode)) g_identity.refreshHz = mode.dmDisplayFrequency;
+  }
+}
+
+void RecordLoop(double fps, double& previous) {
+  const double now = QpcNow100ns();
+  const auto gap = static_cast<uint64_t>((std::max)(0.0, (now - previous) / 10));
+  previous = now;
+  g_lastLoopAt100ns.store(now);
+  if (gap > 2e6 / fps) g_longLoopGaps.fetch_add(1);
+  if (gap > g_maxLoopGapUs.load()) g_maxLoopGapUs.store(gap);
+}
+
+// Returns false only before readiness, so WGC can be tried in this same worker.
+// Once ready, errors terminate this owning session through the normal death signal.
+bool RunDuplication(IDXGIOutput1* output, HMONITOR monitor) {
+  struct Heartbeat {
+    HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    Heartbeat() { if (!timer) timeBeginPeriod(1); }
+    ~Heartbeat() { if (timer) CloseHandle(timer); else timeEndPeriod(1); }
+  } heartbeat;
+  ComPtr<IDXGIOutputDuplication> duplication;
+  // Duplication surfaces need not have video-processor-compatible bindings.
+  // Bridge to an owned BGRA GPU texture; full pixels never cross to the CPU.
+  DuplicationBridge bridge;
+  auto recreate = [&]() {
+    duplication.Reset();
+    ComPtr<IDXGIOutput5> output5;
+    HRESULT hr;
+    if (SUCCEEDED(output->QueryInterface(IID_PPV_ARGS(&output5)))) {
+      const DXGI_FORMAT format = DXGI_FORMAT_B8G8R8A8_UNORM;
+      hr = output5->DuplicateOutput1(g_device.Get(), 0, 1, &format, &duplication);
+    } else {
+      hr = output->DuplicateOutput(g_device.Get(), &duplication);
+    }
+    if (FAILED(hr)) { SetError("DuplicateOutput", hr); return false; }
+    DXGI_OUTDUPL_DESC desc{}; duplication->GetDesc(&desc);
+    if (desc.ModeDesc.Format != DXGI_FORMAT_B8G8R8A8_UNORM && desc.ModeDesc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT) {
+      SetErrorText("Desktop Duplication output format unsupported; using WGC"); return false;
+    }
+    if (desc.Rotation != DXGI_MODE_ROTATION_IDENTITY && desc.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED) {
+      SetErrorText("Desktop Duplication prototype requires an unrotated output"); return false;
+    }
+    if (!EnsurePipeline(desc.ModeDesc.Width, desc.ModeDesc.Height)) return false;
+    return true;
+  };
+  if (!recreate()) return false;
+  { std::lock_guard<std::mutex> lock(g_identityMutex); g_identity.backend = "duplication"; }
+  g_ready.store(true);
+  capture_policy::Pacer pacer;
+  capture_policy::RecoveryBudget recovery;
+  double previousSource = 0, previousLoop = QpcNow100ns(), retryAt = 0;
+  bool hadImage = false;
+  while (g_running.load()) {
+    HANDLE events[] = {g_stopEvent, g_configEvent, heartbeat.timer};
+    if (heartbeat.timer) {
+      LARGE_INTEGER due{}; due.QuadPart = -50000;  // five milliseconds, relative to now
+      if (!SetWaitableTimerEx(heartbeat.timer, &due, 0, nullptr, nullptr, nullptr, 0)) { SetError("duplication heartbeat", HRESULT_FROM_WIN32(GetLastError())); break; }
+    }
+    const DWORD wait = WaitForMultipleObjects(heartbeat.timer ? 3 : 2, events, FALSE, heartbeat.timer ? INFINITE : 5);
+    if (wait == WAIT_OBJECT_0) break;
+    if (wait == WAIT_FAILED) { SetError("duplication wait", HRESULT_FROM_WIN32(GetLastError())); break; }
+    RecordLoop(g_fps.load(), previousLoop);
+    MONITORINFO info{}; info.cbSize = sizeof(info);
+    if (!GetMonitorInfoW(monitor, &info)) { SetErrorText("captured monitor removed"); break; }
+    if (!DrainReadback()) { g_processFailures.fetch_add(1); break; }
+    if (!duplication) {
+      if (QpcNow100ns() < retryAt) continue;
+      if (!recovery.Take()) { SetErrorText("Desktop Duplication recovery exhausted after five attempts"); break; }
+      g_recoveryAttempts.fetch_add(1);
+      if (!recreate()) { duplication.Reset(); retryAt = QpcNow100ns() + 2500000; continue; }
+    }
+    DXGI_OUTDUPL_FRAME_INFO frameInfo{};
+    ComPtr<IDXGIResource> resource;
+    const double before = QpcNow100ns();
+    HRESULT hr = duplication->AcquireNextFrame(0, &frameInfo, &resource);
+    g_acquireCpu.Add((QpcNow100ns() - before) / 10000);
+    if (hr == DXGI_ERROR_WAIT_TIMEOUT) { g_acquireTimeouts.fetch_add(1); continue; }
+    if (hr == DXGI_ERROR_ACCESS_LOST) {
+      g_accessLosses.fetch_add(1); duplication.Reset(); retryAt = QpcNow100ns() + 2500000; continue;
+    }
+    if (FAILED(hr)) { SetError("AcquireNextFrame", hr); break; }
+    struct ReleaseDesktopFrame {
+      IDXGIOutputDuplication* owner;
+      ~ReleaseDesktopFrame() { owner->ReleaseFrame(); }
+    } release{duplication.Get()};
+    g_arrivalEvents.fetch_add(1);
+    if (!frameInfo.LastPresentTime.QuadPart && hadImage) { g_pointerOnlyFrames.fetch_add(1); continue; }
+    recovery.Healthy();
+    g_incomingFrames.fetch_add(1);
+    g_accumulatedDesktopFrames.fetch_add(frameInfo.AccumulatedFrames);
+    LARGE_INTEGER frequency{}; QueryPerformanceFrequency(&frequency);
+    const double ts = frameInfo.LastPresentTime.QuadPart ? frameInfo.LastPresentTime.QuadPart * 1e7 / frequency.QuadPart : QpcNow100ns();
+    ObserveSource(ts, previousSource);
+    bool discontinuity = false;
+    if (!pacer.Take(ts, g_fps.load(), discontinuity)) { g_pacingSkips.fetch_add(1); continue; }
+    if (discontinuity) g_timestampDiscontinuities.fetch_add(1);
+    ComPtr<ID3D11Texture2D> texture;
+    if (FAILED(resource.As(&texture))) { g_surfaceFailures.fetch_add(1); SetErrorText("Desktop Duplication frame has no D3D11 texture"); break; }
+    D3D11_TEXTURE2D_DESC desc{}; texture->GetDesc(&desc);
+    const double beforeBridge = QpcNow100ns();
+    hr = bridge.Copy(g_device.Get(), g_context.Get(), texture.Get());
+    g_bridgeCpu.Add((QpcNow100ns() - beforeBridge) / 10000);
+    if (FAILED(hr)) { SetError("duplication GPU source conversion", hr); break; }
+    { std::lock_guard<std::mutex> lock(g_identityMutex);
+      g_identity.sourceConversion = desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? "scRGB-to-SDR-clipped" : "BGRA-GPU-copy";
+    }
+    g_processAttempts.fetch_add(1);
+    if (!ProcessFrame(bridge.Texture(), desc.Width, desc.Height, ts / 10)) { g_processFailures.fetch_add(1); break; }
+    hadImage = true;
+  }
+  return true;
+}
+
+void CaptureThread(HWND hwnd, HMONITOR monitor, bool requestDuplication) {
   HRESULT hr = RoInitialize(RO_INIT_MULTITHREADED);
   const bool roInitialised = SUCCEEDED(hr) || hr == S_FALSE;
 
@@ -1087,14 +1326,20 @@ void CaptureThread(HWND hwnd, HMONITOR monitor) {
       break;
     }
 
+    ComPtr<IDXGIAdapter1> displayAdapter;
+    ComPtr<IDXGIOutput1> displayOutput;
+    const HMONITOR sourceMonitor = monitor ? monitor : MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    FindMonitorOutput(sourceMonitor, displayAdapter, displayOutput);
+    const bool matchingDevice = requestDuplication && displayAdapter && displayOutput;
     D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
-    hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+    hr = D3D11CreateDevice(matchingDevice ? displayAdapter.Get() : nullptr, matchingDevice ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE, nullptr,
                             D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT, levels, 2,
                             D3D11_SDK_VERSION, &g_device, nullptr, &g_context);
     if (FAILED(hr)) {
       SetError("D3D11CreateDevice", hr);
       break;
     }
+    RecordIdentity(sourceMonitor, displayAdapter.Get());
 
     hr = g_device.As(&g_videoDevice);
     if (FAILED(hr)) {
@@ -1186,6 +1431,14 @@ void CaptureThread(HWND hwnd, HMONITOR monitor) {
       SetSchedulingPriorityInfo(buf);
     }
 
+    if (requestDuplication) {
+      if (displayOutput && RunDuplication(displayOutput.Get(), monitor)) break;
+      std::lock_guard<std::mutex> lock(g_identityMutex);
+      g_identity.fallbackReason = displayOutput ? GetErrorText() : "selected monitor has no DXGI output";
+      g_identity.backend = "wgc";
+      SetErrorText("");
+    }
+
     // WGC frames arrive as WinRT surfaces; bridge our own D3D11 device into
     // the WinRT object model so the frame pool can hand us frames on it.
     ComPtr<IDXGIDevice> dxgiDevice;
@@ -1274,6 +1527,7 @@ void CaptureThread(HWND hwnd, HMONITOR monitor) {
 
     g_ready.store(true);
     capture_policy::Pacer pacer;
+    double previousSource = 0;
 
     auto previousLoopWake = std::chrono::steady_clock::now();
     while (g_running.load()) {
@@ -1328,6 +1582,7 @@ void CaptureThread(HWND hwnd, HMONITOR monitor) {
       // still have queued more than one since our last wait (the event tells
       // us "at least one", not "exactly one").
       ComPtr<WGC::IDirect3D11CaptureFrame> frame;
+      const double beforeAcquire = QpcNow100ns();
       bool poolFailed = false;
       for (;;) {
         ComPtr<WGC::IDirect3D11CaptureFrame> next;
@@ -1343,6 +1598,7 @@ void CaptureThread(HWND hwnd, HMONITOR monitor) {
         if (frame) g_drainedFrames.fetch_add(1, std::memory_order_relaxed);
         frame = next;  // the previously-held frame (if any) is Released here
       }
+      g_acquireCpu.Add((QpcNow100ns() - beforeAcquire) / 10000);
       if (poolFailed) break;
       if (!frame) continue;  // nothing new since last wait
 
@@ -1351,6 +1607,7 @@ void CaptureThread(HWND hwnd, HMONITOR monitor) {
       // WGC SystemRelativeTime and QPC share the QPC clock; units are 100ns.
       double ts = SUCCEEDED(hr) && relativeTime.Duration > 0 ? static_cast<double>(relativeTime.Duration) : QpcNow100ns();
       if (FAILED(hr) || relativeTime.Duration <= 0) g_timestampFallbacks.fetch_add(1);
+      ObserveSource(ts, previousSource);
       bool discontinuity = false;
       if (!pacer.Take(ts, fps, discontinuity)) { g_pacingSkips.fetch_add(1); continue; }
       if (discontinuity) g_timestampDiscontinuities.fetch_add(1);
@@ -1653,6 +1910,13 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
     Napi::Error::New(env, "invalid window handle or monitor point").ThrowAsJavaScriptException();
     return env.Undefined();
   }
+  std::string backend = "wgc";
+  if (info.Length() > 6 && !info[6].IsUndefined()) {
+    if (!info[6].IsString()) { Napi::TypeError::New(env, "backend must be wgc or duplication").ThrowAsJavaScriptException(); return env.Undefined(); }
+    backend = info[6].As<Napi::String>().Utf8Value();
+    if (backend != "wgc" && backend != "duplication") { Napi::RangeError::New(env, "unknown capture backend").ThrowAsJavaScriptException(); return env.Undefined(); }
+  }
+  if (backend == "duplication" && !monitor) { Napi::RangeError::New(env, "Desktop Duplication supports monitor capture only").ThrowAsJavaScriptException(); return env.Undefined(); }
 
   const double width = info[1].As<Napi::Number>().DoubleValue();
   const double height = info[2].As<Napi::Number>().DoubleValue();
@@ -1723,6 +1987,10 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
   g_maxLoopGapUs.store(0); g_lastLoopAt100ns.store(QpcNow100ns());
   g_submittedFrames.store(0); g_emittedFrames.store(0); g_readbackCoalesced.store(0); g_ringFull.store(0);
   g_expiredReadbacks.store(0); g_maxFrameAgeUs.store(0);
+  g_sourceGap.Reset(); g_acquireAge.Reset(); g_readbackWait.Reset(); g_frameAge.Reset(); g_acquireCpu.Reset(); g_pipelineCpu.Reset(); g_bridgeCpu.Reset();
+  g_sourceExtent.store(0); g_acquireTimeouts.store(0); g_pointerOnlyFrames.store(0); g_accumulatedDesktopFrames.store(0);
+  g_accessLosses.store(0); g_recoveryAttempts.store(0);
+  { std::lock_guard<std::mutex> lock(g_identityMutex); g_identity = CaptureIdentity{}; g_identity.requestedBackend = backend; }
   g_submissionSequence = 0; g_lastEmittedTimestampUs = -1; g_ready.store(false);
   // Same reasoning: a later share should never look like it inherited an
   // earlier session's GPU-priority outcome before CaptureThread (below) has
@@ -1730,7 +1998,7 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
   SetGpuThreadPriorityInfo("not attempted");
   SetSchedulingPriorityInfo("not attempted");
   g_running.store(true);
-  g_thread = std::thread(CaptureThread, hwnd, monitor);
+  g_thread = std::thread(CaptureThread, hwnd, monitor, backend == "duplication");
   return Napi::Boolean::New(env, true);
 }
 

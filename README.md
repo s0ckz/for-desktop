@@ -107,7 +107,11 @@ Currently, this is required to build, any forks are expected to provide their ow
 ## Screen share diagnostics
 
 On Windows, native window and monitor shares write diagnostics to
-`%APPDATA%/stoat-desktop/logs/app-audio.log`. `screen capture: stages` is emitted
+`%APPDATA%/stoat-desktop/logs/app-audio.log`. Rotation retains the current 2MiB
+file plus four numbered archives (`.1` is newest); preserve all five files
+when comparing sessions. Start/final snapshots identify the session, target,
+app/Electron/native build and actual capture adapter/monitor/backend.
+`screen capture: stages` is emitted
 approximately every 10 seconds independently of pixel delivery, including
 when a share has frozen. It reports incoming frames, frames discarded while
 draining the pool, pacing skips, processing attempts/failures, surface/pool
@@ -121,12 +125,36 @@ delivery age, excluding renderer/encoder/network latency. `delivery` contains
 cumulative posts, acknowledgements, coalesces and failures, plus queue state.
 Renderer counters distinguish construction, backpressure, accepted writes,
 write errors and canvas draws. `incomingFps`
-is the retrieved WGC frame rate, not encoded or viewer FPS. `longLoopGaps`
+is the retrieved source frame rate, not encoded or viewer FPS. `longLoopGaps`
 counts intervals exceeding twice the requested frame interval;
 `sessionMaxLoopGapMs` is a session maximum. Loop gaps include waiting,
 scheduling, and prior processing; they are not GPU execution timings.
 `loopIdleMs` and `frameDroughtMs` distinguish lack of thread progress from
 lack of delivered frames. `lastError` may describe a recovered failure.
+
+`timings` contains cumulative bounded-memory distributions: `sourceGap`
+(source timestamp intervals), `acquireAge` (source timestamp to acquisition),
+`readbackWait` (copy submission to successful nonblocking Map), `frameAge`
+(source timestamp to Map, including readbacks later expired), and CPU wall
+time for acquisition, GPU bridge submission and pipeline submission.
+These are approximate snapshots; p50/p95/p99 are histogram bucket upper
+bounds, not exact percentiles. Empty distributions have null values.
+Readback wait includes GPU queue/execution, thread scheduling and polling
+delay; it does not isolate GPU execution. Source dimensions and adapter LUID
+help detect unexpected resolution and cross-adapter capture.
+
+Monitor capture defaults to Windows Graphics Capture (WGC). An experimental
+Desktop Duplication backend is selected with `--native-monitor-backend=duplication`
+or `run-capture-test.ps1 -Backend duplication`. Windows still use WGC.
+The prototype creates its device on the monitor's adapter, normalizes pixels
+on the GPU, and reuses the existing NV12/downscale/readback/delivery pipeline.
+It polls acquisition without blocking, ignores cursor-only updates and retries
+access loss at most five times per recovery episode. Unsupported initial setup
+falls back to WGC and records the reason. Failures after readiness end the session.
+Rotated outputs are unsupported. Hardware cursor overlay is not implemented;
+HDR scRGB input is converted to SDR with clipped highlights. This backend is
+for FPS comparison, pending game/fullscreen/display-transition and image-quality
+validation; it is not a claim of improved performance under GPU saturation.
 
 The matching web-client sender diagnostics appear as `[rtc] screen share sender`
 and are forwarded into this same file by the desktop shell. These require the
@@ -140,8 +168,10 @@ Validation commands:
 ```powershell
 node src/native/screenCapture.behavior.test.cjs
 node src/native/screenCapture.diagnostics.test.cjs
+node src/native/diagnosticLog.test.cjs
+node src/native/appAudio.log.test.cjs
 node native/win-capture/check-exports.js
-node native/win-capture/check-package.js out-capture-fixes/Stoat-win32-x64
+node native/win-capture/check-package.js out-capture-batch3/Stoat-win32-x64
 # After rebuilding the native addon for Electron:
 .\node_modules\electron\dist\electron.exe native/win-capture/test-diagnostics.js
 ```
@@ -149,7 +179,10 @@ node native/win-capture/check-package.js out-capture-fixes/Stoat-win32-x64
 The Electron smoke test captures attached monitors briefly and requires a
 delivered first image, including a static monitor. It checks counters,
 teardown and invalid monitor selection. Compile `test-policy.cc` with a
-C++17 compiler for deterministic pacing, sizing and freshness tests.
+C++17 compiler for deterministic pacing, sizing, recovery, metrics and freshness
+tests. `test-bridge.cc` validates known SDR and HDR pixels on D3D11 WARP; link
+with d3d11.lib and d3dcompiler.lib. The smoke test runs both backends on all
+attached monitors (or accepts `wgc` / `duplication` as its first argument).
 
 Native frame submission uses bounded timestamp credit to tolerate jitter;
 pending readbacks drain independently of source arrivals. The main-to-renderer

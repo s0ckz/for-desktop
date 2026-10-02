@@ -5,7 +5,7 @@ const crypto = require("node:crypto");
 const asar = require("@electron/asar");
 const root = path.resolve(__dirname, "../..");
 const packaged = path.resolve(
-  process.argv[2] || path.join(root, "out-capture-fixes", "Stoat-win32-x64"),
+  process.argv[2] || path.join(root, "out-capture-batch3", "Stoat-win32-x64"),
 );
 const resources = path.join(packaged, "resources");
 const archive = path.join(resources, "app.asar");
@@ -18,6 +18,11 @@ for (const marker of [
   "screen capture: renderer",
   "confirmSessionLive",
   "counters.written",
+  "native-monitor-backend",
+  "screen capture: session start",
+  "screen capture: session final",
+  "timings",
+  "app-audio.log",
 ]) {
   assert(main.includes(marker), "Packaged main missing: " + marker);
 }
@@ -25,6 +30,19 @@ for (const marker of ["frameId", "sessionId", '"ack"']) {
   assert(preload.includes(marker), "Packaged preload missing: " + marker);
 }
 const relative = "node_modules/win-capture/build/Release/win_capture.node";
+const nativeBinary = fs.readFileSync(
+  path.join(resources, "app.asar.unpacked", relative),
+);
+for (const marker of [
+  "capture-batch3",
+  "readbackWait",
+  "sourceConversion",
+  "DuplicateOutput",
+])
+  assert(
+    nativeBinary.includes(Buffer.from(marker)),
+    "Packaged native missing: " + marker,
+  );
 const hash = (file) =>
   crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 assert.equal(

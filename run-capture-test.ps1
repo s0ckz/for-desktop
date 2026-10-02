@@ -1,7 +1,8 @@
 param(
-  [string]$AppPath = "$PSScriptRoot\out-capture-fixes\Stoat-win32-x64\stoat-desktop.exe",
+  [string]$AppPath = "$PSScriptRoot\out-capture-batch3\Stoat-win32-x64\stoat-desktop.exe",
   [string]$WebRoot = "$PSScriptRoot\..\for-web\packages\client",
-  [switch]$CheckOnly
+  [switch]$CheckOnly,
+  [ValidateSet('wgc', 'duplication')][string]$Backend = 'wgc'
 )
 $ErrorActionPreference = 'Stop'
 $AppPath = [IO.Path]::GetFullPath($AppPath)
@@ -42,5 +43,5 @@ if (!$page) {
 if (!$page -or !$page.Content.Contains($asset)) { throw 'Port 4173 is not serving the expected local web build' }
 $served = Invoke-WebRequest "$url$asset" -UseBasicParsing -TimeoutSec 10
 if (!$served.Content.Contains('[rtc] screen share sender')) { throw 'Served web entry lacks sender diagnostics' }
-Write-Output "Opening $AppPath with --force-server=$url"
-Start-Process $AppPath -ArgumentList "--force-server=$url"
+Write-Output "Opening $AppPath with --force-server=$url --native-monitor-backend=$Backend"
+Start-Process $AppPath -ArgumentList @("--force-server=$url", "--native-monitor-backend=$Backend")

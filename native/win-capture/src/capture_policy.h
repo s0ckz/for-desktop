@@ -59,4 +59,13 @@ inline bool Expired(double ageUs, uint64_t sequence, uint64_t newestSequence) {
   return ageUs > 250000 && sequence < newestSequence;
 }
 
+// Five recreation attempts per recovery episode; a healthy frame clears it.
+class RecoveryBudget {
+ public:
+  bool Take() { return attempts_++ < 5; }
+  void Healthy() { attempts_ = 0; }
+ private:
+  unsigned attempts_ = 0;
+};
+
 }  // namespace capture_policy

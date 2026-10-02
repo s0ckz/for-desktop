@@ -70,18 +70,25 @@ function transportTests() {
 }
 async function lifecycleTests() {
   const callbacks = [],
+    startArgs = [],
     handlers = {},
     logs = [];
   const native = {
     isSupported: () => true,
     start: (...args) => {
+      startArgs.push(args);
       callbacks.push(args[4]);
       return true;
     },
     stop: () => Promise.resolve(),
     lastError: () => "",
   };
+  let requestedBackend = "";
   const electron = {
+    app: {
+      commandLine: { getSwitchValue: () => requestedBackend },
+      getVersion: () => "test",
+    },
     BrowserWindow: { getAllWindows: () => [] },
     ipcMain: {
       on: (key, fn) => {
@@ -105,14 +112,19 @@ async function lifecycleTests() {
     "./appAudio": {
       log: (...x) => logs.push(x.join(" ")),
       createLogRateLimiter: () => () => true,
-      windowHandleFromSourceId: () => null,
+      windowHandleFromSourceId: (id) =>
+        id.startsWith("window:") ? "123" : null,
       windowStateForSourceId: () => null,
     },
   });
   api.initScreenCapture();
   try {
     await api.startForSource("screen:1:0", 30, 1, "1");
+    assert.equal(startArgs[0][6], "wgc");
+    requestedBackend = "duplication";
     await api.startForSource("screen:1:0", 30, 2, "1");
+    assert.equal(startArgs[1][6], "duplication");
+    assert(logs.some((line) => line.includes("screen capture: session start")));
     const oldMeta = {
       width: 640,
       height: 480,
@@ -139,6 +151,7 @@ async function lifecycleTests() {
     assert.equal(state.active, false);
     assert.equal(state.sessionId, 2);
     assert(state.reason.includes("new death"));
+    assert(logs.some((line) => line.includes("screen capture: session final")));
     await api.stop();
     api.resetNativeFailures();
     native.diagnostics = () => ({
@@ -159,6 +172,8 @@ async function lifecycleTests() {
     assert.deepEqual(results, [false, true]);
     assert.equal(handlers["screenCapture:getState"]().sessionId, 5);
     assert.equal(handlers["screenCapture:getState"]().fps, 60);
+    await api.startForSource("window:123:0", 30, 6);
+    assert.equal(startArgs.at(-1)[6], "wgc", "window shares always use WGC");
   } finally {
     await api.stop();
   }

@@ -14,7 +14,7 @@
 // unsupported OS/GPU, or a capture failure is never fatal -- the caller (the
 // page patch in appAudioPatch.ts) falls back to Chromium's own, slower
 // capture path and keeps sharing.
-import { BrowserWindow, ipcMain, screen } from "electron";
+import { BrowserWindow, app, ipcMain, screen } from "electron";
 
 import {
   log as appAudioLog,
@@ -624,6 +624,11 @@ export async function startForSource(
       fps,
       (frame, meta) => onFrame(frame, meta, sessionId),
       monitorOrigin,
+      isMonitor &&
+        app?.commandLine?.getSwitchValue("native-monitor-backend") ===
+          "duplication"
+        ? "duplication"
+        : "wgc",
     );
     if (!started) {
       lastFallbackReason = `native start() returned false: ${mod.lastError()}`;
@@ -712,6 +717,22 @@ export async function startForSource(
   )
     return false;
   active.ready = true;
+  try {
+    appAudioLog(
+      "screen capture: session start " +
+        JSON.stringify({
+          sessionId,
+          sourceId,
+          displayId,
+          target: [active.targetWidth, active.targetHeight, fps],
+          desktopVersion: app?.getVersion?.() ?? "unknown",
+          electronVersion: process.versions.electron,
+          native: mod.diagnostics?.(),
+        }),
+    );
+  } catch {
+    /* diagnostics must not prevent capture */
+  }
   appAudioLog(
     `screen capture: native GPU path active for ${sourceId} (${isMonitor ? `display ${displayId}` : `hwnd ${hwnd}`}), target ${CAPTURE_TARGET_WIDTH}x${CAPTURE_TARGET_HEIGHT}@${fps}fps`,
   );
@@ -1066,6 +1087,11 @@ function startWatchdogs() {
             | "emittedFrames"
             | "readbackCoalesced"
             | "expiredReadbacks"
+            | "acquireTimeouts"
+            | "pointerOnlyFrames"
+            | "accumulatedDesktopFrames"
+            | "accessLosses"
+            | "recoveryAttempts"
             | "ringFull",
         ) => (previous ? Math.max(0, current[key] - previous[key]) : null);
         const incoming = delta("incomingFrames");
@@ -1097,6 +1123,17 @@ function startWatchdogs() {
               expiredReadbacks: delta("expiredReadbacks"),
               sessionMaxFrameAgeMs: current.maxFrameAgeMs ?? null,
               ringFull: delta("ringFull"),
+              identity: current.identity ?? null,
+              source: [
+                current.sourceWidth ?? null,
+                current.sourceHeight ?? null,
+              ],
+              timings: current.timings ?? null,
+              acquireTimeouts: delta("acquireTimeouts"),
+              pointerOnlyFrames: delta("pointerOnlyFrames"),
+              accumulatedDesktopFrames: delta("accumulatedDesktopFrames"),
+              accessLosses: delta("accessLosses"),
+              recoveryAttempts: delta("recoveryAttempts"),
               delivery: delivery.snapshot(),
               sessionMaxLoopGapMs: Number(current.maxLoopGapMs.toFixed(2)),
               loopIdleMs: Number(current.loopIdleMs.toFixed(2)),
@@ -1504,6 +1541,22 @@ export function stop(
   // comment.
   stopReason = active ? reason : null;
   if (!active) return nativeStopPromise;
+  try {
+    appAudioLog(
+      "screen capture: session final " +
+        JSON.stringify({
+          sessionId: active.sessionId,
+          sourceId: active.sourceId,
+          reason,
+          failureReason,
+          durationSeconds: (Date.now() - active.startedAt) / 1000,
+          native: loadNative()?.diagnostics?.(),
+          delivery: delivery.snapshot(),
+        }),
+    );
+  } catch {
+    /* preserve teardown even if diagnostics fail */
+  }
   appAudioLog(
     `screen capture: stopped native capture for ${active.sourceId} (${reason})`,
   );

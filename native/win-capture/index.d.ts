@@ -24,6 +24,38 @@ declare const winCapture: {
     expiredReadbacks: number;
     maxFrameAgeMs: number;
     ready: boolean;
+    sourceWidth: number;
+    sourceHeight: number;
+    nativeBuild: string;
+    acquireTimeouts: number;
+    pointerOnlyFrames: number;
+    accumulatedDesktopFrames: number;
+    accessLosses: number;
+    recoveryAttempts: number;
+    identity: {
+      backend: string;
+      requestedBackend: string;
+      fallbackReason: string;
+      adapter: string;
+      adapterLuid: string;
+      adapterMatchesMonitor: boolean;
+      monitor: string;
+      refreshHz: number;
+      sourceConversion: string;
+    };
+    /** Cumulative snapshots, quantiles are bucket upper bounds. Readback wait
+     * includes GPU queue/execution, OS scheduling and polling observation delay. */
+    timings: Record<
+      string,
+      {
+        count: number;
+        meanMs: number | null;
+        maxMs: number | null;
+        p50UpperMs: number | null;
+        p95UpperMs: number | null;
+        p99UpperMs: number | null;
+      }
+    >;
     running: boolean;
     lastError: string;
   } | null;
@@ -140,6 +172,8 @@ declare const winCapture: {
     },
     /** Physical-pixel point inside the selected monitor; replaces hwnd. */
     monitorOrigin?: { x: number; y: number },
+    /** Opt-in monitor prototype; unsupported setup falls back to WGC. */
+    backend?: "wgc" | "duplication",
   ): boolean;
   /**
    * Requests capture to stop and resolves once the capture thread has
