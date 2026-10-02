@@ -1260,7 +1260,7 @@ double QpcNow100ns() {
 // waits on.
 // ---------------------------------------------------------------------------
 
-void CaptureThread(HWND hwnd) {
+void CaptureThread(HWND hwnd, HMONITOR monitor) {
   HRESULT hr = RoInitialize(RO_INIT_MULTITHREADED);
   const bool roInitialised = SUCCEEDED(hr) || hr == S_FALSE;
 
@@ -1445,9 +1445,11 @@ void CaptureThread(HWND hwnd) {
       SetError("ActivationFactory(GraphicsCaptureItem)", hr);
       break;
     }
-    hr = itemInterop->CreateForWindow(hwnd, IID_PPV_ARGS(&g_item));
+    hr = monitor ? itemInterop->CreateForMonitor(monitor, IID_PPV_ARGS(&g_item))
+                 : itemInterop->CreateForWindow(hwnd, IID_PPV_ARGS(&g_item));
     if (FAILED(hr)) {
-      SetError("IGraphicsCaptureItemInterop::CreateForWindow", hr);
+      SetError(monitor ? "IGraphicsCaptureItemInterop::CreateForMonitor"
+                       : "IGraphicsCaptureItemInterop::CreateForWindow", hr);
       break;
     }
 
@@ -1590,8 +1592,11 @@ void CaptureThread(HWND hwnd) {
       // newest frame and pacing on its own timestamp behaves correctly
       // whether this wait was satisfied by new content, the heartbeat, or a
       // coarse timeout.
-      if (!IsWindow(hwnd)) {
-        SetError("captured window", HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE));
+      MONITORINFO monitorInfo = {};
+      monitorInfo.cbSize = sizeof(monitorInfo);
+      if (monitor ? !GetMonitorInfoW(monitor, &monitorInfo) : !IsWindow(hwnd)) {
+        SetError(monitor ? "captured monitor" : "captured window",
+                 HRESULT_FROM_WIN32(monitor ? ERROR_INVALID_HANDLE : ERROR_INVALID_WINDOW_HANDLE));
         break;
       }
 
@@ -2023,9 +2028,22 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  HWND hwnd = HwndFromValue(info[0]);
-  if (!hwnd || !IsWindow(hwnd)) {
-    Napi::Error::New(env, "invalid window handle").ThrowAsJavaScriptException();
+  HMONITOR monitor = nullptr;
+  HWND hwnd = nullptr;
+  if (info.Length() > 5 && info[5].IsObject()) {
+    auto origin = info[5].As<Napi::Object>();
+    if (!origin.Get("x").IsNumber() || !origin.Get("y").IsNumber()) {
+      Napi::TypeError::New(env, "monitor origin must contain numeric x/y").ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
+    POINT point = {origin.Get("x").As<Napi::Number>().Int32Value(),
+                   origin.Get("y").As<Napi::Number>().Int32Value()};
+    monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONULL);
+  } else {
+    hwnd = HwndFromValue(info[0]);
+  }
+  if (!monitor && (!hwnd || !IsWindow(hwnd))) {
+    Napi::Error::New(env, "invalid window handle or monitor point").ThrowAsJavaScriptException();
     return env.Undefined();
   }
 
@@ -2092,7 +2110,7 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
   SetGpuThreadPriorityInfo("not attempted");
   SetSchedulingPriorityInfo("not attempted");
   g_running.store(true);
-  g_thread = std::thread(CaptureThread, hwnd);
+  g_thread = std::thread(CaptureThread, hwnd, monitor);
   return Napi::Boolean::New(env, true);
 }
 

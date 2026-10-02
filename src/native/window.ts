@@ -414,17 +414,9 @@ async function respondToDisplayMedia(
     }
   }
 
-  // Native GPU-downscaled capture: Windows + window sources only (the agreed
-  // scope boundary -- screen sources and every other platform keep today's
-  // Chromium path untouched). `videoSource` may have been swapped to a screen
-  // above by --window-shares-as-screen, which must NOT go through here: that
-  // flag exists specifically to route a window off WGC, and this module's
-  // whole point is capturing a *window* through WGC, just more cheaply.
-  if (
-    process.platform === "win32" &&
-    isWindow &&
-    videoSource.id === source.id
-  ) {
+  // Native WGC capture for both windows and monitors. Preserve the explicit
+  // --window-shares-as-screen escape hatch to Chromium.
+  if (process.platform === "win32" && videoSource.id === source.id) {
     // The page announced what it asked getDisplayMedia for (see
     // appAudioPatch.ts and takeNextRequestedFps's doc comment); 30 is what we
     // fell back to before that handoff existed, so it stays the default when
@@ -440,7 +432,9 @@ async function respondToDisplayMedia(
     // `if` would test a Promise object, which is always truthy, and this
     // branch would report "native GPU capture" even when start ultimately
     // failed or fell back.
-    if (await startScreenCapture(source.id, fps, sessionId)) {
+    if (
+      await startScreenCapture(source.id, fps, sessionId, source.display_id)
+    ) {
       appAudioLog(
         "video path: native GPU capture (WGC + VideoProcessorBlt) for",
         source.id,

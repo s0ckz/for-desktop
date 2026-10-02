@@ -56,13 +56,13 @@ module.exports = {
     }
   },
   /**
-   * Begin capture of a top-level window. Frames are delivered fit-inside
+   * Begin capture of a top-level window or the monitor containing monitorOrigin. Frames are delivered fit-inside
    * targetWidth x targetHeight (aspect preserved, never stretched -- see
    * index.d.ts), at up to `fps` times per second. Frames produced faster than
    * that are dropped on the native side, never queued.
    */
-  start: (hwnd, targetWidth, targetHeight, fps, onFrame) =>
-    api.start(hwnd, targetWidth, targetHeight, fps, onFrame),
+  start: (hwnd, targetWidth, targetHeight, fps, onFrame, monitorOrigin) =>
+    api.start(hwnd, targetWidth, targetHeight, fps, onFrame, monitorOrigin),
   /**
    * Resolves once the capture thread has actually joined (see index.d.ts).
    * screenCapture.ts's stopNative() awaits this specifically to know when

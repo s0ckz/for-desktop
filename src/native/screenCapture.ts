@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-// Windows native GPU-downscaled window capture for screen sharing.
+// Windows native GPU-downscaled window and monitor capture for screen sharing.
 //
 // getDisplayMedia is contractually bound to hand JavaScript a full-resolution
 // frame, so Chromium's WGC capturer reads back every pixel of the shared
@@ -14,7 +14,7 @@
 // unsupported OS/GPU, or a capture failure is never fatal -- the caller (the
 // page patch in appAudioPatch.ts) falls back to Chromium's own, slower
 // capture path and keeps sharing.
-import { BrowserWindow, ipcMain } from "electron";
+import { BrowserWindow, ipcMain, screen } from "electron";
 
 import {
   log as appAudioLog,
@@ -516,6 +516,7 @@ export async function startForSource(
   sourceId: string,
   fps: number,
   sessionId: number,
+  displayId?: string,
 ): Promise<boolean> {
   // Belt and braces on top of stop()'s own clear: every return path below
   // already sets this to something specific (or to null on success), but
@@ -539,15 +540,24 @@ export async function startForSource(
     return false;
   }
 
+  const isMonitor = sourceId.startsWith("screen:");
+  const display = isMonitor
+    ? screen
+        .getAllDisplays()
+        .find((candidate) => String(candidate.id) === displayId)
+    : undefined;
+  // Convert a point inside this display from DIP to physical pixels. This
+  // works with negative coordinates and mixed DPI without guessing a monitor.
+  const monitorOrigin = display
+    ? screen.dipToScreenPoint({
+        x: Math.round(display.bounds.x + display.bounds.width / 2),
+        y: Math.round(display.bounds.y + display.bounds.height / 2),
+      })
+    : undefined;
   const hwnd = windowHandleFromSourceId(sourceId);
-  if (!hwnd) {
-    // Screen sources have no window handle; this module only ever handles
-    // window shares, by design (see the plan's scope boundary).
-    lastFallbackReason = "source is not a window";
-    appAudioLog(
-      "screen capture: source is not a window, falling back to Chromium capture:",
-      sourceId,
-    );
+  if (isMonitor ? !monitorOrigin : !hwnd) {
+    lastFallbackReason = "selected capture source could not be resolved";
+    appAudioLog("screen capture: cannot resolve selected source:", sourceId);
     return false;
   }
 
@@ -608,11 +618,12 @@ export async function startForSource(
 
   try {
     const started = mod.start(
-      hwnd,
+      hwnd ?? "0",
       CAPTURE_TARGET_WIDTH,
       CAPTURE_TARGET_HEIGHT,
       fps,
       (frame, meta) => onFrame(frame, meta, sessionId),
+      monitorOrigin,
     );
     if (!started) {
       lastFallbackReason = `native start() returned false: ${mod.lastError()}`;
@@ -647,7 +658,7 @@ export async function startForSource(
   stopReason = null;
   active = {
     sourceId,
-    hwnd,
+    hwnd: hwnd ?? "0",
     fps,
     width: CAPTURE_TARGET_WIDTH,
     height: CAPTURE_TARGET_HEIGHT,
@@ -678,7 +689,7 @@ export async function startForSource(
     },
   };
   appAudioLog(
-    `screen capture: native GPU path active for ${sourceId} (hwnd ${hwnd}), target ${CAPTURE_TARGET_WIDTH}x${CAPTURE_TARGET_HEIGHT}@${fps}fps`,
+    `screen capture: native GPU path active for ${sourceId} (${isMonitor ? `display ${displayId}` : `hwnd ${hwnd}`}), target ${CAPTURE_TARGET_WIDTH}x${CAPTURE_TARGET_HEIGHT}@${fps}fps`,
   );
   startWatchdogs();
   broadcastState();
@@ -1012,6 +1023,11 @@ function startWatchdogs() {
   stopWatchdogs();
   pollTimer = setInterval(() => {
     if (!active) return;
+    if (active.sourceId.startsWith("screen:")) {
+      active.stateReadable = true;
+      // The native loop detects monitor removal; window visibility is irrelevant.
+      return;
+    }
     const state = windowStateForSourceId(active.sourceId);
     active.stateReadable = state !== null;
     // No native audio module loaded means no way to tell this way; the frame

@@ -2,7 +2,7 @@ declare const winCapture: {
   isSupported(): boolean;
   /**
    * Start capturing `hwnd` (a desktopCapturer window handle, decimal or
-   * string). Frames are delivered as NV12 buffers fit inside
+   * string), or the monitor containing monitorOrigin when supplied. Frames are delivered as NV12 buffers fit inside
    * targetWidth x targetHeight -- the source aspect ratio is preserved (not
    * stretched, and never upscaled) and both dimensions are rounded to even,
    * so the delivered frame may be smaller than the requested box on either
@@ -113,6 +113,8 @@ declare const winCapture: {
         },
       ): void;
     },
+    /** Physical-pixel point inside the selected monitor; replaces hwnd. */
+    monitorOrigin?: { x: number; y: number },
   ): boolean;
   /**
    * Requests capture to stop and resolves once the capture thread has
