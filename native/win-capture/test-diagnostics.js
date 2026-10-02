@@ -48,6 +48,15 @@ app
         assert.equal(first.identity.requestedBackend, backend);
         assert(first.timings.readbackWait.count > 0);
         assert(first.timings.frameAge.count > 0);
+        assert(first.nativeBuild.startsWith("capture-health-v1"));
+        assert(first.tsfnQueuedFrames > 0);
+        for (const stage of ["acquisition", "submission", "readback"]) {
+          const offset = first.sourceTimestampOffsets[stage];
+          assert(offset.count > 0);
+          assert(Number.isFinite(offset.meanMs));
+          assert(offset.minMs <= offset.maxMs);
+          assert(offset.negativeSamples <= offset.count);
+        }
         if (backend === "duplication") {
           assert.equal(
             first.identity.backend,
@@ -73,7 +82,10 @@ app
           }),
         );
         await capture.stop();
-        assert.equal(capture.diagnostics().running, false);
+        const stopped = capture.diagnostics();
+        assert.equal(stopped.running, false);
+        // Joined worker: packing attempts partition into accepted/rejected frames.
+        assert.equal(stopped.emittedFrames, stopped.tsfnQueuedFrames + stopped.tsfnRejectedFrames);
       }
     }
     assert.throws(() =>

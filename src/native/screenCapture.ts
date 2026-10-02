@@ -338,13 +338,15 @@ let active: {
   /**
    * Latest counters off the frame metadata (see native/win-capture/index.d.ts),
    * kept here so the watchdog's death log can report them alongside
-   * lastError() -- see {@link startWatchdogs}. `refused` is JS-side
-   * backpressure; `poolResizes` is how many times the frame pool was
-   * recreated for a content-size change this session. A death with
+   * lastError() -- see {@link startWatchdogs}. `refused` is a legacy aggregate
+   * of frame rejections and pool-pressure polls; `poolResizes` counts frame-pool
+   * recreations for a content-size change this session. A death with
    * `poolResizes` climbing was mid-resize when it happened; a death at zero
    * is a genuine capture failure.
    */
   refused: number;
+  /** Frames accepted by this session's JS callback, independently of TSFN queuing. */
+  jsDeliveredFrames: number;
   poolResizes: number;
   /** Cumulative DXGI_ERROR_WAS_STILL_DRAWING skips -- see {@link LiveFrameMeta}. */
   stillDrawing: number;
@@ -389,7 +391,7 @@ let active: {
    * bleed into the next share's opening window.
    */
   summary: {
-    /** {@link Date.now} at the start of the window currently accumulating. */
+    /** Monotonic performance.now() at the start of the window currently accumulating. */
     windowStartMs: number;
     /** Frames native actually produced and handed to {@link onFrame} this
      *  window -- the first stage in the pipeline plan PR "no frames" item 6
@@ -671,12 +673,13 @@ export async function startForSource(
     height: CAPTURE_TARGET_HEIGHT,
     targetWidth: CAPTURE_TARGET_WIDTH,
     targetHeight: CAPTURE_TARGET_HEIGHT,
-    lastFrameAt: Date.now(),
-    startedAt: Date.now(),
+    lastFrameAt: performance.now(),
+    startedAt: performance.now(),
     paused: false,
     hiddenByPoll: false,
     stateReadable: true,
     refused: 0,
+    jsDeliveredFrames: 0,
     poolResizes: 0,
     stillDrawing: 0,
     timestampFallbacks: 0,
@@ -685,7 +688,7 @@ export async function startForSource(
     sessionId,
     ready: false,
     summary: {
-      windowStartMs: Date.now(),
+      windowStartMs: performance.now(),
       frames: 0,
       bltMsSum: 0,
       grabMsSum: 0,
@@ -699,11 +702,11 @@ export async function startForSource(
   delivery.start(sessionId);
   // Setup is asynchronous in the addon. Do not replace Chromium's track until
   // device/pool/session initialization succeeds. Older binaries keep working.
-  const deadline = Date.now() + 3000;
+  const deadline = performance.now() + 3000;
   while (active?.sessionId === sessionId && sessionId === newestRequestId) {
     const status = mod.diagnostics?.();
     if (!status || status.ready === undefined || status.ready) break;
-    if (!status.running || Date.now() >= deadline) {
+    if (!status.running || performance.now() >= deadline) {
       const reason = status.lastError || "native capture setup timed out";
       await stop("capture-error", sessionId, reason);
       return false;
@@ -834,7 +837,8 @@ function onFrame(
   }
   // Same reasoning as the death branch above, mirrored for the live case.
   const live = meta as LiveFrameMeta;
-  const now = Date.now();
+  active.jsDeliveredFrames++;
+  const now = performance.now();
   const wasPaused = active.paused;
   active.lastFrameAt = now;
   active.width = live.width;
@@ -987,72 +991,14 @@ function onFrame(
 }
 
 /**
- * REJECTED: stopping (or counting as a native-path failure) whenever
- * `mod.lastError()` reports something, on the theory that a real capture
- * error means the capture thread has exited. The original plan for this PR
- * said exactly that ("stop when lastError() reports a real capture error --
- * thread exited"), and it is wrong. Checked against
- * native/win-capture/src/addon.cc:
- *
- * - `g_lastError` is cleared ONLY inside `Start()` (addon.cc:887) -- it is
- *   sticky for the whole session. Once anything sets it, `lastError()` keeps
- *   returning that same message on every later call until the next
- *   `start()`, whether or not the capture thread is still running and
- *   perfectly healthy.
- * - It gets set on several transient, self-recovering per-frame paths where
- *   the capture thread carries on regardless: `get_Surface` (addon.cc:651),
- *   `QueryInterface(IDirect3DDxgiInterfaceAccess)` (addon.cc:660) and
- *   `GetInterface` (addon.cc:666) each just `continue;` the loop afterward;
- *   and `VideoProcessorBlt` (addon.cc:449) / `Map(staging texture)`
- *   (addon.cc:462) return `false` out of `ProcessFrame`, whose return value
- *   is discarded at its one call site (addon.cc:720) -- the loop does not
- *   even look at it before moving on to the next frame.
- * - The comment block at addon.cc:671-712 documents exactly this: a
- *   `VideoProcessorBlt` failure with `E_INVALIDARG` during a continuous
- *   window resize is an observed, self-recovering condition, not a thread
- *   death -- the fix that block describes exists specifically so that case
- *   stops dropping frames, let alone ending the session.
- * - `Init()` (addon.cc:951-957) exports only `isSupported` / `start` /
- *   `stop` / `setFps` / `lastError` -- there is no run-state export, so
- *   nothing in TypeScript today can distinguish "thread still running, had a
- *   transient hiccup a while ago" from "thread exited" by polling
- *   `lastError()`.
- *
- * Treating `lastError()` as fatal would have ended a share within about one
- * second of the first harmless VideoProcessorBlt hiccup (WINDOW_POLL_MS
- * polling against a value that a resize can set at any moment and that never
- * clears itself), and done it twice over: once by ending the session
- * outright, and again by counting toward MAX_NATIVE_FAILURES and eventually
- * disabling the native path for the rest of the process's life over
- * something that was never a failure to begin with.
- *
- * So `lastError()` is called ONLY as diagnostic context appended to the log
- * line of the one path that actually stops the session below
- * (FRAME_WATCHDOG_NO_STATE_MS) -- exactly how the pre-this-PR code used it.
- * The real fatal signal now exists (A3 item 5): addon.cc invokes the
- * ThreadSafeFunction once more on loop exit with a null frame and lastError()
- * as `reason`, and {@link onFrame}'s null-frame branch drives
- * `stop("capture-error")` from that instead of from any timeout.
- */
-/**
- * REJECTED: a second, longer timeout on the state-readable path (there used
- * to be one here, FRAME_WATCHDOG_HARD_LEAK_MS) ending the session after
- * minutes of silence even though the poll keeps confirming the window is
- * fine. `state.visible` is `IsWindowVisible`, reflecting only WS_VISIBLE --
- * it stays true for an occluded or alt-tabbed window, so the headline
- * scenario (share a fullscreen game, alt-tab away) leaves `hiddenByPoll`
- * false and the guard fires anyway. That is worse than the bug it guarded
- * against: `stop()` ends native capture but leaves the page's generated
- * track frozen instead of `ended`, so for-web never recovers -- permanently
- * frozen, no path back. No unbounded leak to guard against either: the poll
- * ends the session the instant the window closes (`state.exists === false`
- * above). The genuine "capture thread died" signal now exists ({@link
- * onFrame}'s null-frame branch, A3 item 5) and drives `stop("capture-error")`
- * on this path instead of any clock.
+ * Silence alone is legitimate for static/occluded capture. An explicit
+ * diagnostics().running === false is terminal, even if the bounded TSFN
+ * death notification was lost. Transient lastError text alone is not fatal.
  */
 function startWatchdogs() {
   stopWatchdogs();
   const mod = loadNative();
+  const sessionId = active?.sessionId;
   // Older native binaries still work, but cannot supply the new counters.
   if (typeof mod?.diagnostics === "function") {
     let previous: ReturnType<NativeModule["diagnostics"]> = null;
@@ -1061,14 +1007,14 @@ function startWatchdogs() {
     } catch {
       // The periodic report handles this once; diagnostics cannot fail start.
     }
-    let previousAt = Date.now();
-    const sessionId = active?.sessionId;
+    let previousAt = performance.now();
+    let previousJsFrames = active?.jsDeliveredFrames ?? 0;
     diagnosticsTimer = setInterval(() => {
       if (!active || active.sessionId !== sessionId) return;
       try {
         const current = mod.diagnostics();
         if (!current) return;
-        const now = Date.now();
+        const now = performance.now();
         const seconds = (now - previousAt) / 1000;
         const delta = (
           key:
@@ -1092,8 +1038,22 @@ function startWatchdogs() {
             | "accumulatedDesktopFrames"
             | "accessLosses"
             | "recoveryAttempts"
-            | "ringFull",
-        ) => (previous ? Math.max(0, current[key] - previous[key]) : null);
+            | "ringFull"
+            | "tsfnQueuedFrames"
+            | "tsfnRejectedFrames"
+            | "payloadPoolPressurePolls"
+            | "pipelineRebuildDiscards"
+            | "deathNotificationFailures"
+            | "sourceBackwards",
+        ) => {
+          const before = previous?.[key];
+          const value = current[key];
+          return typeof before === "number" &&
+            typeof value === "number" &&
+            value >= before
+            ? value - before
+            : null;
+        };
         const incoming = delta("incomingFrames");
         appAudioLog(
           "screen capture: stages " +
@@ -1118,7 +1078,16 @@ function startWatchdogs() {
               stillDrawing: delta("stillDrawing"),
               refused: delta("refused"),
               submittedFrames: delta("submittedFrames"),
-              emittedFrames: delta("emittedFrames"),
+              emittedFrames: delta("emittedFrames"), // legacy packing-attempt counter
+              packedFrames: delta("emittedFrames"),
+              tsfnQueuedFrames: delta("tsfnQueuedFrames"),
+              tsfnRejectedFrames: delta("tsfnRejectedFrames"),
+              jsDeliveredFrames: active.jsDeliveredFrames - previousJsFrames,
+              payloadPoolPressurePolls: delta("payloadPoolPressurePolls"),
+              pipelineRebuildDiscards: delta("pipelineRebuildDiscards"),
+              deathNotificationFailures: delta("deathNotificationFailures"),
+              sourceBackwards: delta("sourceBackwards"),
+              sourceTimestampOffsets: current.sourceTimestampOffsets ?? null,
               readbackCoalesced: delta("readbackCoalesced"),
               expiredReadbacks: delta("expiredReadbacks"),
               sessionMaxFrameAgeMs: current.maxFrameAgeMs ?? null,
@@ -1143,6 +1112,7 @@ function startWatchdogs() {
             }),
         );
         previous = current;
+        previousJsFrames = active.jsDeliveredFrames;
         previousAt = now;
       } catch (error) {
         // Diagnostic failures must not interrupt a share or spam the log.
@@ -1156,7 +1126,7 @@ function startWatchdogs() {
     }, SUMMARY_INTERVAL_MS);
   }
   pollTimer = setInterval(() => {
-    if (!active) return;
+    if (!active || active.sessionId !== sessionId) return;
     if (active.sourceId.startsWith("screen:")) {
       active.stateReadable = true;
       // The native loop detects monitor removal; window visibility is irrelevant.
@@ -1219,8 +1189,21 @@ function startWatchdogs() {
     }
   }, WINDOW_POLL_MS);
   watchdogTimer = setInterval(() => {
-    if (!active) return;
-    const now = Date.now();
+    if (!active || active.sessionId !== sessionId) return;
+    try {
+      const health = mod?.diagnostics?.();
+      if (health?.running === false) {
+        const reason =
+          health.lastError ||
+          "native worker stopped without a death notification";
+        appAudioLog("screen capture: native liveness failure:", reason);
+        void stop("capture-error", sessionId, reason);
+        return;
+      }
+    } catch {
+      // A missing/failed diagnostics read alone does not end a healthy capture.
+    }
+    const now = performance.now();
     const droughtMs = now - active.lastFrameAt;
 
     if (!active.stateReadable) {
@@ -1549,7 +1532,7 @@ export function stop(
           sourceId: active.sourceId,
           reason,
           failureReason,
-          durationSeconds: (Date.now() - active.startedAt) / 1000,
+          durationSeconds: (performance.now() - active.startedAt) / 1000,
           native: loadNative()?.diagnostics?.(),
           delivery: delivery.snapshot(),
         }),

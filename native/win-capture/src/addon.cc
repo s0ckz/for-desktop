@@ -282,6 +282,7 @@ struct StagingSlot {
   bool pending = false;
 };
 StagingSlot g_stagingRing[kStagingRingSize];
+std::atomic<uint64_t> g_pipelineRebuildDiscards{0};
 uint64_t g_submissionSequence = 0;
 double g_lastEmittedTimestampUs = -1;
 
@@ -467,6 +468,7 @@ bool EnsurePipeline(UINT32 srcW, UINT32 srcH) {
 
   // Rebuilt textures have no submitted copies; reset all pending slots.
   for (int i = 0; i < kStagingRingSize; i++) {
+    if (g_stagingRing[i].pending) g_pipelineRebuildDiscards.fetch_add(1);
     g_stagingRing[i].tex = stagingTex[i];
     g_stagingRing[i].timestampUs = 0;
     g_stagingRing[i].pending = false;
@@ -641,6 +643,9 @@ std::atomic<uint64_t> g_submittedFrames{0}, g_emittedFrames{0}, g_readbackCoales
 std::atomic<uint64_t> g_expiredReadbacks{0}, g_maxFrameAgeUs{0};
 std::atomic<double> g_lastLoopAt100ns{0};
 capture_metrics::Distribution g_sourceGap, g_acquireAge, g_readbackWait, g_frameAge, g_acquireCpu, g_pipelineCpu, g_bridgeCpu;
+capture_metrics::SignedOffset g_sourceAtAcquire, g_sourceAtSubmit, g_sourceAtReadback;
+std::atomic<uint64_t> g_sourceBackwards{0}, g_tsfnQueuedFrames{0}, g_tsfnRejectedFrames{0};
+std::atomic<uint64_t> g_payloadPoolPressurePolls{0}, g_deathNotificationFailures{0};
 std::atomic<uint64_t> g_sourceExtent{0};
 std::atomic<uint64_t> g_acquireTimeouts{0}, g_pointerOnlyFrames{0}, g_accumulatedDesktopFrames{0};
 std::atomic<uint64_t> g_accessLosses{0}, g_recoveryAttempts{0};
@@ -668,8 +673,23 @@ Napi::Object DistributionToJs(Napi::Env env, const capture_metrics::Distribution
 
 void ObserveSource(double ts, double& previous) {
   if (previous > 0 && ts > previous) g_sourceGap.Add((ts - previous) / 10000);
+  if (previous > 0 && ts < previous) g_sourceBackwards.fetch_add(1);
   previous = ts;
-  g_acquireAge.Add((std::max)(0.0, (QpcNow100ns() - ts) / 10000));
+  const double offsetMs = (QpcNow100ns() - ts) / 10000;
+  g_sourceAtAcquire.Add(offsetMs);
+  g_acquireAge.Add((std::max)(0.0, offsetMs));  // legacy clamped metric
+}
+
+Napi::Object SignedOffsetToJs(Napi::Env env, const capture_metrics::SignedOffset& metric) {
+  auto value = Napi::Object::New(env);
+  const auto s = metric.Read();
+  value.Set("count", Napi::Number::New(env, static_cast<double>(s.count)));
+  value.Set("negativeSamples", Napi::Number::New(env, static_cast<double>(s.negative)));
+  auto field = [&](const char* name, double number) {
+    value.Set(name, s.count ? static_cast<Napi::Value>(Napi::Number::New(env, number)) : static_cast<Napi::Value>(env.Null()));
+  };
+  field("meanMs", s.mean); field("minMs", s.minimum); field("maxMs", s.maximum);
+  return value;
 }
 
 Napi::Value Diagnostics(const Napi::CallbackInfo& info) {
@@ -688,6 +708,12 @@ Napi::Value Diagnostics(const Napi::CallbackInfo& info) {
   CAPTURE_COUNTER("refused", g_framesRefused);
   CAPTURE_COUNTER("submittedFrames", g_submittedFrames);
   CAPTURE_COUNTER("emittedFrames", g_emittedFrames);
+  CAPTURE_COUNTER("tsfnQueuedFrames", g_tsfnQueuedFrames);
+  CAPTURE_COUNTER("tsfnRejectedFrames", g_tsfnRejectedFrames);
+  CAPTURE_COUNTER("payloadPoolPressurePolls", g_payloadPoolPressurePolls);
+  CAPTURE_COUNTER("pipelineRebuildDiscards", g_pipelineRebuildDiscards);
+  CAPTURE_COUNTER("deathNotificationFailures", g_deathNotificationFailures);
+  CAPTURE_COUNTER("sourceBackwards", g_sourceBackwards);
   CAPTURE_COUNTER("readbackCoalesced", g_readbackCoalesced);
   CAPTURE_COUNTER("ringFull", g_ringFull);
   CAPTURE_COUNTER("expiredReadbacks", g_expiredReadbacks);
@@ -704,7 +730,7 @@ Napi::Value Diagnostics(const Napi::CallbackInfo& info) {
   result.Set("ready", Napi::Boolean::New(info.Env(), g_ready.load()));
   result.Set("running", Napi::Boolean::New(info.Env(), g_running.load()));
   result.Set("lastError", Napi::String::New(info.Env(), GetErrorText()));
-  result.Set("nativeBuild", "capture-batch3 " __DATE__ " " __TIME__);
+  result.Set("nativeBuild", "capture-health-v1 " __DATE__ " " __TIME__);
   auto timings = Napi::Object::New(info.Env());
   timings.Set("sourceGap", DistributionToJs(info.Env(), g_sourceGap));
   timings.Set("acquisitionAge", DistributionToJs(info.Env(), g_acquireAge));
@@ -714,6 +740,11 @@ Napi::Value Diagnostics(const Napi::CallbackInfo& info) {
   timings.Set("pipelineCpu", DistributionToJs(info.Env(), g_pipelineCpu));
   timings.Set("bridgeCpu", DistributionToJs(info.Env(), g_bridgeCpu));
   result.Set("timings", timings);
+  auto offsets = Napi::Object::New(info.Env());
+  offsets.Set("acquisition", SignedOffsetToJs(info.Env(), g_sourceAtAcquire));
+  offsets.Set("submission", SignedOffsetToJs(info.Env(), g_sourceAtSubmit));
+  offsets.Set("readback", SignedOffsetToJs(info.Env(), g_sourceAtReadback));
+  result.Set("sourceTimestampOffsets", offsets);  // signed local QPC minus source, milliseconds
   const auto sourceSize = g_sourceExtent.load();
   result.Set("sourceWidth", Napi::Number::New(info.Env(), sourceSize >> 32));
   result.Set("sourceHeight", Napi::Number::New(info.Env(), sourceSize & 0xffffffff));
@@ -803,13 +834,18 @@ constexpr int kDeathRetries = 10;
 constexpr DWORD kDeathRetryDelayMs = 5;
 
 void Emit(FramePayload* payload) {
+  const bool isDeath = payload->isDeath;  // queued payload may immediately be released by JS
   auto status = g_tsfn.NonBlockingCall(payload, EmitToJs);
   // Drop, don't queue: once the queue is full NonBlockingCall fails fast
   // instead of buffering. For an ordinary frame that is correct as-is --
   // delivering a stale frame late is worse than skipping it. See the queue
   // size in Start() for why it is not 1.
-  if (status == napi_ok) return;
+  if (status == napi_ok) {
+    if (!isDeath) g_tsfnQueuedFrames.fetch_add(1);
+    return;
+  }
   if (!payload->isDeath) {
+    g_tsfnRejectedFrames.fetch_add(1);
     g_framesRefused.fetch_add(1, std::memory_order_relaxed);
     // Never queued (NonBlockingCall refused it outright), so nothing else
     // can be reading this slot -- released back to the pool (item 3), not
@@ -865,12 +901,9 @@ void Emit(FramePayload* payload) {
     status = g_tsfn.NonBlockingCall(payload, EmitToJs);
   }
   if (status != napi_ok) {
-    // Retries exhausted -- record the drop through the normal error channel
-    // instead of losing it silently. Overwrites whatever g_lastError held
-    // (the death payload's own `reason`, already lost with it); still
-    // surfaced through lastError(), e.g. in the FRAME_WATCHDOG_NO_STATE_MS
-    // log line in screenCapture.ts.
-    SetErrorText("death signal dropped: TSFN queue stayed full after retries");
+    // Preserve the original failure for the independent JS liveness poll.
+    g_deathNotificationFailures.fetch_add(1);
+    SetErrorText(payload->reason + "; death signal dropped: TSFN queue stayed full after retries");
     delete payload;
   }
 }
@@ -925,6 +958,7 @@ bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH, double time
   writeSlot->bltMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - beforeBlt).count();
   writeSlot->timestampUs = timestampUs;
   writeSlot->submittedAt100ns = QpcNow100ns();
+  g_sourceAtSubmit.Add((writeSlot->submittedAt100ns / 10 - timestampUs) / 1000);
   writeSlot->sequence = ++g_submissionSequence;
   writeSlot->pending = true;
   g_context->Flush();
@@ -946,7 +980,7 @@ bool DrainReadback() {
   if (!count) return true;
   std::sort(ordered, ordered + count, [](const auto* a, const auto* b) { return a->sequence > b->sequence; });
   auto* payload = AcquirePooledPayload();
-  if (!payload) { g_framesRefused.fetch_add(1); return true; }
+  if (!payload) { g_framesRefused.fetch_add(1); g_payloadPoolPressurePolls.fetch_add(1); return true; }
   bool notReady = false;
   for (int i = 0; i < count; ++i) {
     auto* slot = ordered[i];
@@ -960,8 +994,11 @@ bool DrainReadback() {
       return false;
     }
     ScopedReadMap unmap{g_context.Get(), slot->tex.Get()};
-    const double ageUs = (std::max)(0.0, QpcNow100ns() / 10 - slot->timestampUs);
-    g_readbackWait.Add((std::max)(0.0, (QpcNow100ns() - slot->submittedAt100ns) / 10000));
+    const double completedAt100ns = QpcNow100ns();
+    const double sourceAgeUs = completedAt100ns / 10 - slot->timestampUs;
+    g_sourceAtReadback.Add(sourceAgeUs / 1000);
+    const double ageUs = (std::max)(0.0, sourceAgeUs);
+    g_readbackWait.Add((std::max)(0.0, (completedAt100ns - slot->submittedAt100ns) / 10000));
     g_frameAge.Add(ageUs / 1000);  // includes expired copies, avoiding survivor bias
     if (capture_policy::Expired(ageUs, slot->sequence, g_submissionSequence)) {
       slot->pending = false;  // scoped Unmap precedes slot reuse
@@ -1734,7 +1771,7 @@ void CaptureThread(HWND hwnd, HMONITOR monitor, bool requestDuplication) {
   }
 
   g_outputView.Reset();
-  for (auto& slot : g_stagingRing) slot.tex.Reset();
+  for (auto& slot : g_stagingRing) { slot.tex.Reset(); slot.pending = false; }
   g_outputTex.Reset();
   g_videoProcessor.Reset();
   g_vpEnum.Reset();
@@ -1987,6 +2024,9 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
   g_maxLoopGapUs.store(0); g_lastLoopAt100ns.store(QpcNow100ns());
   g_submittedFrames.store(0); g_emittedFrames.store(0); g_readbackCoalesced.store(0); g_ringFull.store(0);
   g_expiredReadbacks.store(0); g_maxFrameAgeUs.store(0);
+  g_tsfnQueuedFrames.store(0); g_tsfnRejectedFrames.store(0); g_payloadPoolPressurePolls.store(0);
+  g_pipelineRebuildDiscards.store(0); g_deathNotificationFailures.store(0); g_sourceBackwards.store(0);
+  g_sourceAtAcquire.Reset(); g_sourceAtSubmit.Reset(); g_sourceAtReadback.Reset();
   g_sourceGap.Reset(); g_acquireAge.Reset(); g_readbackWait.Reset(); g_frameAge.Reset(); g_acquireCpu.Reset(); g_pipelineCpu.Reset(); g_bridgeCpu.Reset();
   g_sourceExtent.store(0); g_acquireTimeouts.store(0); g_pointerOnlyFrames.store(0); g_accumulatedDesktopFrames.store(0);
   g_accessLosses.store(0); g_recoveryAttempts.store(0);

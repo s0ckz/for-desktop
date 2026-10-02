@@ -1,5 +1,5 @@
 param(
-  [string]$AppPath = "$PSScriptRoot\out-capture-batch3\Stoat-win32-x64\stoat-desktop.exe",
+  [string]$AppPath = "$PSScriptRoot\out-capture-health\Stoat-win32-x64\stoat-desktop.exe",
   [string]$WebRoot = "$PSScriptRoot\..\for-web\packages\client",
   [switch]$CheckOnly,
   [ValidateSet('wgc', 'duplication')][string]$Backend = 'wgc'
@@ -14,6 +14,10 @@ $asset = [regex]::Match($index, 'src="(/assets/index-[^"]+\.js)"').Groups[1].Val
 if (!$asset) { throw 'Local web build has no entry asset' }
 $js = Get-Content (Join-Path $dist $asset.TrimStart('/')) -Raw
 if (!$js.Contains('[rtc] screen share sender')) { throw 'Local web build lacks sender diagnostics; rebuild for-web' }
+if (!$js.Contains('Presented FPS (compositor)')) { throw 'Local web build lacks presentation telemetry; rebuild for-web' }
+$webEntry = Get-Item (Join-Path $dist $asset.TrimStart('/'))
+$newestWebSource = Get-ChildItem "$WebRoot\components" -File -Recurse | Where-Object { $_.Extension -in @('.ts', '.tsx') } | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+if ($webEntry.LastWriteTimeUtc -lt $newestWebSource.LastWriteTimeUtc) { throw 'Local web build is older than client source; rebuild for-web' }
 $native = Join-Path (Split-Path $AppPath) 'resources\app.asar.unpacked\node_modules\win-capture\build\Release\win_capture.node'
 $compiled = Join-Path $PSScriptRoot 'node_modules\win-capture\build\Release\win_capture.node'
 if (!(Test-Path $native) -or (Get-FileHash $native).Hash -ne (Get-FileHash $compiled).Hash) { throw 'Packaged native addon differs from the locally compiled addon; repackage' }
@@ -44,4 +48,4 @@ if (!$page -or !$page.Content.Contains($asset)) { throw 'Port 4173 is not servin
 $served = Invoke-WebRequest "$url$asset" -UseBasicParsing -TimeoutSec 10
 if (!$served.Content.Contains('[rtc] screen share sender')) { throw 'Served web entry lacks sender diagnostics' }
 Write-Output "Opening $AppPath with --force-server=$url --native-monitor-backend=$Backend"
-Start-Process $AppPath -ArgumentList @("--force-server=$url", "--native-monitor-backend=$Backend")
+Start-Process $AppPath -ArgumentList @("--force-server=$url", "--native-monitor-backend=$Backend") -WindowStyle Hidden

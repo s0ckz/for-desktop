@@ -48,6 +48,16 @@ int main() {
   distribution.Add(INFINITY); distribution.Add(-1);
   assert(distribution.Read().count == 100);
   distribution.Reset(); assert(distribution.Read().count == 0);
+  capture_metrics::SignedOffset offset;
+  assert(offset.Read().count == 0);
+  offset.Add(-40); offset.Add(0); offset.Add(100);
+  auto signedMetric = offset.Read();
+  assert(signedMetric.count == 3 && signedMetric.negative == 1);
+  assert(signedMetric.mean == 20 && signedMetric.minimum == -40 && signedMetric.maximum == 100);
+  offset.Add(INFINITY); offset.Add(NAN);
+  assert(offset.Read().count == 3);
+  offset.Reset(); offset.Add(-10);
+  assert(offset.Read().mean == -10 && offset.Read().maximum == -10);
   const auto size = capture_policy::Fit(3440, 1440, 1279, 719);
   assert(size.width <= 1279 && size.height <= 719 && !(size.width % 2) && !(size.height % 2));
   std::cout << "CAPTURE POLICY PASS\n";

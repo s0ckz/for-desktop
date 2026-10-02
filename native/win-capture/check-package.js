@@ -5,7 +5,7 @@ const crypto = require("node:crypto");
 const asar = require("@electron/asar");
 const root = path.resolve(__dirname, "../..");
 const packaged = path.resolve(
-  process.argv[2] || path.join(root, "out-capture-batch3", "Stoat-win32-x64"),
+  process.argv[2] || path.join(root, "out-capture-health", "Stoat-win32-x64"),
 );
 const resources = path.join(packaged, "resources");
 const archive = path.join(resources, "app.asar");
@@ -22,6 +22,9 @@ for (const marker of [
   "screen capture: session start",
   "screen capture: session final",
   "timings",
+  "native liveness failure",
+  "sourceTimestampOffsets",
+  "tsfnQueuedFrames",
   "app-audio.log",
 ]) {
   assert(main.includes(marker), "Packaged main missing: " + marker);
@@ -34,7 +37,9 @@ const nativeBinary = fs.readFileSync(
   path.join(resources, "app.asar.unpacked", relative),
 );
 for (const marker of [
-  "capture-batch3",
+  "capture-health-v1",
+  "sourceTimestampOffsets",
+  "payloadPoolPressurePolls",
   "readbackWait",
   "sourceConversion",
   "DuplicateOutput",

@@ -13,11 +13,32 @@ declare const winCapture: {
     longLoopGaps: number;
     /** Heartbeat polls where no pending copy was ready. Frames remain pending. */
     stillDrawing: number;
+    /** Legacy aggregate: TSFN frame rejection plus payload-pressure polls. Not a frame-drop count. */
     refused: number;
     maxLoopGapMs: number;
     loopIdleMs: number;
     submittedFrames: number;
+    /** Frames packed for attempted delivery, before TSFN acceptance. */
     emittedFrames: number;
+    tsfnQueuedFrames: number;
+    tsfnRejectedFrames: number;
+    payloadPoolPressurePolls: number;
+    pipelineRebuildDiscards: number;
+    deathNotificationFailures: number;
+    sourceBackwards: number;
+    /** Signed local QPC minus raw source time (ms). Negative samples expose
+     * future source timestamps/clock mismatch. Stages have different populations;
+     * these means must not be subtracted to estimate GPU time. */
+    sourceTimestampOffsets: Record<
+      string,
+      {
+        count: number;
+        negativeSamples: number;
+        meanMs: number | null;
+        minMs: number | null;
+        maxMs: number | null;
+      }
+    >;
     readbackCoalesced: number;
     ringFull: number;
     /** Completed copies discarded after 250ms when a newer submission exists. */

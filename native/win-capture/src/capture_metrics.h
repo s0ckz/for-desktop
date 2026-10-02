@@ -44,4 +44,32 @@ class Distribution {
   std::array<std::atomic<uint64_t>, 13> buckets_{};
   std::atomic<uint64_t> totalUs_{0}, maximumUs_{0};
 };
+
+// Source timestamps are diagnostic clock inputs: preserve future/negative
+// offsets instead of silently making them look like zero latency.
+class SignedOffset {
+ public:
+  struct Snapshot { uint64_t count, negative; double mean, minimum, maximum; };
+  void Reset() {
+    count_.store(0); negative_.store(0);
+    total_.store(0); minimum_.store(0); maximum_.store(0);
+  }
+  void Add(double ms) {
+    if (!std::isfinite(ms)) return;
+    const auto count = count_.load();
+    total_.store(total_.load() + ms);
+    if (!count || ms < minimum_.load()) minimum_.store(ms);
+    if (!count || ms > maximum_.load()) maximum_.store(ms);
+    if (ms < 0) negative_.fetch_add(1);
+    count_.fetch_add(1);
+  }
+  Snapshot Read() const {
+    const auto count = count_.load();
+    return {count, negative_.load(), count ? total_.load() / count : 0,
+      minimum_.load(), maximum_.load()};
+  }
+ private:
+  std::atomic<uint64_t> count_{0}, negative_{0};
+  std::atomic<double> total_{0}, minimum_{0}, maximum_{0};
+};
 }  // namespace capture_metrics
