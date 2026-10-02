@@ -103,3 +103,38 @@ mise assets
 ```
 
 Currently, this is required to build, any forks are expected to provide their own assets.
+
+## Screen share diagnostics
+
+On Windows, native window and monitor shares write diagnostics to
+`%APPDATA%/stoat-desktop/logs/app-audio.log`. `screen capture: stages` is emitted
+approximately every 10 seconds independently of pixel delivery, including
+when a share has frozen. It reports incoming frames, frames discarded while
+draining the pool, pacing skips, processing attempts/failures, surface/pool
+read failures, and readback/queue drops as **interval deltas**. `incomingFps`
+is the retrieved WGC frame rate, not encoded or viewer FPS. `longLoopGaps`
+counts intervals exceeding twice the requested frame interval;
+`sessionMaxLoopGapMs` is a session maximum. Loop gaps include waiting,
+scheduling, and prior processing; they are not GPU execution timings.
+`loopIdleMs` and `frameDroughtMs` distinguish lack of thread progress from
+lack of delivered frames. `lastError` may describe a recovered failure.
+
+The matching web-client sender diagnostics appear as `[rtc] screen share sender`
+and are forwarded into this same file by the desktop shell. These require the
+web-client diagnostics change to be loaded, either from its hosted deployment
+or with `--force-server` pointing to a local client. Closing the stats panel
+does not stop collection. These measurements do not alter capture quality,
+codec choice, bitrate, or scheduling.
+
+Validation commands:
+
+```powershell
+node src/native/screenCapture.diagnostics.test.cjs
+node native/win-capture/check-exports.js
+# After rebuilding the native addon for Electron:
+.\node_modules\electron\dist\electron.exe native/win-capture/test-diagnostics.js
+```
+
+The Electron smoke test captures attached monitors briefly and verifies
+counter snapshots, teardown, and invalid monitor selection; static monitors
+may produce no delivered pixels while their diagnostics remain readable.

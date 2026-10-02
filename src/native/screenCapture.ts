@@ -432,6 +432,7 @@ let active: {
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let watchdogTimer: ReturnType<typeof setInterval> | null = null;
+let diagnosticsTimer: ReturnType<typeof setInterval> | null = null;
 
 /**
  * The main-process end of the dedicated frame-delivery channel (plan PR A4
@@ -1021,6 +1022,81 @@ function onFrame(
  */
 function startWatchdogs() {
   stopWatchdogs();
+  const mod = loadNative();
+  // Older native binaries still work, but cannot supply the new counters.
+  if (typeof mod?.diagnostics === "function") {
+    let previous: ReturnType<NativeModule["diagnostics"]> = null;
+    try {
+      previous = mod.diagnostics();
+    } catch {
+      // The periodic report handles this once; diagnostics cannot fail start.
+    }
+    let previousAt = Date.now();
+    const sessionId = active?.sessionId;
+    diagnosticsTimer = setInterval(() => {
+      if (!active || active.sessionId !== sessionId) return;
+      try {
+        const current = mod.diagnostics();
+        if (!current) return;
+        const now = Date.now();
+        const seconds = (now - previousAt) / 1000;
+        const delta = (
+          key:
+            | "arrivalEvents"
+            | "incomingFrames"
+            | "drainedFrames"
+            | "pacingSkips"
+            | "processAttempts"
+            | "processFailures"
+            | "poolReadFailures"
+            | "surfaceFailures"
+            | "longLoopGaps"
+            | "stillDrawing"
+            | "refused",
+        ) => (previous ? Math.max(0, current[key] - previous[key]) : null);
+        const incoming = delta("incomingFrames");
+        appAudioLog(
+          "screen capture: stages " +
+            JSON.stringify({
+              sessionId,
+              sourceId: active.sourceId,
+              target: [active.targetWidth, active.targetHeight, active.fps],
+              intervalSeconds: Number(seconds.toFixed(3)),
+              incomingFps:
+                incoming !== null && seconds > 0
+                  ? Number((incoming / seconds).toFixed(1))
+                  : null,
+              arrivalEvents: delta("arrivalEvents"),
+              incomingFrames: incoming,
+              drainedFrames: delta("drainedFrames"),
+              pacingSkips: delta("pacingSkips"),
+              processAttempts: delta("processAttempts"),
+              processFailures: delta("processFailures"),
+              poolReadFailures: delta("poolReadFailures"),
+              surfaceFailures: delta("surfaceFailures"),
+              longLoopGaps: delta("longLoopGaps"),
+              stillDrawing: delta("stillDrawing"),
+              refused: delta("refused"),
+              sessionMaxLoopGapMs: Number(current.maxLoopGapMs.toFixed(2)),
+              loopIdleMs: Number(current.loopIdleMs.toFixed(2)),
+              frameDroughtMs: now - active.lastFrameAt,
+              running: current.running,
+              lastError: current.lastError.slice(0, 400),
+            }),
+        );
+        previous = current;
+        previousAt = now;
+      } catch (error) {
+        // Diagnostic failures must not interrupt a share or spam the log.
+        appAudioLog(
+          "screen capture: stage diagnostics unavailable:",
+          String(error),
+        );
+        if (diagnosticsTimer) clearInterval(diagnosticsTimer);
+        diagnosticsTimer = null;
+      }
+    }, SUMMARY_INTERVAL_MS);
+  }
   pollTimer = setInterval(() => {
     if (!active) return;
     if (active.sourceId.startsWith("screen:")) {
@@ -1134,6 +1210,8 @@ function startWatchdogs() {
 function stopWatchdogs() {
   if (pollTimer) clearInterval(pollTimer);
   if (watchdogTimer) clearInterval(watchdogTimer);
+  if (diagnosticsTimer) clearInterval(diagnosticsTimer);
+  diagnosticsTimer = null;
   pollTimer = null;
   watchdogTimer = null;
 }

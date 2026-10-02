@@ -33,7 +33,10 @@ Napi::Value EmptyString(const Napi::CallbackInfo& info) {
   return Napi::String::New(info.Env(), "unsupported platform");
 }
 
+Napi::Value NoDiagnostics(const Napi::CallbackInfo& info) { return info.Env().Null(); }
+
 Napi::Object Init(Napi::Env env, Napi::Object exports) {
+  exports.Set("diagnostics", Napi::Function::New(env, NoDiagnostics));
   exports.Set("isSupported", Napi::Function::New(env, NotSupported));
   exports.Set("start", Napi::Function::New(env, FalseNoop));
   exports.Set("stop", Napi::Function::New(env, ResolvedStop));

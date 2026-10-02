@@ -758,6 +758,40 @@ std::atomic<uint64_t> g_timestampFallbacks{0};
  */
 std::atomic<uint64_t> g_timestampDiscontinuities{0};
 
+// Independent of pixel delivery: JS can sample these even during a drought.
+// All counters reset before the capture thread starts; the getter only reads
+// atomics and the existing error mutex, never the thread-owned D3D objects.
+std::atomic<uint64_t> g_arrivalEvents{0}, g_incomingFrames{0}, g_drainedFrames{0};
+std::atomic<uint64_t> g_pacingSkips{0}, g_processAttempts{0}, g_processFailures{0};
+std::atomic<uint64_t> g_poolReadFailures{0}, g_surfaceFailures{0}, g_longLoopGaps{0};
+std::atomic<uint64_t> g_maxLoopGapUs{0};
+std::atomic<double> g_lastLoopAt100ns{0};
+
+double QpcNow100ns();
+
+Napi::Value Diagnostics(const Napi::CallbackInfo& info) {
+  auto result = Napi::Object::New(info.Env());
+#define CAPTURE_COUNTER(name, counter) result.Set(name, Napi::Number::New(info.Env(), static_cast<double>(counter.load(std::memory_order_relaxed))))
+  CAPTURE_COUNTER("arrivalEvents", g_arrivalEvents);
+  CAPTURE_COUNTER("incomingFrames", g_incomingFrames);
+  CAPTURE_COUNTER("drainedFrames", g_drainedFrames);
+  CAPTURE_COUNTER("pacingSkips", g_pacingSkips);
+  CAPTURE_COUNTER("processAttempts", g_processAttempts);
+  CAPTURE_COUNTER("processFailures", g_processFailures);
+  CAPTURE_COUNTER("poolReadFailures", g_poolReadFailures);
+  CAPTURE_COUNTER("surfaceFailures", g_surfaceFailures);
+  CAPTURE_COUNTER("longLoopGaps", g_longLoopGaps);
+  CAPTURE_COUNTER("stillDrawing", g_framesStillDrawing);
+  CAPTURE_COUNTER("refused", g_framesRefused);
+#undef CAPTURE_COUNTER
+  result.Set("maxLoopGapMs", Napi::Number::New(info.Env(), g_maxLoopGapUs.load() / 1000.0));
+  const double lastLoop = g_lastLoopAt100ns.load(std::memory_order_relaxed);
+  result.Set("loopIdleMs", Napi::Number::New(info.Env(), lastLoop > 0 ? (QpcNow100ns() - lastLoop) / 10000.0 : 0));
+  result.Set("running", Napi::Boolean::New(info.Env(), g_running.load()));
+  result.Set("lastError", Napi::String::New(info.Env(), GetErrorText()));
+  return result;
+}
+
 // Named (not an inline lambda at the call site) so Emit() below can pass it
 // to more than one NonBlockingCall attempt when retrying a death payload.
 void EmitToJs(Napi::Env env, Napi::Function cb, FramePayload* p) {
@@ -1173,6 +1207,7 @@ class FrameArrivedHandler
   }
 
   IFACEMETHODIMP Invoke(WGC::IDirect3D11CaptureFramePool*, IInspectable*) override {
+    g_arrivalEvents.fetch_add(1, std::memory_order_relaxed);
     // Load once rather than SetEvent(frameEvent_.load()) inline -- not for
     // correctness (both read it exactly once either way), just so the value
     // actually being signalled is visible in a debugger/crash dump.
@@ -1533,6 +1568,7 @@ void CaptureThread(HWND hwnd, HMONITOR monitor) {
     // above for why it no longer has any say in which frames get delivered.
     auto nextTick = std::chrono::steady_clock::now();
 
+    auto previousLoopWake = std::chrono::steady_clock::now();
     while (g_running.load()) {
       const auto now = std::chrono::steady_clock::now();
       // Re-read every iteration, same reasoning as before this PR: a
@@ -1586,6 +1622,15 @@ void CaptureThread(HWND hwnd, HMONITOR monitor) {
         SetError("WaitForMultipleObjects", HRESULT_FROM_WIN32(GetLastError()));
         break;
       }
+      const auto loopWake = std::chrono::steady_clock::now();
+      const auto gapUs = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(loopWake - previousLoopWake).count());
+      previousLoopWake = loopWake;
+      g_lastLoopAt100ns.store(QpcNow100ns(), std::memory_order_relaxed);
+      if (gapUs > static_cast<uint64_t>(2.0e6 / fps)) g_longLoopGaps.fetch_add(1, std::memory_order_relaxed);
+      auto priorMax = g_maxLoopGapUs.load(std::memory_order_relaxed);
+      while (gapUs > priorMax && !g_maxLoopGapUs.compare_exchange_weak(priorMax, gapUs, std::memory_order_relaxed)) {}
+      // This gap includes OS wait/scheduling and the previous iteration's
+      // work. It is not a pure GPU timing measurement.
       // Anything else -- frameEvent, pacingTimer, or WAIT_TIMEOUT on the
       // fallback path -- all fall through to the same check-and-drain below.
       // Which one woke this iteration does not matter: draining to the
@@ -1607,7 +1652,14 @@ void CaptureThread(HWND hwnd, HMONITOR monitor) {
       for (;;) {
         ComPtr<WGC::IDirect3D11CaptureFrame> next;
         HRESULT frHr = g_framePool->TryGetNextFrame(&next);
-        if (FAILED(frHr) || !next) break;
+        if (FAILED(frHr)) {
+          g_poolReadFailures.fetch_add(1, std::memory_order_relaxed);
+          SetError("TryGetNextFrame", frHr);
+          break;
+        }
+        if (!next) break;
+        g_incomingFrames.fetch_add(1, std::memory_order_relaxed);
+        if (frame) g_drainedFrames.fetch_add(1, std::memory_order_relaxed);
         frame = next;  // the previously-held frame (if any) is Released here
       }
       if (!frame) continue;  // nothing new since last wait
@@ -1699,6 +1751,7 @@ void CaptureThread(HWND hwnd, HMONITOR monitor) {
         nextDeliverTs = -1.0;
       }
       if (nextDeliverTs >= 0.0 && ts < nextDeliverTs) {
+        g_pacingSkips.fetch_add(1, std::memory_order_relaxed);
         continue;  // before the next scheduled delivery -- drop (Release only, same as any other drop)
       }
       lastDeliveredTs = ts;
@@ -1726,12 +1779,17 @@ void CaptureThread(HWND hwnd, HMONITOR monitor) {
       }
 
       WG::SizeInt32 contentSize{};
-      frame->get_ContentSize(&contentSize);
-      if (contentSize.Width <= 0 || contentSize.Height <= 0) continue;
+      hr = frame->get_ContentSize(&contentSize);
+      if (FAILED(hr) || contentSize.Width <= 0 || contentSize.Height <= 0) {
+        g_surfaceFailures.fetch_add(1, std::memory_order_relaxed);
+        if (FAILED(hr)) SetError("IDirect3D11CaptureFrame::get_ContentSize", hr);
+        continue;
+      }
 
       ComPtr<WGDD::IDirect3DSurface> surface;
       hr = frame->get_Surface(&surface);
       if (FAILED(hr)) {
+        g_surfaceFailures.fetch_add(1, std::memory_order_relaxed);
         SetError("IDirect3D11CaptureFrame::get_Surface", hr);
         continue;
       }
@@ -1742,12 +1800,14 @@ void CaptureThread(HWND hwnd, HMONITOR monitor) {
       ComPtr<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess> access;
       hr = surface.As(&access);
       if (FAILED(hr)) {
+        g_surfaceFailures.fetch_add(1, std::memory_order_relaxed);
         SetError("QueryInterface(IDirect3DDxgiInterfaceAccess)", hr);
         continue;
       }
       ComPtr<ID3D11Texture2D> srcTex;
       hr = access->GetInterface(IID_PPV_ARGS(&srcTex));
       if (FAILED(hr)) {
+        g_surfaceFailures.fetch_add(1, std::memory_order_relaxed);
         SetError("IDirect3DDxgiInterfaceAccess::GetInterface", hr);
         continue;
       }
@@ -1801,7 +1861,10 @@ void CaptureThread(HWND hwnd, HMONITOR monitor) {
       // lived in.
       D3D11_TEXTURE2D_DESC srcDesc{};
       srcTex->GetDesc(&srcDesc);
-      ProcessFrame(srcTex.Get(), srcDesc.Width, srcDesc.Height, ts / 10.0);
+      g_processAttempts.fetch_add(1, std::memory_order_relaxed);
+      if (!ProcessFrame(srcTex.Get(), srcDesc.Width, srcDesc.Height, ts / 10.0)) {
+        g_processFailures.fetch_add(1, std::memory_order_relaxed);
+      }
 
       // Recreate the pool for the window's current content size if it has
       // drifted from what the pool was last built for. Deliberately after
@@ -2104,6 +2167,10 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
   g_framesStillDrawing.store(0);
   g_timestampFallbacks.store(0);
   g_timestampDiscontinuities.store(0);
+  g_arrivalEvents.store(0); g_incomingFrames.store(0); g_drainedFrames.store(0);
+  g_pacingSkips.store(0); g_processAttempts.store(0); g_processFailures.store(0);
+  g_poolReadFailures.store(0); g_surfaceFailures.store(0); g_longLoopGaps.store(0);
+  g_maxLoopGapUs.store(0); g_lastLoopAt100ns.store(QpcNow100ns());
   // Same reasoning: a later share should never look like it inherited an
   // earlier session's GPU-priority outcome before CaptureThread (below) has
   // had a chance to run its own attempt and overwrite this.
@@ -2281,6 +2348,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("setFps", Napi::Function::New(env, SetFps));
   exports.Set("setTarget", Napi::Function::New(env, SetTarget));
   exports.Set("lastError", Napi::Function::New(env, LastError));
+  exports.Set("diagnostics", Napi::Function::New(env, Diagnostics));
 
   // Item 5 / R5: nothing previously stopped native capture on quit. Left
   // alone, an in-progress g_thread reaches static destruction as a still-

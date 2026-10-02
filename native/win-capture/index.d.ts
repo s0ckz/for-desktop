@@ -1,5 +1,23 @@
 declare const winCapture: {
   isSupported(): boolean;
+  /** Cumulative session counters; callable without waiting for a video frame. */
+  diagnostics(): {
+    arrivalEvents: number;
+    incomingFrames: number;
+    drainedFrames: number;
+    pacingSkips: number;
+    processAttempts: number;
+    processFailures: number;
+    poolReadFailures: number;
+    surfaceFailures: number;
+    longLoopGaps: number;
+    stillDrawing: number;
+    refused: number;
+    maxLoopGapMs: number;
+    loopIdleMs: number;
+    running: boolean;
+    lastError: string;
+  } | null;
   /**
    * Start capturing `hwnd` (a desktopCapturer window handle, decimal or
    * string), or the monitor containing monitorOrigin when supplied. Frames are delivered as NV12 buffers fit inside

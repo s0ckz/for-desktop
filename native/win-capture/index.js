@@ -24,6 +24,7 @@ const METHODS = [
   "setFps",
   "setTarget",
   "lastError",
+  "diagnostics",
 ];
 
 const unavailable = {};
@@ -37,6 +38,8 @@ unavailable.stop = () => Promise.resolve();
 unavailable.lastError = () =>
   loadError ? String(loadError.message || loadError) : "not loaded";
 
+unavailable.diagnostics = () => null;
+
 const api = native || unavailable;
 
 // This object must mirror index.d.ts exactly: every method declared there
@@ -47,6 +50,7 @@ const api = native || unavailable;
 // assume the harness exercises a method just because it goes through this
 // wrapper; check test-capture.js's own call list, or check-exports.js.
 module.exports = {
+  diagnostics: () => api.diagnostics?.() ?? null,
   /** True when the running OS/GPU can do Windows Graphics Capture with a video processor. */
   isSupported: () => {
     try {
