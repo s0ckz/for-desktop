@@ -11,10 +11,19 @@ declare const winCapture: {
     poolReadFailures: number;
     surfaceFailures: number;
     longLoopGaps: number;
+    /** Heartbeat polls where no pending copy was ready. Frames remain pending. */
     stillDrawing: number;
     refused: number;
     maxLoopGapMs: number;
     loopIdleMs: number;
+    submittedFrames: number;
+    emittedFrames: number;
+    readbackCoalesced: number;
+    ringFull: number;
+    /** Completed copies discarded after 250ms when a newer submission exists. */
+    expiredReadbacks: number;
+    maxFrameAgeMs: number;
+    ready: boolean;
     running: boolean;
     lastError: string;
   } | null;
@@ -22,12 +31,12 @@ declare const winCapture: {
    * Start capturing `hwnd` (a desktopCapturer window handle, decimal or
    * string), or the monitor containing monitorOrigin when supplied. Frames are delivered as NV12 buffers fit inside
    * targetWidth x targetHeight -- the source aspect ratio is preserved (not
-   * stretched, and never upscaled) and both dimensions are rounded to even,
+   * stretched, and never upscaled) and both dimensions are rounded down to even,
    * so the delivered frame may be smaller than the requested box on either
    * axis, or both (a source smaller than the box on both axes is captured at
-   * its own size). `fps` bounds how often onFrame fires; frames arriving
-   * faster are dropped, not queued. Returns true if the native capture
-   * session was started.
+   * its own size). `fps` bounds submission rate with at most two frames of
+   * bounded jitter credit. Returns true when the worker was launched;
+   * diagnostics().ready confirms successful asynchronous capture setup.
    *
    * onFrame also fires exactly once more when the capture thread exits, for
    * whatever reason (window gone, an unrecoverable capture error, or an
@@ -53,7 +62,9 @@ declare const winCapture: {
         meta: {
           width: number;
           height: number;
+          /** CPU time submitting the blit/copy; not GPU execution time. */
           bltMs: number;
+          /** CPU time for a successful nonblocking Map and NV12 packing. */
           grabMs: number;
           /** Frames the JS side refused because it wasn't ready in time (see
            *  screenCapture.ts's ThreadSafeFunction queue). Cumulative for this
@@ -64,12 +75,8 @@ declare const winCapture: {
            *  with this climbing was mid-resize; one that dies at zero hit a
            *  genuine capture failure. Cumulative for this capture session. */
           poolResizes: number;
-          /** Times the staging-texture readback (D3D11_MAP_FLAG_DO_NOT_WAIT)
-           *  returned DXGI_ERROR_WAS_STILL_DRAWING and the frame was skipped
-           *  -- an ordinary pacing drop, not a failure, but one worth seeing
-           *  climb: a session stuck at this incrementing on every frame is
-           *  delivering nothing and this is why. Cumulative for this capture
-           *  session. */
+          /** Readback polls where pending copies were not ready yet.
+           *  These copies remain pending; this is not a dropped-frame count. */
           stillDrawing: number;
           /** Times frame->get_SystemRelativeTime() failed, or returned
            *  Duration == 0, and pacing fell back to a QueryPerformanceCounter

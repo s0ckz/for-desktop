@@ -61,6 +61,15 @@ new Function("require", "module", "exports", code)(
     if (name === "electron") return electron;
     if (name === "./appAudio") return audio;
     if (name === "win-capture") return native;
+    if (name === "./frameDelivery") {
+      const code = ts.transpileModule(
+        fs.readFileSync(path.join(__dirname, "frameDelivery.ts"), "utf8"),
+        { compilerOptions: { module: ts.ModuleKind.CommonJS } },
+      ).outputText;
+      const m = { exports: {} };
+      new Function("module", "exports", code)(m, m.exports);
+      return m.exports;
+    }
     throw Error("unexpected import " + name);
   },
   captureModule,

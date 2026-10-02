@@ -29,6 +29,7 @@ import { APP_AUDIO_PATCH } from "./appAudioPatch";
 import { config, getPersistedServer } from "./config";
 import {
   SCREEN_CAPTURE_FRAME_PORT,
+  isCurrentScreenCaptureSession,
   resetNativeFailures,
   setFramePort,
   setLiveFps as setScreenCaptureFps,
@@ -636,14 +637,19 @@ async function primaryScreenSource(): Promise<Electron.DesktopCapturerSource | n
  * Lives here rather than in screenCapture.ts so `--capture-fps` still wins,
  * exactly as it does for the initial rate in respondToDisplayMedia.
  */
-ipcMain.on("screenCapture:setFps", (_event, fps: unknown) => {
-  if (typeof fps !== "number" || !Number.isFinite(fps)) {
-    appAudioLog("screen capture: ignoring invalid setFps value:", fps);
-    return;
-  }
-  const cap = captureFpsCap();
-  setScreenCaptureFps(cap !== null ? Math.min(fps, cap) : fps);
-});
+ipcMain.on(
+  "screenCapture:setFps",
+  (_event, fps: unknown, sessionId?: number) => {
+    if (sessionId !== undefined && !isCurrentScreenCaptureSession(sessionId))
+      return;
+    if (typeof fps !== "number" || !Number.isFinite(fps)) {
+      appAudioLog("screen capture: ignoring invalid setFps value:", fps);
+      return;
+    }
+    const cap = captureFpsCap();
+    setScreenCaptureFps(cap !== null ? Math.min(fps, cap) : fps);
+  },
+);
 
 /**
  * The renderer's own record of whether a voice call is live -- see

@@ -25,8 +25,9 @@ app
       const first = capture.diagnostics();
       assert(first.incomingFrames > 0);
       assert(first.processAttempts > 0);
-      // A static monitor may not fill the staging ring. Diagnostics must still
-      // remain readable when no pixel callback has been delivered.
+      // A single initial frame from a static monitor must drain without
+      // waiting for additional source frames to prime a ring.
+      assert(frames > 0, "static monitor must deliver its initial image");
       assert.equal(first.processFailures, 0);
       assert.equal(first.surfaceFailures, 0);
       await new Promise((r) => setTimeout(r, 1000));

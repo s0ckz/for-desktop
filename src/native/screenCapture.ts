@@ -22,6 +22,7 @@ import {
   windowHandleFromSourceId,
   windowStateForSourceId,
 } from "./appAudio";
+import { FrameDelivery } from "./frameDelivery";
 
 export const SCREEN_CAPTURE_STATE = "screenCapture:state";
 /** One-time handoff channel: carries the {@link MessageChannelMain} port the
@@ -378,6 +379,7 @@ let active: {
    * the A3 plan.
    */
   sessionId: number;
+  ready: boolean;
   /**
    * Rolling-summary accumulators for {@link onFrame}'s live branch (plan PR
    * C4 item 2) -- grouped here, not module-level, specifically so a fresh
@@ -408,15 +410,8 @@ let active: {
      *  CaptureThread a trace beyond the one-shot edge-detect log in
      *  {@link onFrame}. */
     discontinuitiesAtWindowStart: number;
-    /** Frames actually handed to `framePort.postMessage` this window (a
-     *  frame native produced but that arrived for a session already
-     *  superseded, or with no port registered, does not count) -- reset
-     *  every window, not cumulative, so this is a plain count rather than a
-     *  delta-off-cumulative like `refused`/`stillDrawing` above. Comparing
-     *  this against `frames` in the same log line is what tells "native
-     *  isn't producing anything" (both near 0) apart from "native is fine,
-     *  delivery to the renderer is the broken stage" (`frames` healthy,
-     *  `posted` not). */
+    /** Cumulative transport posts at the start of this summary window.
+     *  ACK-triggered posts count too, even between native callbacks. */
     posted: number;
     /** `VideoFrame` construction failures the injected page patch reported
      *  this window (plan PR "no frames" item 6) -- see the
@@ -445,6 +440,9 @@ let diagnosticsTimer: ReturnType<typeof setInterval> | null = null;
  * `native/window.ts` on every `did-finish-load`.
  */
 let framePort: Electron.MessagePortMain | null = null;
+const delivery = new FrameDelivery();
+let newestRequestId = 0;
+let lastStoppedSessionId = 0;
 
 /**
  * Wire (or rewire) the frame-delivery port. `native/window.ts` calls this
@@ -463,6 +461,11 @@ export function setFramePort(port: Electron.MessagePortMain | null) {
     }
   }
   framePort = port;
+  delivery.setPort(port);
+  port?.on("message", (event) => {
+    if (framePort === port) delivery.receive(event.data);
+  });
+  port?.start();
 }
 
 /**
@@ -491,6 +494,10 @@ export function isScreenCaptureSupported(): boolean {
     cachedSupported = false;
   }
   return cachedSupported;
+}
+
+export function isCurrentScreenCaptureSession(sessionId: number) {
+  return active?.sessionId === sessionId;
 }
 
 export function isScreenCaptureActive() {
@@ -523,6 +530,8 @@ export async function startForSource(
   // already sets this to something specific (or to null on success), but
   // clearing it here too means a future early-return branch that forgets to
   // set it can never leak a previous, unrelated share's reason instead.
+  if (sessionId < newestRequestId) return false;
+  newestRequestId = sessionId;
   lastFallbackReason = null;
   const mod = loadNative();
   if (!mod) {
@@ -574,21 +583,10 @@ export async function startForSource(
     return false;
   }
 
-  // A stop() from an earlier attempt (this share's own supersede below, a
-  // death signal from onFrame, a watchdog teardown, ...) may still be
-  // joining the capture thread on the libuv threadpool -- see nativeBusy's
-  // doc comment above stopNative(). mod.start() would just throw "previous
-  // capture still shutting down" in that case; failing fast here skips the
-  // pointless round trip through stop()/mod.start() and reaches the same
-  // fallback outcome without spending another NATIVE_STOP_TIMEOUT_MS racing
-  // a second timeout against a join we already know is running long.
-  if (nativeBusy) {
-    lastFallbackReason = "native stop still pending";
-    appAudioLog(
-      "screen capture: previous native stop still in flight, falling back to Chromium capture",
-    );
-    return false;
-  }
+  // Native shutdown may still be joining the previous capture thread.
+  // Share the existing bounded stop wait below. Rejecting here could make
+  // two simultaneous requests both lose: the older becomes stale while the
+  // newest falls back just because the older began a normal native join.
 
   // "superseded", not the "stopped" default: whatever was running before
   // this attempt is being replaced by it, not user/page-stopped. See
@@ -605,6 +603,7 @@ export async function startForSource(
   // so mod.start() below never runs while the native side still considers
   // itself mid-teardown.
   await stop("superseded", sessionId);
+  if (sessionId !== newestRequestId) return false;
 
   // The await above is also the call whose own stopNative() could be the one
   // that just timed out -- nativeBusy can only be known for certain once it
@@ -634,6 +633,7 @@ export async function startForSource(
       // lastFallbackReason (the `reason` field) already carries the real
       // story for this failed attempt. See StopReason's doc comment.
       stopReason = null;
+      consecutiveFailures++;
       appAudioLog(
         "screen capture: native start() returned false, falling back to Chromium capture:",
         mod.lastError(),
@@ -642,6 +642,7 @@ export async function startForSource(
     }
   } catch (err) {
     lastFallbackReason = `native start() threw: ${String(err)}`;
+    consecutiveFailures++;
     // See the comment on the `!started` branch above -- same reasoning.
     stopReason = null;
     appAudioLog(
@@ -677,6 +678,7 @@ export async function startForSource(
     timestampDiscontinuities: 0,
     gpuPriorityLogged: false,
     sessionId,
+    ready: false,
     summary: {
       windowStartMs: Date.now(),
       frames: 0,
@@ -689,6 +691,27 @@ export async function startForSource(
       videoFrameFailures: 0,
     },
   };
+  delivery.start(sessionId);
+  // Setup is asynchronous in the addon. Do not replace Chromium's track until
+  // device/pool/session initialization succeeds. Older binaries keep working.
+  const deadline = Date.now() + 3000;
+  while (active?.sessionId === sessionId && sessionId === newestRequestId) {
+    const status = mod.diagnostics?.();
+    if (!status || status.ready === undefined || status.ready) break;
+    if (!status.running || Date.now() >= deadline) {
+      const reason = status.lastError || "native capture setup timed out";
+      await stop("capture-error", sessionId, reason);
+      return false;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  if (
+    !active ||
+    active.sessionId !== sessionId ||
+    sessionId !== newestRequestId
+  )
+    return false;
+  active.ready = true;
   appAudioLog(
     `screen capture: native GPU path active for ${sourceId} (${isMonitor ? `display ${displayId}` : `hwnd ${hwnd}`}), target ${CAPTURE_TARGET_WIDTH}x${CAPTURE_TARGET_HEIGHT}@${fps}fps`,
   );
@@ -705,12 +728,8 @@ type LiveFrameMeta = {
   grabMs: number;
   refused: number;
   poolResizes: number;
-  /** Cumulative DXGI_ERROR_WAS_STILL_DRAWING skips this session -- see
-   *  index.d.ts's doc comment. An ordinary pacing drop, not a failure, but
-   *  one that fed into "0 fps" while it was silent (plan PR "no frames"
-   *  item 1) -- now folded into the 10s summary below so a session stuck
-   *  incrementing this on every frame is visible instead of looking exactly
-   *  like a healthy session with nothing to deliver. */
+  /** Cumulative nonblocking readback polls with no ready copy. Pending
+   *  copies survive these polls; this is not a discarded-frame count. */
   stillDrawing: number;
   /** Cumulative timestamp-pacing fallbacks this session (native's
    *  get_SystemRelativeTime() failed, or read a zero Duration, and fell
@@ -758,7 +777,7 @@ function onFrame(
   meta: LiveFrameMeta | DeathFrameMeta,
   sessionId: number,
 ) {
-  if (!active) return;
+  if (!active || sessionId !== active.sessionId) return;
   if (frame === null) {
     // The capture thread exited -- addon.cc invokes the TSFN once more on
     // loop exit with a null frame and lastError() as `reason`, so death no
@@ -785,20 +804,11 @@ function onFrame(
     // and the JS-visible bookkeeping (active, broadcastState) it does
     // happens synchronously before this statement even returns, so nothing
     // here needs to wait on the native join to have already taken effect.
-    void stop("capture-error", sessionId);
-    // stop() above unconditionally nulls lastFallbackReason before this line
-    // ever runs (it has to, for the ordinary stop reasons -- see its own
-    // comment), so this deliberately runs AFTER that call rather than
-    // before it, or the real reason would already be gone by the time
-    // buildState() next reads it. Without this, a native GPU capture that
-    // failed at subscription/setup (e.g. add_FrameArrived rejecting the
-    // handler) read, to both app-audio.log's page-forwarded line and the
-    // page's own console, as a plain unexplained choice to use Chromium
-    // capture -- see appAudioPatch.ts's "native GPU path not engaged for
-    // this share" log, which only names a reason when one is present here.
-    // Naming the failure plainly (not just "not engaged") is what makes a
-    // regression like that loud instead of silent next time.
-    lastFallbackReason = `native GPU capture FAILED: ${death.reason || "(no reason given)"}`;
+    void stop(
+      "capture-error",
+      sessionId,
+      death.reason || "native capture thread exited",
+    );
     return;
   }
   // Same reasoning as the death branch above, mirrored for the live case.
@@ -902,8 +912,7 @@ function onFrame(
   // runs between the two uses (this whole function is a synchronous native
   // callback), so re-checking there would just read the same answer twice,
   // not add a freshness guarantee.
-  const port = sessionId === active.sessionId ? framePort : null;
-  if (port) summary.posted++;
+  const postedTotal = delivery.snapshot().posted;
   const summaryElapsedMs = now - summary.windowStartMs;
   if (summaryElapsedMs >= SUMMARY_INTERVAL_MS) {
     const deliveredFps = (summary.frames / summaryElapsedMs) * 1000;
@@ -922,7 +931,7 @@ function onFrame(
     // addon.cc's ProcessFrame -- so near-zero here means healthy, not idle.
     const meanGrabMs = summary.grabMsSum / summary.frames;
     appAudioLog(
-      `screen capture: 10s summary for ${active.sourceId}: produced=${summary.frames} (${deliveredFps.toFixed(1)}fps) posted=${summary.posted} refused +${refusedDelta} stillDrawing +${stillDrawingDelta} timestampDiscontinuities +${discontinuitiesDelta} videoFrameFailures=${summary.videoFrameFailures} mean bltMs=${meanBltMs.toFixed(2)} grabMs=${meanGrabMs.toFixed(2)} (grabMs near zero is expected -- DO_NOT_WAIT readback, not a stall)`,
+      `screen capture: 10s summary for ${active.sourceId}: produced=${summary.frames} (${deliveredFps.toFixed(1)}fps) posted=${postedTotal - summary.posted} refused +${refusedDelta} readbackNotReadyPolls +${stillDrawingDelta} timestampDiscontinuities +${discontinuitiesDelta} videoFrameFailures=${summary.videoFrameFailures} mean submissionMs=${meanBltMs.toFixed(2)} readbackCpuMs=${meanGrabMs.toFixed(2)} (CPU timings, not GPU execution time)`,
     );
     summary.windowStartMs = now;
     summary.frames = 0;
@@ -931,7 +940,7 @@ function onFrame(
     summary.refusedAtWindowStart = live.refused;
     summary.stillDrawingAtWindowStart = live.stillDrawing;
     summary.discontinuitiesAtWindowStart = live.timestampDiscontinuities;
-    summary.posted = 0;
+    summary.posted = postedTotal;
     summary.videoFrameFailures = 0;
   }
 
@@ -945,13 +954,13 @@ function onFrame(
   // -- in flight on the TSFN queue when a newer session's `active` replaced
   // this one -- is dropped here instead of being misdelivered through the
   // current session's port under the old session's stale width/height.
-  if (!port) return;
-  port.postMessage({
+  delivery.offer({
     frame,
     meta: {
       width: live.width,
       height: live.height,
       timestampUs: live.timestampUs,
+      sessionId,
     },
   });
 }
@@ -1052,7 +1061,12 @@ function startWatchdogs() {
             | "surfaceFailures"
             | "longLoopGaps"
             | "stillDrawing"
-            | "refused",
+            | "refused"
+            | "submittedFrames"
+            | "emittedFrames"
+            | "readbackCoalesced"
+            | "expiredReadbacks"
+            | "ringFull",
         ) => (previous ? Math.max(0, current[key] - previous[key]) : null);
         const incoming = delta("incomingFrames");
         appAudioLog(
@@ -1077,6 +1091,13 @@ function startWatchdogs() {
               longLoopGaps: delta("longLoopGaps"),
               stillDrawing: delta("stillDrawing"),
               refused: delta("refused"),
+              submittedFrames: delta("submittedFrames"),
+              emittedFrames: delta("emittedFrames"),
+              readbackCoalesced: delta("readbackCoalesced"),
+              expiredReadbacks: delta("expiredReadbacks"),
+              sessionMaxFrameAgeMs: current.maxFrameAgeMs ?? null,
+              ringFull: delta("ringFull"),
+              delivery: delivery.snapshot(),
               sessionMaxLoopGapMs: Number(current.maxLoopGapMs.toFixed(2)),
               loopIdleMs: Number(current.loopIdleMs.toFixed(2)),
               frameDroughtMs: now - active.lastFrameAt,
@@ -1171,7 +1192,6 @@ function startWatchdogs() {
       // state-readable path below.
       if (droughtMs > FRAME_WATCHDOG_NO_STATE_MS) {
         const mod = loadNative();
-        consecutiveFailures++;
         appAudioLog(
           "screen capture: no frames for",
           FRAME_WATCHDOG_NO_STATE_MS,
@@ -1181,13 +1201,11 @@ function startWatchdogs() {
         );
         // Sync timer callback -- same reasoning as the other stop() call
         // sites in this file.
-        void stop("capture-error");
-        // Same reasoning as onFrame's death branch above: set AFTER stop()
-        // so it survives stop()'s own unconditional clear, and name the
-        // actual failure rather than leaving the page (and app-audio.log's
-        // page-forwarded line) to report a bare "not engaged" with no
-        // explanation.
-        lastFallbackReason = `native GPU capture FAILED: no window-state signal for ${FRAME_WATCHDOG_NO_STATE_MS}ms; lastError: ${mod?.lastError() ?? "(unknown)"}`;
+        void stop(
+          "capture-error",
+          active.sessionId,
+          `no window-state signal for ${FRAME_WATCHDOG_NO_STATE_MS}ms; lastError: ${mod?.lastError() ?? "(unknown)"}`,
+        );
       }
       return;
     }
@@ -1384,11 +1402,16 @@ const NATIVE_STOP_TIMEOUT_MS = 3000;
  * rejected teardown -- and every sync call site of stop() in this file
  * fires it with `void` on exactly that guarantee.
  */
+let pendingNativeStop: Promise<void> | null = null;
+
 function stopNative(): Promise<void> {
+  if (pendingNativeStop) return pendingNativeStop;
   const mod = loadNative();
   if (!mod) return Promise.resolve();
 
-  const settle = Promise.resolve(mod.stop())
+  nativeBusy = true;
+  const settle = Promise.resolve()
+    .then(() => mod.stop())
     .catch(() => {
       /* already stopped, or the native side reported an error tearing down
          -- either way the thread has been reaped by the time this runs,
@@ -1398,7 +1421,7 @@ function stopNative(): Promise<void> {
       nativeBusy = false;
     });
 
-  return new Promise<void>((resolve) => {
+  pendingNativeStop = new Promise<void>((resolve) => {
     const timer = setTimeout(() => {
       appAudioLog(
         `screen capture: native stop still pending after ${NATIVE_STOP_TIMEOUT_MS}ms`,
@@ -1408,9 +1431,11 @@ function stopNative(): Promise<void> {
     }, NATIVE_STOP_TIMEOUT_MS);
     void settle.then(() => {
       clearTimeout(timer);
+      pendingNativeStop = null;
       resolve();
     });
   });
+  return pendingNativeStop;
 }
 
 /**
@@ -1440,6 +1465,7 @@ function stopNative(): Promise<void> {
 export function stop(
   reason: StopReason = "stopped",
   sessionId?: number,
+  failureReason?: string,
 ): Promise<void> {
   if (sessionId !== undefined && active && sessionId < active.sessionId) {
     appAudioLog(`screen capture: stop ignored: stale session ${sessionId}`);
@@ -1460,7 +1486,10 @@ export function stop(
   // never even attempts native capture, e.g. a screen source) -- see
   // lastFallbackReason's doc comment for why this must happen here rather
   // than only inside startForSource.
-  lastFallbackReason = null;
+  lastFallbackReason = failureReason
+    ? `native GPU capture FAILED: ${failureReason}`
+    : null;
+  if (reason === "capture-error" && active) consecutiveFailures++;
   // Also touched unconditionally, same scoping reason as lastFallbackReason
   // above -- but only *records* `reason` when a session was truly active.
   // startForSource's pre-start call and window.ts's two pre-start calls all
@@ -1478,6 +1507,12 @@ export function stop(
   appAudioLog(
     `screen capture: stopped native capture for ${active.sourceId} (${reason})`,
   );
+  appAudioLog(
+    "screen capture: final delivery " +
+      JSON.stringify({ sessionId: active.sessionId, ...delivery.snapshot() }),
+  );
+  delivery.stop();
+  lastStoppedSessionId = active.sessionId;
   active = null;
   broadcastState();
   return nativeStopPromise;
@@ -1492,7 +1527,7 @@ function broadcastState() {
 
 function buildState() {
   return {
-    active: active !== null,
+    active: active?.ready === true,
     sourceId: active?.sourceId ?? null,
     // Real delivered size once at least one frame has arrived; the requested
     // target beforehand.
@@ -1511,7 +1546,7 @@ function buildState() {
     // Null while a session is active.
     stopReason: active ? null : stopReason,
     // Diagnostic only -- see active's doc comment (item 4).
-    sessionId: active?.sessionId ?? 0,
+    sessionId: active?.sessionId ?? lastStoppedSessionId,
   };
 }
 
@@ -1560,7 +1595,10 @@ export function initScreenCapture() {
   // Sync ipcMain handler -- same "fire and let stop() settle its own
   // bookkeeping synchronously" reasoning as this file's other stop() call
   // sites.
-  ipcMain.on("screenCapture:stop", () => void stop("stopped"));
+  ipcMain.on("screenCapture:stop", (_event, sessionId?: number) => {
+    if (sessionId !== undefined && sessionId !== active?.sessionId) return;
+    void stop("stopped", sessionId);
+  });
   // The value arrives from a remote page, so it is validated, not trusted:
   // reject anything that isn't a finite number (same distrust as
   // RENDERER_WRITABLE_KEYS in config.ts) and clamp the rest to a sane range
@@ -1582,7 +1620,8 @@ export function initScreenCapture() {
   // cross IPC from a remote page.
   ipcMain.on(
     "screenCapture:setTarget",
-    (_event, width: unknown, height: unknown) => {
+    (_event, width: unknown, height: unknown, sessionId?: number) => {
+      if (sessionId !== undefined && sessionId !== active?.sessionId) return;
       if (
         typeof width !== "number" ||
         typeof height !== "number" ||
@@ -1614,6 +1653,46 @@ export function initScreenCapture() {
   // value is dropped rather than silently bucketed somewhere wrong, so a
   // future stage added on the page side without a matching case here fails
   // loudly (via the else branch's log) instead of quietly undercounting.
+  ipcMain.on(
+    "screenCapture:rendererStats",
+    (_event, sessionId: unknown, counters: unknown) => {
+      if (
+        !active ||
+        sessionId !== active.sessionId ||
+        !counters ||
+        typeof counters !== "object"
+      )
+        return;
+      const value = counters as Record<string, unknown>;
+      const keys = [
+        "received",
+        "constructed",
+        "accepted",
+        "written",
+        "backpressure",
+        "writeFailures",
+        "canvasDrawn",
+        "drawFailures",
+      ];
+      if (
+        !keys.every(
+          (key) =>
+            typeof value[key] === "number" &&
+            Number.isSafeInteger(value[key]) &&
+            (value[key] as number) >= 0 &&
+            (value[key] as number) <= 1e9,
+        )
+      )
+        return;
+      appAudioLog(
+        "screen capture: renderer " +
+          JSON.stringify({
+            sessionId,
+            ...Object.fromEntries(keys.map((key) => [key, value[key]])),
+          }),
+      );
+    },
+  );
   ipcMain.on("screenCapture:pageDrop", (_event, stage: unknown) => {
     if (typeof stage !== "string") return;
     if (!pageDropRateLimit()) return;

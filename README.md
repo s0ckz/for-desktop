@@ -76,13 +76,13 @@ Various useful commands for development testing:
 
 ```bash
 # connect to the development server
-mise exec -- pnpm start -- --force-server http://localhost:5173
+mise exec -- pnpm start -- --force-server=http://localhost:5173
 
 # test the flatpak (after `make`)
 mise exec -- pnpm install:flatpak
 mise exec -- pnpm run:flatpak
 # ... also connect to dev server like so:
-mise exec -- pnpm run:flatpak --force-server http://localhost:5173
+mise exec -- pnpm run:flatpak --force-server=http://localhost:5173
 
 # Nix-specific instructions for testing
 pnpm package
@@ -111,7 +111,16 @@ On Windows, native window and monitor shares write diagnostics to
 approximately every 10 seconds independently of pixel delivery, including
 when a share has frozen. It reports incoming frames, frames discarded while
 draining the pool, pacing skips, processing attempts/failures, surface/pool
-read failures, and readback/queue drops as **interval deltas**. `incomingFps`
+read failures, submitted/emitted frames, expired/coalesced readbacks and
+readback/queue pressure as **interval deltas**. `stillDrawing` now counts
+nonblocking polls with pending GPU work; it does **not** count dropped frames.
+`ringFull` counts skipped submissions. `expiredReadbacks` counts completed
+copies older than 250ms discarded when newer source submissions exist; the
+last/static image is retained. `sessionMaxFrameAgeMs` measures source-to-native
+delivery age, excluding renderer/encoder/network latency. `delivery` contains
+cumulative posts, acknowledgements, coalesces and failures, plus queue state.
+Renderer counters distinguish construction, backpressure, accepted writes,
+write errors and canvas draws. `incomingFps`
 is the retrieved WGC frame rate, not encoded or viewer FPS. `longLoopGaps`
 counts intervals exceeding twice the requested frame interval;
 `sessionMaxLoopGapMs` is a session maximum. Loop gaps include waiting,
@@ -129,12 +138,33 @@ codec choice, bitrate, or scheduling.
 Validation commands:
 
 ```powershell
+node src/native/screenCapture.behavior.test.cjs
 node src/native/screenCapture.diagnostics.test.cjs
 node native/win-capture/check-exports.js
+node native/win-capture/check-package.js out-capture-fixes/Stoat-win32-x64
 # After rebuilding the native addon for Electron:
 .\node_modules\electron\dist\electron.exe native/win-capture/test-diagnostics.js
 ```
 
-The Electron smoke test captures attached monitors briefly and verifies
-counter snapshots, teardown, and invalid monitor selection; static monitors
-may produce no delivered pixels while their diagnostics remain readable.
+The Electron smoke test captures attached monitors briefly and requires a
+delivered first image, including a static monitor. It checks counters,
+teardown and invalid monitor selection. Compile `test-policy.cc` with a
+C++17 compiler for deterministic pacing, sizing and freshness tests.
+
+Native frame submission uses bounded timestamp credit to tolerate jitter;
+pending readbacks drain independently of source arrivals. The main-to-renderer
+port allows one frame in transit and one replaceable latest frame, validated
+by session/frame acknowledgements. Generator backpressure is checked before
+constructing a VideoFrame; the canvas fallback manually requests each draw.
+CPU submission/readback timings are not GPU execution timings. Readiness
+confirms native setup before Chromium's original track is stopped.
+
+On Windows, `native/win-capture/build-electron.ps1` synchronizes the copied
+file dependency, rebuilds against the installed Electron headers, and fails
+on missing/stale binaries. It also accepts `-Module win-app-audio`.
+For the local packaged test build, `run-capture-test.ps1 -CheckOnly` verifies
+the packaged native binary and local web sender diagnostics. Without
+`-CheckOnly`, it requires other Stoat instances to be closed, verifies the
+web frontend served on port 4173, then opens the test app with
+`--force-server=http://127.0.0.1:4173`. The desktop package does not bundle the
+web UI. No backend configuration changes are made by this helper.

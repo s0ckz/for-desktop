@@ -1,64 +1,10 @@
-// GPU-downscaled window capture for Windows.
-//
-// Chromium's own desktop capture path (Windows.Graphics.Capture wrapped by
-// DesktopCaptureDevice) always copies the ENTIRE captured surface GPU->CPU
-// before anything downstream gets to touch it, and throttles itself to
-// 2 x last_capture_duration between frames. At 3440x1440 under game-GPU
-// contention that grab alone measures ~31ms, which caps capture at ~16fps --
-// nowhere near the 30fps/16.6ms budget a screen share needs.
-//
-// This module reverses the order: scale AND convert colour space to NV12 on
-// the GPU (ID3D11VideoProcessor::VideoProcessorBlt, a single fixed-function
-// hardware step on Intel/AMD/NVIDIA alike) and only then read back -- so the
-// CPU copy moves ~1.5MB instead of ~20MB. It is also not a
-// DesktopCaptureDevice, so Chromium's 2x-duration governor never applies.
-//
-// Frames are delivered as NV12 (Y plane, then interleaved UV) at exactly the
-// size fit inside targetWidth x targetHeight, aspect preserved.
-//
-// Threading model, deliberately simple: capture runs entirely from ONE
-// dedicated thread that we own end to end -- it creates the D3D11 device,
-// the WGC capture item/session/frame pool, subscribes to the pool's
-// FrameArrived event, and waits on that subscription (CaptureThread, below)
-// instead of polling TryGetNextFrame() on a fixed cadence.
-//
-// This module used to poll instead, on purpose, specifically to avoid
-// implementing the ABI's parameterized
-// ITypedEventHandler<Direct3D11CaptureFramePool, IInspectable> callback
-// interface. That tradeoff is reversed here: polling at ~fps against a
-// source presenting at its own unrelated rate is a sampling-vs-source-rate
-// aliasing problem, and it showed up exactly where that theory predicts -- a
-// 60Hz game polled at ~60Hz drifts in and out of phase with its own presents,
-// so some polls see 0 new frames and the next sees 2 (dup/skip judder despite
-// every individual frame being correct), plus up to one whole poll interval
-// of pure latency between a present and this thread noticing it. Subscribing
-// removes both, and implementing the callback interface needed nothing more
-// than a small Microsoft::WRL::RuntimeClass<ClassicCom, ITypedEventHandler
-// <...>> -- see FrameArrivedHandler below -- not the extra projection
-// machinery the old comment here worried about. Frame pools created with
-// CreateFreeThreaded() never needed a DispatcherQueue/message pump either
-// way, polled or subscribed; that part of the old reasoning was never the
-// actual issue.
-//
-// FrameArrived's handler does nothing but SetEvent() a HANDLE this thread
-// waits on -- see FrameArrivedHandler's own comment for why nothing else is
-// safe there. Delivery is paced on each frame's own
-// frame->get_SystemRelativeTime() (a 100ns-unit timestamp WGC stamps on the
-// frame itself) rather than on wall-clock arrival time -- see the pacing
-// comment above lastDeliveredTs in CaptureThread for why that, not the event
-// subscription by itself, is what removes the aliasing above. A
-// CreateWaitableTimerExW high-resolution timer still wakes this loop roughly
-// once an interval when FrameArrived does not fire at all (a static window
-// legitimately produces no FrameArrived events), purely so the liveness
-// checks -- window still exists, stop requested -- keep running promptly; it
-// has no say any more in which frames get delivered.
-//
-// Every frame we retrieve and don't use -- draining the pool to the newest
-// one, or a frame arriving faster than the requested pacing allows -- is
-// released immediately (its ComPtr going out of scope), which is what
-// returns the buffer to the pool, so a "drop" costs nothing beyond the
-// Release.
-
+// Native Windows window/monitor capture: scale and convert to NV12 on the
+// GPU before a bounded CPU readback. WGC FrameArrived wakes one capture
+// thread; timestamp-based pacing permits bounded jitter without banking a
+// long drought. A relative heartbeat drains completed staging copies even
+// when no further source frames arrive. The three-slot ring never blocks
+// waiting for GPU completion and delivers the newest readable pending copy.
+// Every acquired frame and every successful Map has scoped cleanup.
 #include <napi.h>
 
 #include <windows.h>
@@ -87,6 +33,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "capture_policy.h"
 
 using Microsoft::WRL::ComPtr;
 namespace WG = ABI::Windows::Graphics;
@@ -133,6 +80,8 @@ std::atomic<bool> g_running{false};
 // shutting down" for the whole window the async join is in flight.
 std::atomic<bool> g_stopping{false};
 HANDLE g_stopEvent = nullptr;
+HANDLE g_configEvent = nullptr;
+std::atomic<bool> g_ready{false};
 Napi::ThreadSafeFunction g_tsfn;
 // stop() calls that arrived while g_stopping was already true -- i.e. while
 // an earlier stop()'s StopWorker join was still in flight. Resolved (or
@@ -262,7 +211,7 @@ typedef NTSTATUS(APIENTRY* PFN_D3DKMTSetProcessSchedulingPriorityClass)(HANDLE, 
  *
  * Recorded here so the next person does not spend the same afternoon on it.
  * The ~49.5fps ceiling at a 60fps target was the poll-vs-present aliasing
- * the file header now describes -- see there, and lastDeliveredTs's comment
+ * the file header now describes -- see there, and the timestamp pacer's comment
  * in CaptureThread, for the fix (event-driven capture, paced on real frame
  * timestamps) rather than a buffer-count workaround.
  */
@@ -277,8 +226,8 @@ constexpr int kFramePoolBuffers = 2;
  * change (1080p -> 720p) the same way a rate fixed at Start() used to strand
  * a framerate change -- see SetTarget()'s own doc comment.
  */
-std::atomic<UINT32> g_targetW{0};
-std::atomic<UINT32> g_targetH{0};
+// One atomic snapshot prevents a mixed width/height during preset changes.
+std::atomic<uint64_t> g_targetSize{0};
 /**
  * Delivery cadence, changeable while capture is running.
  *
@@ -317,70 +266,20 @@ UINT32 g_outH = 0;
 UINT32 g_lastTargetW = 0;  // g_targetW/g_targetH EnsurePipeline last built the above for
 UINT32 g_lastTargetH = 0;
 
-/**
- * Staging texture ring depth (item 2 of PR C3).
- *
- * Was a single D3D11_USAGE_STAGING texture: CopyResource into it, then
- * Map(D3D11_MAP_READ) with no flags, which -- CopyResource only *starts* the
- * GPU copy, it does not wait for it -- forced a full CPU/GPU pipeline stall
- * on every single frame. Under game-GPU contention that stall was real time,
- * not free synchronisation.
- *
- * Now: CopyResource into the NEXT slot, and Map the OLDEST one -- the slot
- * whose own CopyResource is kStagingRingSize-1 frame intervals in the past,
- * not merely the one written last call (see ProcessFrame's readSlot for why
- * "oldest", not "previous", is the correct target at any ring depth) -- with
- * D3D11_MAP_FLAG_DO_NOT_WAIT. Whatever GPU work is still outstanding for the
- * oldest slot has had kStagingRingSize-1 intervals to land, so by the time
- * this call reaches it, it is normally done; DO_NOT_WAIT turns "normally"
- * into a guarantee -- Map() returns immediately either way,
- * DXGI_ERROR_WAS_STILL_DRAWING if the GPU is for some reason still behind,
- * in which case that frame is skipped exactly like any other pacing drop
- * rather than blocked on.
- *
- * 2 was shipped as "the minimum that works" on the theory that it would only
- * be worth going deeper if it was measured to skip often in practice. It has
- * now been measured: a user's app-audio.log 10s summaries showed `refused=0`,
- * `bltMs=0.00`, `grabMs<0.5` throughout -- nothing CPU-side was slow and
- * nothing was queued -- while `stillDrawing` jumped from 0 to ~270-390 per
- * 10s (~27/s) exactly when the shared window (a game) had focus, and
- * `produced` collapsed from ~53fps to 1-14fps in the same window. A focused
- * game saturates the GPU's own queue; this module's VideoProcessorBlt +
- * CopyResource then regularly takes longer than one frame interval to reach
- * the front of it, so by the time Map(DO_NOT_WAIT) polls the slot, the copy
- * has not landed and the frame is skipped.
- *
- * 3 gives the GPU two frame intervals of head start instead of one (see
- * ProcessFrame's readSlot -- the slot read is always the OLDEST of the ring,
- * not merely the previous one) at the cost of one extra ~1.5MB staging
- * texture and one more frame of latency (~17ms at 60fps). Not going straight
- * to 4+: each extra slot buys diminishing head start against a fixed cost in
- * memory and glass-to-glass latency, and the 10s summary already reports
- * `stillDrawing` for free -- so the move is to ship 3, watch that counter
- * under real contention, and only go deeper if it is still nonzero.
- */
+// Bounded pending GPU submissions. Completed readbacks drain on heartbeat
+// wakes, independently of new WGC frames (including the first static image).
 constexpr int kStagingRingSize = 3;
 struct StagingSlot {
-  ComPtr<ID3D11Texture2D> tex;  // D3D11_USAGE_STAGING, CPU-readable copy of g_outputTex
-  // This slot's own frame timestamp, captured at CopyResource time and read
-  // back out kStagingRingSize-1 calls later alongside the pixels -- see
-  // ProcessFrame. Without this, the ring's kStagingRingSize-1-frame delivery
-  // lag would pair frame N's own timestampUs with frame N-(kStagingRingSize-1)'s
-  // pixels, silently reintroducing the kind of timestamp/content mismatch PR
-  // C2 removed.
+  ComPtr<ID3D11Texture2D> tex;
   double timestampUs = 0;
+  double bltMs = 0;
+  uint64_t sequence = 0;
+  bool pending = false;
 };
 StagingSlot g_stagingRing[kStagingRingSize];
-int g_stagingRingIndex = 0;   // next slot ProcessFrame will CopyResource into
-// Priming counter, not a slot-written count: it only ever climbs to
-// kStagingRingSize - 1 (see ProcessFrame's priming check) -- the point at
-// which the slot about to be read next already has real content,
-// kStagingRingSize-1 intervals old, not kStagingRingSize (every slot ever
-// written).
-int g_stagingRingFilled = 0;
+uint64_t g_submissionSequence = 0;
+double g_lastEmittedTimestampUs = -1;
 
-// The frame pool's own buffer size, tracked separately from g_srcW/g_srcH --
-// see EnsurePool.
 UINT32 g_poolW = 0;
 UINT32 g_poolH = 0;
 
@@ -461,8 +360,9 @@ bool EnsurePipeline(UINT32 srcW, UINT32 srcH) {
   // 1080p -> 720p preset change on a window that never resized), and that
   // must rebuild the video processor and output/staging textures for the new
   // output box exactly the way a source resize already does.
-  const UINT32 targetW = g_targetW.load(std::memory_order_relaxed);
-  const UINT32 targetH = g_targetH.load(std::memory_order_relaxed);
+  const uint64_t target = g_targetSize.load(std::memory_order_relaxed);
+  const UINT32 targetW = static_cast<UINT32>(target >> 32);
+  const UINT32 targetH = static_cast<UINT32>(target);
   if (srcW == g_srcW && srcH == g_srcH && targetW == g_lastTargetW && targetH == g_lastTargetH && g_vpEnum) {
     return true;
   }
@@ -479,15 +379,9 @@ bool EnsurePipeline(UINT32 srcW, UINT32 srcH) {
   // 800x600 window against the 1920x1080 target) gets scale > 1 here and is
   // blown up to fill the box, spending bitrate on invented pixels instead of
   // the real ones. Fit-inside should only ever shrink.
-  const double scale = (std::min)({static_cast<double>(targetW) / srcW,
-                                    static_cast<double>(targetH) / srcH,
-                                    1.0});
-  UINT32 outW = static_cast<UINT32>(std::lround(srcW * scale));
-  UINT32 outH = static_cast<UINT32>(std::lround(srcH * scale));
-  if (outW % 2) outW += 1;
-  if (outH % 2) outH += 1;
-  outW = (std::max)(outW, 2u);
-  outH = (std::max)(outH, 2u);
+  const auto output = capture_policy::Fit(srcW, srcH, targetW, targetH);
+  const UINT32 outW = output.width;
+  const UINT32 outH = output.height;
 
   D3D11_VIDEO_PROCESSOR_CONTENT_DESC vpDesc{};
   vpDesc.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
@@ -566,21 +460,13 @@ bool EnsurePipeline(UINT32 srcW, UINT32 srcH) {
   g_lastTargetW = targetW;
   g_lastTargetH = targetH;
 
-  // Every texture just built above is a fresh, never-copied-into resource,
-  // regardless of whether this rebuild was the very first one this session
-  // or a later resize/setTarget() -- so the ring's write/read bookkeeping
-  // must restart from empty here too, on the same trigger, or ProcessFrame
-  // could try to Map a "primed" slot from before this rebuild that no longer
-  // exists (a resize replaces the ComPtrs entirely, it does not reuse them).
-  // See ProcessFrame's own comment on g_stagingRingFilled for the other half
-  // of this contract, and the struct's declaration above for why the first
-  // kStagingRingSize-1 frames after any rebuild have nothing to read yet.
+  // Rebuilt textures have no submitted copies; reset all pending slots.
   for (int i = 0; i < kStagingRingSize; i++) {
     g_stagingRing[i].tex = stagingTex[i];
     g_stagingRing[i].timestampUs = 0;
+    g_stagingRing[i].pending = false;
   }
-  g_stagingRingIndex = 0;
-  g_stagingRingFilled = 0;
+
   return true;
 }
 
@@ -595,7 +481,7 @@ struct FramePayload {
   double bltMs = 0;
   double grabMs = 0;
   // frame->get_SystemRelativeTime(), converted to microseconds (100ns units
-  // / 10) -- see CaptureThread's pacing comment above lastDeliveredTs. Real
+  // / 10) -- see CaptureThread's pacing comment above the timestamp pacer. Real
   // per-frame time, not wall-clock delivery time; the page patch uses this
   // directly for VideoFrame.timestamp and its own delta for duration (see
   // appAudioPatch.ts), replacing a fixed duration computed once at build
@@ -736,26 +622,7 @@ std::atomic<uint64_t> g_framesStillDrawing{0};
  */
 std::atomic<uint64_t> g_timestampFallbacks{0};
 
-/**
- * Times CaptureThread's pacing clock reset because `ts` (from whichever of
- * get_SystemRelativeTime()/QpcNow100ns() was used for this frame -- see
- * g_timestampFallbacks just above) landed BEFORE lastDeliveredTs instead of
- * merely too close to it -- cumulative for this session. Deliberately a
- * separate counter from g_timestampFallbacks, not a reuse of it: falling
- * back to QpcNow100ns() and hitting this backward jump are not the same
- * event. A session can use the fallback on every frame after the first
- * without ever landing here (the QPC-derived value stays consistently ahead
- * of lastDeliveredTs), and this can just as well fire coming BACK OUT of the
- * fallback -- a genuine, smaller get_SystemRelativeTime() read following a
- * larger QpcNow100ns() one -- which never touches g_timestampFallbacks at
- * all, since that frame took the successful-read branch. Counting them
- * together would blur "we used a substitute clock" (harmless by itself, per
- * QpcNow100ns's doc comment) with "the two clocks just disagreed about
- * order" (the actual precondition for the stall this counter exists to make
- * visible -- see the re-baseline just above the pacing check in
- * CaptureThread for the fix, and QpcNow100ns's doc comment for why the
- * re-baseline, not this counter, is what keeps it from recurring).
- */
+// Backward QPC/source timestamps reset pacing credit; fallback uses the same clock.
 std::atomic<uint64_t> g_timestampDiscontinuities{0};
 
 // Independent of pixel delivery: JS can sample these even during a drought.
@@ -765,6 +632,8 @@ std::atomic<uint64_t> g_arrivalEvents{0}, g_incomingFrames{0}, g_drainedFrames{0
 std::atomic<uint64_t> g_pacingSkips{0}, g_processAttempts{0}, g_processFailures{0};
 std::atomic<uint64_t> g_poolReadFailures{0}, g_surfaceFailures{0}, g_longLoopGaps{0};
 std::atomic<uint64_t> g_maxLoopGapUs{0};
+std::atomic<uint64_t> g_submittedFrames{0}, g_emittedFrames{0}, g_readbackCoalesced{0}, g_ringFull{0};
+std::atomic<uint64_t> g_expiredReadbacks{0}, g_maxFrameAgeUs{0};
 std::atomic<double> g_lastLoopAt100ns{0};
 
 double QpcNow100ns();
@@ -783,10 +652,17 @@ Napi::Value Diagnostics(const Napi::CallbackInfo& info) {
   CAPTURE_COUNTER("longLoopGaps", g_longLoopGaps);
   CAPTURE_COUNTER("stillDrawing", g_framesStillDrawing);
   CAPTURE_COUNTER("refused", g_framesRefused);
+  CAPTURE_COUNTER("submittedFrames", g_submittedFrames);
+  CAPTURE_COUNTER("emittedFrames", g_emittedFrames);
+  CAPTURE_COUNTER("readbackCoalesced", g_readbackCoalesced);
+  CAPTURE_COUNTER("ringFull", g_ringFull);
+  CAPTURE_COUNTER("expiredReadbacks", g_expiredReadbacks);
 #undef CAPTURE_COUNTER
   result.Set("maxLoopGapMs", Napi::Number::New(info.Env(), g_maxLoopGapUs.load() / 1000.0));
+  result.Set("maxFrameAgeMs", Napi::Number::New(info.Env(), g_maxFrameAgeUs.load() / 1000.0));
   const double lastLoop = g_lastLoopAt100ns.load(std::memory_order_relaxed);
   result.Set("loopIdleMs", Napi::Number::New(info.Env(), lastLoop > 0 ? (QpcNow100ns() - lastLoop) / 10000.0 : 0));
+  result.Set("ready", Napi::Boolean::New(info.Env(), g_ready.load()));
   result.Set("running", Napi::Boolean::New(info.Env(), g_running.load()));
   result.Set("lastError", Napi::String::New(info.Env(), GetErrorText()));
   return result;
@@ -937,18 +813,13 @@ void Emit(FramePayload* payload) {
   }
 }
 
-// Scale+convert the given source texture into the shared output texture, read
-// it back, pack it as tight NV12, and deliver it. srcW/srcH must be the
-// *texture's own* dimensions (srcTex->GetDesc), not the frame's ContentSize --
-// see the caller in CaptureThread for why those can briefly disagree and what
-// goes wrong if you pass ContentSize here instead. timestampUs is the frame's
-// own get_SystemRelativeTime(), already converted -- see FramePayload's field
-// of the same name. Called for every frame the capture loop decides to
-// process -- there is no resize case that skips this call any more, only the
-// pacing skips upstream of it (the drain loop and the pacing check against
-// lastDeliveredTs). Returns false only on a hard D3D/WGC failure.
+// Submit a GPU scale/convert and staging copy. srcW/srcH bound valid content
+// inside the source texture, excluding undefined pixels during a resize.
 bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH, double timestampUs) {
   if (!EnsurePipeline(srcW, srcH)) return false;
+  StagingSlot* writeSlot = nullptr;
+  for (auto& slot : g_stagingRing) if (!slot.pending) { writeSlot = &slot; break; }
+  if (!writeSlot) { g_ringFull.fetch_add(1); return true; }
 
   D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC inDesc{};
   inDesc.FourCC = 0;
@@ -971,178 +842,85 @@ bool ProcessFrame(ID3D11Texture2D* srcTex, UINT32 srcW, UINT32 srcH, double time
   g_videoContext->VideoProcessorSetStreamSourceRect(g_videoProcessor.Get(), 0, TRUE, &srcRect);
   g_videoContext->VideoProcessorSetStreamDestRect(g_videoProcessor.Get(), 0, TRUE, &dstRect);
 
-  const auto t0 = std::chrono::steady_clock::now();
+  const auto beforeBlt = std::chrono::steady_clock::now();
   hr = g_videoContext->VideoProcessorBlt(g_videoProcessor.Get(), g_outputView.Get(), 0, 1, &stream);
-  const auto t1 = std::chrono::steady_clock::now();
   if (FAILED(hr)) {
     SetError("VideoProcessorBlt", hr);
     return false;
   }
 
-  // This is the number the whole module exists to shrink: on Chromium's own
-  // path this Map() blocks on a ~20MB GPU->CPU copy under game-GPU
-  // contention. Downscaling before this point (above) is what gets it to
-  // ~1.5MB instead.
-  //
-  // Staging ring (item 2 of PR C3, deepened by the focused-game-FPS fix):
-  // write this frame's blit result into the NEXT ring slot, but read back
-  // the OLDEST slot's -- blitted kStagingRingSize-1 frame intervals ago --
-  // content, instead of the one just copied into. CopyResource only
-  // *starts* the GPU->CPU copy; it does not wait for it, so Map()'ing the
-  // slot just copied into would still pay the full pipeline stall this item
-  // exists to remove. Reading the oldest slot means whatever GPU work is
-  // still outstanding for it had the longest possible head start this ring
-  // depth can offer, so D3D11_MAP_FLAG_DO_NOT_WAIT normally succeeds
-  // immediately; on the rare case it has not, Map() returns
-  // DXGI_ERROR_WAS_STILL_DRAWING right away instead of blocking, and this
-  // call skips the frame exactly like any other pacing drop -- see
-  // kStagingRingSize's declaration for more.
-  const int writeSlot = g_stagingRingIndex;
-  g_context->CopyResource(g_stagingRing[writeSlot].tex.Get(), g_outputTex.Get());
-  g_stagingRing[writeSlot].timestampUs = timestampUs;
-  g_stagingRingIndex = (writeSlot + 1) % kStagingRingSize;
-
-  // CopyResource above only *records* the GPU->CPU copy into the immediate
-  // context's command list -- it does not submit it, and with no Present()
-  // anywhere in this headless capture path nothing else submits it either,
-  // short of the driver eventually auto-flushing on a full command buffer
-  // (bursty at best, and in practice never happens before the caller gives
-  // up). Flush() here is what actually hands the copy to the GPU. Without
-  // it, Map(..., D3D11_MAP_FLAG_DO_NOT_WAIT) below has nothing to poll but
-  // work that was never submitted, so it returns DXGI_ERROR_WAS_STILL_DRAWING
-  // -- forever, not just on the rare occasion the comment above the read
-  // slot describes -- and this function never delivers a single frame. This
-  // is a plain Flush(), not a wait: it costs a driver call to hand off the
-  // command list, not a pipeline stall, so it does not undo the point of
-  // moving Map() to DO_NOT_WAIT above.
+  g_context->CopyResource(writeSlot->tex.Get(), g_outputTex.Get());
+  writeSlot->bltMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - beforeBlt).count();
+  writeSlot->timestampUs = timestampUs;
+  writeSlot->sequence = ++g_submissionSequence;
+  writeSlot->pending = true;
   g_context->Flush();
+  g_submittedFrames.fetch_add(1);
+  return true;
+}
 
-  // The first kStagingRingSize-1 frames after Start() or after EnsurePipeline
-  // resets this ring (a resize or a setTarget() -- see its own comment) have
-  // no OLDEST slot with real content to read: every slot is a freshly
-  // created, never-copied-into STAGING texture. Returning true with nothing
-  // emitted is not a failure -- CaptureThread already treats "no Emit() this
-  // iteration" as an ordinary drop (the same path a too-fast frame or a
-  // still-drawing GPU takes), so the caller sees no difference from any
-  // other skipped frame; it is just guaranteed for a session's or a
-  // rebuild's first kStagingRingSize-1 frame(s) instead of merely likely.
-  //
-  // Compared against kStagingRingSize - 1, not kStagingRingSize: this
-  // reasoning is depth-independent, not specific to N=2 or N=3. filled==0
-  // means writeSlot's own copy (just issued above) is the only content the
-  // ring has ever held, so priming this call's own return is correct. Each
-  // subsequent call increments filled by exactly one, and once filled
-  // reaches kStagingRingSize-1, that many DISTINCT slots (every slot except
-  // the one just written this call) have each been written at least once --
-  // which is exactly the set the ring can ever read from, so the oldest of
-  // them (readSlot below) is guaranteed to hold real content, one whole
-  // priming phase old, exactly like the steady-state case. The old
-  // `< kStagingRingSize` bound primed for one call too many, discarding a
-  // frame that was already readable, on every EnsurePipeline rebuild -- and
-  // `0c836e28` made those rebuilds happen on every quality change, not just
-  // at session start.
-  if (g_stagingRingFilled < kStagingRingSize - 1) {
-    g_stagingRingFilled++;
-    return true;
-  }
+// Scope every successful mapping, including payload exhaustion and failures.
+struct ScopedReadMap {
+  ID3D11DeviceContext* context;
+  ID3D11Texture2D* texture;
+  ~ScopedReadMap() { context->Unmap(texture, 0); }
+};
 
-  // The OLDEST slot, not "one behind" writeSlot: g_stagingRingIndex advances
-  // by exactly 1 (mod kStagingRingSize) every single call, so the slot whose
-  // content is furthest from being overwritten again is always the one
-  // immediately AHEAD of writeSlot in the cycle, i.e. (writeSlot + 1) % N --
-  // the slot this same call will become the write target for, N calls from
-  // now (N-1 calls from the NEXT call). This looks identical to "one behind"
-  // at N=2, where +1 and -1 land on the same single other slot, which is why
-  // the collapse to (writeSlot + N - 1) % N is behaviour-preserving at N=2
-  // but WRONG for any N>2, where it keeps reading the slot written just one
-  // interval ago no matter how deep the ring is declared -- silently giving
-  // a deeper ring zero extra GPU head start. Bumping kStagingRingSize alone,
-  // without also moving this expression to the true oldest slot, changes
-  // nothing about how much head start a read gets.
-  const int readSlot = (writeSlot + 1) % kStagingRingSize;
-  D3D11_MAPPED_SUBRESOURCE mapped{};
-  hr = g_context->Map(g_stagingRing[readSlot].tex.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
-  const auto t2 = std::chrono::steady_clock::now();
-  if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
-    // Not a failure -- see the comment above this block. The pixels
-    // themselves are not corrupted, only unread -- but there is no "gets
-    // another chance once the ring cycles back to it" at any ring depth,
-    // because of phase-locking: readSlot is a FIXED function of writeSlot
-    // ((writeSlot + 1) % N, always), and writeSlot advances by exactly 1
-    // (mod N) every single call with no dependence on whether the previous
-    // read succeeded. A fixed function of a value that itself advances in
-    // lockstep visits each ring position exactly once per N-call cycle, at
-    // the same fixed phase offset relative to writeSlot every time -- so
-    // read and write visit each slot at a fixed relative distance, cycle
-    // after cycle, never drifting apart to open a second read window. Here
-    // that fixed distance is one call (readSlot this call == writeSlot next
-    // call, by construction), i.e. zero room for a retry: whatever this call
-    // just failed to read is the very slot CopyResource overwrites on the
-    // next iteration. So a failed Map() is a dropped frame, full stop. What
-    // a deeper ring buys is not a retry, it is more elapsed GPU time before
-    // this one attempt -- lowering how often the attempt fails at all.
-    // Counted (not just silently returned) so a session that skips every
-    // single frame this way -- e.g. the Flush() above being lost again some
-    // future PR -- is visible in the 10s summary (screenCapture.ts) instead
-    // of looking identical to a healthy session with nothing to deliver.
-    g_framesStillDrawing.fetch_add(1, std::memory_order_relaxed);
-    return true;
-  }
-  if (FAILED(hr)) {
-    SetError("Map(staging texture)", hr);
-    return false;
-  }
-
-  // Pooled (item 3), not `new`: see AcquirePooledPayload's doc comment for
-  // what a null return means and why it is handled exactly like Emit()'s own
-  // full-queue drop rather than falling back to a heap allocation -- this
-  // function must never block or grow unboundedly on a slow JS thread any
-  // more than the queue itself does.
+bool DrainReadback() {
+  StagingSlot* ordered[kStagingRingSize];
+  int count = 0;
+  for (auto& slot : g_stagingRing) if (slot.pending) ordered[count++] = &slot;
+  if (!count) return true;
+  std::sort(ordered, ordered + count, [](const auto* a, const auto* b) { return a->sequence > b->sequence; });
   auto* payload = AcquirePooledPayload();
-  if (!payload) {
-    g_framesRefused.fetch_add(1, std::memory_order_relaxed);
+  if (!payload) { g_framesRefused.fetch_add(1); return true; }
+  bool notReady = false;
+  for (int i = 0; i < count; ++i) {
+    auto* slot = ordered[i];
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    const auto before = std::chrono::steady_clock::now();
+    HRESULT hr = g_context->Map(slot->tex.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+    if (hr == DXGI_ERROR_WAS_STILL_DRAWING) { notReady = true; continue; }
+    if (FAILED(hr)) {
+      ReleasePooledPayload(payload);
+      SetError("Map(staging texture)", hr);
+      return false;
+    }
+    ScopedReadMap unmap{g_context.Get(), slot->tex.Get()};
+    const double ageUs = (std::max)(0.0, QpcNow100ns() / 10 - slot->timestampUs);
+    if (capture_policy::Expired(ageUs, slot->sequence, g_submissionSequence)) {
+      slot->pending = false;  // scoped Unmap precedes slot reuse
+      g_expiredReadbacks.fetch_add(1);
+      continue;
+    }
+    const auto age = static_cast<uint64_t>(ageUs);
+    if (age > g_maxFrameAgeUs.load()) g_maxFrameAgeUs.store(age);
+    payload->width = g_outW;
+    payload->height = g_outH;
+    payload->bltMs = slot->bltMs;  // CPU submission time, not GPU completion time
+    payload->timestampUs = (std::max)(slot->timestampUs, g_lastEmittedTimestampUs + 1);
+    g_lastEmittedTimestampUs = payload->timestampUs;
+    const size_t ySize = static_cast<size_t>(g_outW) * g_outH;
+    payload->nv12.resize(ySize + ySize / 2);
+    const auto* pixels = static_cast<const uint8_t*>(mapped.pData);
+    for (UINT32 row = 0; row < g_outH; ++row)
+      memcpy(payload->nv12.data() + static_cast<size_t>(row) * g_outW, pixels + static_cast<size_t>(row) * mapped.RowPitch, g_outW);
+    const auto* uv = pixels + static_cast<size_t>(mapped.RowPitch) * g_outH;
+    for (UINT32 row = 0; row < g_outH / 2; ++row)
+      memcpy(payload->nv12.data() + ySize + static_cast<size_t>(row) * g_outW, uv + static_cast<size_t>(row) * mapped.RowPitch, g_outW);
+    payload->grabMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - before).count();
+    // GPU commands are ordered on our immediate context. If this slot is
+    // ready, older submitted copies are complete too and may be reused.
+    for (auto& prior : g_stagingRing) if (prior.pending && prior.sequence <= slot->sequence) {
+      if (&prior != slot) g_readbackCoalesced.fetch_add(1);
+      prior.pending = false;
+    }
+    g_emittedFrames.fetch_add(1);
+    Emit(payload);
     return true;
   }
-  payload->width = g_outW;
-  payload->height = g_outH;
-  payload->bltMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
-  // No longer a GPU-wait measurement now that Map() is DO_NOT_WAIT -- it
-  // normally reads near zero, which is the point of this item, not a bug.
-  // grabMs still exists as a field so the harness/renderer can tell a
-  // healthy near-zero value apart from the rare WAS_STILL_DRAWING skip above
-  // (which never reaches here to report one).
-  payload->grabMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
-  // This slot's OWN timestamp, captured when it was written
-  // kStagingRingSize-1 calls ago -- not the `timestampUs` argument, which
-  // belongs to the frame just blitted into writeSlot (a DIFFERENT slot than
-  // readSlot) this same call. Using the argument here would pair this
-  // frame's pixels with a future frame's timestamp, silently undoing PR C2's
-  // real-per-frame-timestamp fix for the kStagingRingSize-1-frame lag this
-  // ring adds.
-  payload->timestampUs = g_stagingRing[readSlot].timestampUs;
-
-  // D3D11 maps an NV12 texture as one contiguous region: the Y plane
-  // (height rows of RowPitch bytes) immediately followed by the half-height,
-  // full-RowPitch UV plane. RowPitch is normally larger than the logical
-  // width (driver row alignment), so we copy row by row to hand JS a tightly
-  // packed buffer instead of forwarding the padding.
-  const size_t ySize = static_cast<size_t>(g_outW) * g_outH;
-  const size_t uvSize = ySize / 2;
-  payload->nv12.resize(ySize + uvSize);
-  const auto* src = static_cast<const uint8_t*>(mapped.pData);
-
-  for (UINT32 row = 0; row < g_outH; row++) {
-    memcpy(payload->nv12.data() + static_cast<size_t>(row) * g_outW, src + static_cast<size_t>(row) * mapped.RowPitch,
-           g_outW);
-  }
-  const uint8_t* uvSrc = src + static_cast<size_t>(mapped.RowPitch) * g_outH;
-  for (UINT32 row = 0; row < g_outH / 2; row++) {
-    memcpy(payload->nv12.data() + ySize + static_cast<size_t>(row) * g_outW,
-           uvSrc + static_cast<size_t>(row) * mapped.RowPitch, g_outW);
-  }
-  g_context->Unmap(g_stagingRing[readSlot].tex.Get(), 0);
-
-  Emit(payload);
+  ReleasePooledPayload(payload);
+  if (notReady) g_framesStillDrawing.fetch_add(1);  // poll miss, not a discarded frame
   return true;
 }
 
@@ -1227,53 +1005,7 @@ class FrameArrivedHandler
   std::atomic<HANDLE> frameEvent_{nullptr};  // not owned; CaptureThread owns and closes it
 };
 
-/**
- * Monotonic fallback for frame delivery pacing, in the same 100ns units as
- * frame->get_SystemRelativeTime() (see CaptureThread's pacing comment above
- * nextDeliverTs/lastDeliveredTs).
- *
- * get_SystemRelativeTime() can fail, and -- observed in the wild, not just
- * hypothesised -- some drivers hand back a "successful" HRESULT with
- * Duration == 0. Either way, the caller must never treat that as a genuine
- * timestamp: the pacing check below is `ts < nextDeliverTs`, and nothing but
- * an actual delivery ever advances nextDeliverTs. A `ts` of exactly 0 only
- * costs one dropped frame if nextDeliverTs was already ahead of it -- but if
- * THIS were the very first frame of the session, nextDeliverTs would latch
- * onto `0 + interval100ns` as the schedule's starting point, and every later
- * frame's own (also fabricated-as-0-on-failure, or worse, genuinely small)
- * value would keep failing to reach that mark, permanently. A single bad
- * read used to be enough to end delivery for the rest of the session with
- * nothing in the logs to explain why -- which is exactly why `ts` is never
- * allowed to actually be a fabricated 0 in the first place: substituting
- * QpcNow100ns() below keeps `ts` itself genuinely, unboundedly advancing
- * even when get_SystemRelativeTime() never recovers, so the schedule stays
- * reachable.
- *
- * QueryPerformanceCounter is this thread's own monotonic wall clock -- not
- * comparable to WGC's SystemRelativeTime in absolute terms (different
- * epochs), and pacing here compares a given `ts` against either the running
- * delivery schedule (nextDeliverTs) or the previously delivered frame's own
- * timestamp (lastDeliveredTs, kept solely for the discontinuity guard) -- so
- * switching which clock backs `ts`, in either direction, can make either of
- * those comparisons land wrong instead of merely imprecise. Left unguarded,
- * that is not "at most one wrongly-paced frame": a `ts` from the new clock
- * landing far behind the old clock's epoch would fail `ts < nextDeliverTs`
- * forever, since nothing but a delivery advances nextDeliverTs -- the exact
- * same permanent-stall shape described above, just triggered by a clock
- * switch instead of a fabricated 0. What actually makes the epoch mismatch
- * survivable is CaptureThread's own discontinuity guard, immediately before
- * the pacing check: any `ts` that reads BEFORE lastDeliveredTs re-baselines
- * pacing (resets both lastDeliveredTs and nextDeliverTs to the "take the
- * next frame unconditionally" sentinel) the moment it happens, rather than
- * trusting the two clocks to ever agree on absolute values. With that guard
- * in place, a one-time epoch mismatch on the frame where a clock switch
- * happens costs at most one re-baselined frame, not a stall -- see
- * g_timestampDiscontinuities for the counter that makes a session which
- * actually hits this leave a trace.
- * QueryPerformanceFrequency cannot fail on any Windows version this addon
- * targets (Vista+); the cached frequency is read once and reused, same
- * reasoning as every other per-process-constant cache in this file.
- */
+// WGC SystemRelativeTime and this fallback are QPC time in 100ns units.
 double QpcNow100ns() {
   static const LARGE_INTEGER kFrequency = [] {
     LARGE_INTEGER f;
@@ -1323,7 +1055,7 @@ void CaptureThread(HWND hwnd, HMONITOR monitor) {
   ComPtr<FrameArrivedHandler> frameArrivedHandler;
 
   // High-resolution pacing/heartbeat timer (item 3 of this PR). Not the
-  // delivery-pacing decision any more -- see lastDeliveredTs below -- just
+  // delivery-pacing decision any more -- see the timestamp pacer below -- just
   // what wakes this loop close to every requested interval when FrameArrived
   // alone would not: a static window legitimately produces no FrameArrived
   // events at all, and without some periodic wake this thread would never
@@ -1540,81 +1272,26 @@ void CaptureThread(HWND hwnd, HMONITOR monitor) {
       break;
     }
 
-    // Real per-frame timestamps (item 2 of this PR): pace and deliver on
-    // frame->get_SystemRelativeTime() -- a 100ns-unit, monotonically
-    // increasing clock WGC stamps on the frame itself -- not on wall-clock
-    // time this thread happens to observe the frame at. That distinction is
-    // what actually removes the poll-vs-present aliasing the file header
-    // describes: FrameArrived alone only fixes *when* this thread wakes up,
-    // not *which* frame it is looking at relative to the source's own
-    // cadence. A source presenting faster than the requested delivery rate
-    // (a 144Hz desktop feeding a 30fps share) still needs frames dropped
-    // deliberately, not accidentally by whichever one happened to be newest
-    // when a fixed-cadence poll landed.
-    double lastDeliveredTs = -1.0;  // 100ns units; negative = "always take the first frame"
-
-    // The delivery SCHEDULE, distinct from lastDeliveredTs just above (which
-    // exists purely to feed the discontinuity guard in the loop below).
-    // Advanced by exactly one interval100ns per delivery, never by a delta
-    // computed from `ts` -- see the comment above the pacing check in the
-    // loop for why a delta from the last DELIVERED frame aliases against
-    // certain source/target fps ratios and an evenly-ticking schedule does
-    // not. Same sentinel convention as lastDeliveredTs: negative means "no
-    // schedule yet -- take the next frame unconditionally", which is also
-    // how a clock-discontinuity re-baseline (below) un-parks it.
-    double nextDeliverTs = -1.0;
-
-    // nextTick now only drives pacingTimer -- see that HANDLE's own comment
-    // above for why it no longer has any say in which frames get delivered.
-    auto nextTick = std::chrono::steady_clock::now();
+    g_ready.store(true);
+    capture_policy::Pacer pacer;
 
     auto previousLoopWake = std::chrono::steady_clock::now();
     while (g_running.load()) {
-      const auto now = std::chrono::steady_clock::now();
-      // Re-read every iteration, same reasoning as before this PR: a
-      // mid-share setFps() must take effect on the very next wait, not the
-      // next session.
       const double fps = g_fps.load(std::memory_order_relaxed);
-      const auto interval = std::chrono::duration<double>(1.0 / fps);
-      const double interval100ns = 1.0e7 / fps;
-
-      // Resync, not accumulate, when behind: if this loop has fallen more
-      // than one whole interval behind schedule (a slow VideoProcessorBlt/
-      // Map, the process itself getting descheduled, ...), snapping nextTick
-      // forward to now avoids the old failure mode this exact pattern used to
-      // have here -- repeatedly adding one interval to a nextTick that is
-      // already in the past computes a wait of 0 on every following
-      // iteration until the deficit is paid off one interval at a time, i.e.
-      // a busy spin. The stakes are lower now than before this PR --
-      // pacingTimer no longer paces delivery, only wakes the liveness checks
-      // below -- but the failure mode is exactly as easy to reintroduce, so
-      // it gets the same fix.
-      if (now - nextTick > interval) nextTick = now;
-      nextTick += std::chrono::duration_cast<std::chrono::steady_clock::duration>(interval);
-
+      const LONGLONG heartbeat100ns = static_cast<LONGLONG>(capture_policy::Heartbeat100ns(fps));
       DWORD waitResult;
       if (haveHighResTimer) {
-        const auto waitDuration = nextTick - now;
-        const LONGLONG wait100ns = (std::max)(
-            static_cast<LONGLONG>(0),
-            std::chrono::duration_cast<std::chrono::duration<LONGLONG, std::ratio<1, 10000000>>>(waitDuration)
-                .count());
-        LARGE_INTEGER dueTime;
-        dueTime.QuadPart = -wait100ns;  // negative = relative to now, 100ns units
+        LARGE_INTEGER dueTime{};
+        dueTime.QuadPart = -heartbeat100ns;
         if (!SetWaitableTimerEx(pacingTimer, &dueTime, 0, nullptr, nullptr, nullptr, 0)) {
           SetError("SetWaitableTimerEx", HRESULT_FROM_WIN32(GetLastError()));
           break;
         }
-        HANDLE handles[3] = {g_stopEvent, frameEvent, pacingTimer};
-        waitResult = WaitForMultipleObjects(3, handles, FALSE, INFINITE);
+        HANDLE handles[] = {g_stopEvent, g_configEvent, frameEvent, pacingTimer};
+        waitResult = WaitForMultipleObjects(4, handles, FALSE, INFINITE);
       } else {
-        // Fallback: the coarse millisecond wait this file used exclusively
-        // before this PR, now racing frameEvent too instead of being the
-        // sole pacing mechanism -- see the file header.
-        const auto waitFor = std::chrono::duration_cast<std::chrono::milliseconds>(nextTick - now);
-        const DWORD waitMs = waitFor.count() > 0 ? static_cast<DWORD>(waitFor.count()) : 0;
-        HANDLE handles[2] = {g_stopEvent, frameEvent};
-        waitResult = WaitForMultipleObjects(2, handles, FALSE, waitMs);
+        HANDLE handles[] = {g_stopEvent, g_configEvent, frameEvent};
+        waitResult = WaitForMultipleObjects(3, handles, FALSE, static_cast<DWORD>((heartbeat100ns + 9999) / 10000));
       }
 
       if (waitResult == WAIT_OBJECT_0) break;  // g_stopEvent
@@ -1645,16 +1322,20 @@ void CaptureThread(HWND hwnd, HMONITOR monitor) {
         break;
       }
 
+      if (!DrainReadback()) { g_processFailures.fetch_add(1); break; }
+
       // Drain the pool, keeping only the newest frame -- under load WGC can
       // still have queued more than one since our last wait (the event tells
       // us "at least one", not "exactly one").
       ComPtr<WGC::IDirect3D11CaptureFrame> frame;
+      bool poolFailed = false;
       for (;;) {
         ComPtr<WGC::IDirect3D11CaptureFrame> next;
         HRESULT frHr = g_framePool->TryGetNextFrame(&next);
         if (FAILED(frHr)) {
           g_poolReadFailures.fetch_add(1, std::memory_order_relaxed);
           SetError("TryGetNextFrame", frHr);
+          poolFailed = true;
           break;
         }
         if (!next) break;
@@ -1662,121 +1343,17 @@ void CaptureThread(HWND hwnd, HMONITOR monitor) {
         if (frame) g_drainedFrames.fetch_add(1, std::memory_order_relaxed);
         frame = next;  // the previously-held frame (if any) is Released here
       }
+      if (poolFailed) break;
       if (!frame) continue;  // nothing new since last wait
 
-      // Pace on the frame's own timestamp -- see the comment above
-      // lastDeliveredTs's declaration for why wall-clock time would not do --
-      // against a running SCHEDULE (nextDeliverTs), not a delta from the
-      // last DELIVERED frame. This used to be delta-based: drop unless
-      // `(ts - lastDeliveredTs) >= 0.9 * interval100ns`, i.e. unless the new
-      // frame landed at least ~0.9 intervals past the previous DELIVERY.
-      // That aliases badly whenever the source's own interval does not
-      // divide evenly into the target interval, because each delivery moves
-      // the base the next comparison is measured from, so a shortfall never
-      // averages out -- it repeats every single time. Concretely, a 70fps
-      // source into a 30fps target: target interval 33.33ms, 0.9x threshold
-      // 30ms, source interval 14.29ms. 1 source interval (14.29ms) is below
-      // 30ms -- drop. 2 (28.57ms) are STILL below it, by 1.4ms -- drop. 3
-      // (42.86ms) finally clears it -- deliver. Every delivered frame resets
-      // the base to itself, so this 1-in-3 pattern holds for the entire
-      // session: 70/3 = 23.3fps delivered, never the 30fps target, no matter
-      // how long the share runs (this is the exact shape measured in
-      // production: 24.7fps delivered against a 30fps target). A schedule
-      // does not have this failure mode because it never re-bases on the
-      // frame that happened to satisfy it: nextDeliverTs ticks forward by
-      // exactly one interval100ns per delivery regardless of how early or
-      // late the frame that crossed it arrived, so every 33.33ms window
-      // takes exactly one frame -- whichever source frame is first to reach
-      // it -- and the long-run delivered rate is min(sourceFps, targetFps)
-      // for any source/target ratio, not just the ones that divide evenly
-      // (144fps into 60fps: one frame every ~16.67ms window, i.e. 60fps
-      // delivered, not some 144-vs-60 aliased rate). The old 0.9x fudge
-      // factor existed purely to absorb jitter under delta-based pacing -- a
-      // frame landing a hair under one full interval since the last
-      // DELIVERY still needed to count as "on time" instead of being pushed
-      // out an extra interval. Schedule-based pacing needs no equivalent: a
-      // frame arriving before nextDeliverTs simply is not this window's
-      // frame yet, and the next frame to reach the mark is -- there is no
-      // "last delivery" for jitter to be measured against, so nothing here
-      // needs fudging.
       ABI::Windows::Foundation::TimeSpan relativeTime{};
       hr = frame->get_SystemRelativeTime(&relativeTime);
-      // FAILED(hr) is the obvious failure; Duration == 0 is the one observed
-      // in the wild that is not -- some drivers report S_OK with a zero
-      // timestamp. Both get the same fallback: a fabricated 0.0 here is
-      // indistinguishable from a genuine one to the pacing check below, and
-      // if nextDeliverTs ever latched onto a fabricated 0's schedule, every
-      // later frame's own (also-possibly-fabricated) value could keep
-      // failing to reach it -- see QpcNow100ns's doc comment for the full
-      // failure mode this replaces.
-      double ts;
-      if (SUCCEEDED(hr) && relativeTime.Duration != 0) {
-        ts = static_cast<double>(relativeTime.Duration);
-      } else {
-        ts = QpcNow100ns();
-        g_timestampFallbacks.fetch_add(1, std::memory_order_relaxed);
-      }
-      // Guard against a clock discontinuity before trusting the pacing check
-      // below at all. `ts` above can come from either clock on any given
-      // frame -- a genuine frame->get_SystemRelativeTime() read, or the
-      // QpcNow100ns() fallback -- and those two are not comparable in
-      // absolute terms (different epochs; see QpcNow100ns's doc comment).
-      // Whenever this session switches from one to the other -- entering the
-      // fallback, leaving it, or flapping between the two on alternating
-      // frames if a driver's Duration==0 glitch is itself intermittent -- the
-      // new `ts` can land BEFORE lastDeliveredTs, not just too close to it.
-      // Falling through to the pacing check below with nextDeliverTs still
-      // anchored to a schedule built from an earlier reading on the OTHER
-      // clock would be wrong in exactly the way this guard exists to fix:
-      // `ts < nextDeliverTs` would be satisfied forever, since nextDeliverTs
-      // is a schedule the new clock's `ts` values may never reach, and
-      // nothing but an actual delivery ever advances it -- so every later
-      // frame this session would be dropped, silently, for the same
-      // structural reason the fabricated-0 bug was (see QpcNow100ns's doc
-      // comment), just reached by a clock switch instead of a fabricated
-      // value. Re-baseline instead of clamping or skipping: reset BOTH
-      // lastDeliveredTs and nextDeliverTs to the same "always take the next
-      // frame"/"no schedule yet" sentinel the very first frame of the
-      // session uses, so this frame is delivered unconditionally, a fresh
-      // schedule starts from it, and every frame after it paces off
-      // whichever clock is now in use. Resetting only one of the two would
-      // not be enough to fix anything: nextDeliverTs is what the pacing
-      // check below actually tests, so leaving it parked at the old clock's
-      // epoch would keep rejecting every subsequent frame even after
-      // lastDeliveredTs itself was cleared -- exactly the kind of
-      // permanently-stalled schedule this whole guard exists to prevent.
-      if (lastDeliveredTs >= 0.0 && ts < lastDeliveredTs) {
-        g_timestampDiscontinuities.fetch_add(1, std::memory_order_relaxed);
-        lastDeliveredTs = -1.0;
-        nextDeliverTs = -1.0;
-      }
-      if (nextDeliverTs >= 0.0 && ts < nextDeliverTs) {
-        g_pacingSkips.fetch_add(1, std::memory_order_relaxed);
-        continue;  // before the next scheduled delivery -- drop (Release only, same as any other drop)
-      }
-      lastDeliveredTs = ts;
-      if (nextDeliverTs < 0.0) {
-        // First delivery this session, or the first since a re-baseline
-        // above: start the schedule exactly one interval past this frame.
-        nextDeliverTs = ts + interval100ns;
-      } else {
-        nextDeliverTs += interval100ns;
-        if (nextDeliverTs <= ts) {
-          // The schedule fell a full interval or more behind `ts` -- the
-          // source stalled, this thread got descheduled for a while, or
-          // setFps() just changed the target rate out from under a schedule
-          // computed for the old one. Resync to this frame instead of
-          // leaving nextDeliverTs in the past: ticking it forward one
-          // interval100ns at a time from here would let every frame until
-          // the deficit is paid off through as a burst of catch-up
-          // deliveries, which is exactly the "producing nothing, then
-          // everything at once" failure this file has already had to fix in
-          // more than one shape (see nextTick's own resync above, and its
-          // comment on why repeatedly adding one interval to a stale base is
-          // a busy-spin waiting to happen).
-          nextDeliverTs = ts + interval100ns;
-        }
-      }
+      // WGC SystemRelativeTime and QPC share the QPC clock; units are 100ns.
+      double ts = SUCCEEDED(hr) && relativeTime.Duration > 0 ? static_cast<double>(relativeTime.Duration) : QpcNow100ns();
+      if (FAILED(hr) || relativeTime.Duration <= 0) g_timestampFallbacks.fetch_add(1);
+      bool discontinuity = false;
+      if (!pacer.Take(ts, fps, discontinuity)) { g_pacingSkips.fetch_add(1); continue; }
+      if (discontinuity) g_timestampDiscontinuities.fetch_add(1);
 
       WG::SizeInt32 contentSize{};
       hr = frame->get_ContentSize(&contentSize);
@@ -1812,58 +1389,18 @@ void CaptureThread(HWND hwnd, HMONITOR monitor) {
         continue;
       }
 
-      // REJECTED #1: passing contentSize.Width/Height straight into
-      // ProcessFrame here, as this originally did. contentSize is the
-      // window's CURRENT content extent per WGC, but srcTex is a frame-pool
-      // texture -- its *actual* dimensions are whatever the pool was last
-      // Recreate()'d to, which lags one frame behind a resize. ProcessFrame
-      // fed its (srcW, srcH) straight into EnsurePipeline (which rebuilt the
-      // video processor for the size WGC just reported) and into srcRect for
-      // VideoProcessorBlt -- so on the frame right after a resize this passed
-      // the NEW size as the source rect while srcTex still held the OLD
-      // pool's texture, and VideoProcessorBlt failed with E_INVALIDARG
-      // (0x80070057) on every single frame until the pool caught up. This is
-      // exactly the failure a racing sim toggling fullscreen/borderless hit
-      // in production, repeatedly, and it is an easy mistake to reintroduce
-      // because contentSize *looks* like the right value to pass -- it is,
-      // just not for a texture that has not been resized to match it yet.
-      //
-      // REJECTED #2: once the above was caught, the fix here dropped this
-      // frame (instead of blitting it) whenever srcTex's own dimensions
-      // disagreed with contentSize, and recreated the pool for the new size
-      // before continuing. That is correct for a *discrete* resize (one
-      // Recreate, no oscillation) but breaks under a *continuous* one --
-      // dragging a window edge, or an engine's fullscreen transition
-      // animating over a second -- where contentSize changes faster than a
-      // Recreate (which itself costs a full enumerator + processor + two
-      // CreateTexture2D calls) can keep up. Every poll during that window
-      // sees a fresh mismatch, so every frame gets dropped and this session
-      // delivers nothing until FRAME_WATCHDOG_MS (screenCapture.ts) kills it
-      // for lack of frames -- the exact symptom this module exists to fix,
-      // reached by a new route.
-      //
-      // The actual fix: there is no correctness reason to drop. srcTex is
-      // valid at its own dimensions regardless of what contentSize says --
-      // on *grow* WGC has cropped the larger window into the smaller
-      // surface (every pixel real, just cropped); on *shrink* the top-left
-      // region matching the new, smaller content is valid and the margin
-      // outside it is 1-2 frames of stale ghost pixels. Both are invisible
-      // at 30fps next to seconds of black. So always blit the texture we
-      // actually hold, sized to itself (srcRect == texture bounds by
-      // construction, matching vpDesc.InputWidth/Height exactly --
-      // E_INVALIDARG from a size mismatch becomes structurally impossible
-      // rather than merely avoided), and use contentSize only to decide,
-      // separately and without blocking this frame, whether the pool needs
-      // recreating for frames still to come. Do NOT try to clamp srcRect to
-      // min(srcDesc, contentSize) to trim the shrink-case ghost margin --
-      // that puts vpDesc.InputWidth/Height out of step with the input view's
-      // actual texture again, which is the exact shape the original bug
-      // lived in.
+      // Crop to valid content inside the current pool texture. During a
+      // resize the two extents can differ; process their intersection, then
+      // recreate the pool for subsequent frames.
       D3D11_TEXTURE2D_DESC srcDesc{};
       srcTex->GetDesc(&srcDesc);
       g_processAttempts.fetch_add(1, std::memory_order_relaxed);
-      if (!ProcessFrame(srcTex.Get(), srcDesc.Width, srcDesc.Height, ts / 10.0)) {
+      const UINT32 validW = (std::min)(srcDesc.Width, static_cast<UINT32>(contentSize.Width));
+      const UINT32 validH = (std::min)(srcDesc.Height, static_cast<UINT32>(contentSize.Height));
+      if (validW < 2 || validH < 2) continue;
+      if (!ProcessFrame(srcTex.Get(), validW, validH, ts / 10.0)) {
         g_processFailures.fetch_add(1, std::memory_order_relaxed);
+        break;
       }
 
       // Recreate the pool for the window's current content size if it has
@@ -1897,6 +1434,7 @@ void CaptureThread(HWND hwnd, HMONITOR monitor) {
   // there by the time it arrives). This is what lets screenCapture.ts's
   // onFrame react immediately instead of waiting out the watchdog. See A3
   // item 5.
+  g_ready.store(false);
   {
     auto* death = new FramePayload();
     death->isDeath = true;
@@ -1955,8 +1493,7 @@ void CaptureThread(HWND hwnd, HMONITOR monitor) {
   g_srcW = g_srcH = g_outW = g_outH = 0;
   g_poolW = g_poolH = 0;
   g_lastTargetW = g_lastTargetH = 0;
-  g_stagingRingIndex = 0;
-  g_stagingRingFilled = 0;
+
 
   // frameEvent is safe to close now regardless of how CaptureThread got here
   // (a clean stop, a mid-setup failure, an unrecoverable per-frame error) --
@@ -1986,6 +1523,7 @@ void CaptureThread(HWND hwnd, HMONITOR monitor) {
 
   if (roInitialised) RoUninitialize();
 
+  g_ready.store(false);
   g_running.store(false);
   g_tsfn.Release();
 }
@@ -2099,6 +1637,12 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
       Napi::TypeError::New(env, "monitor origin must contain numeric x/y").ThrowAsJavaScriptException();
       return env.Undefined();
     }
+    const double x = origin.Get("x").As<Napi::Number>().DoubleValue();
+    const double y = origin.Get("y").As<Napi::Number>().DoubleValue();
+    if (!std::isfinite(x) || !std::isfinite(y) || x < LONG_MIN || x > LONG_MAX || y < LONG_MIN || y > LONG_MAX) {
+      Napi::RangeError::New(env, "monitor origin must contain finite signed 32-bit coordinates").ThrowAsJavaScriptException();
+      return env.Undefined();
+    }
     POINT point = {origin.Get("x").As<Napi::Number>().Int32Value(),
                    origin.Get("y").As<Napi::Number>().Int32Value()};
     monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONULL);
@@ -2110,25 +1654,31 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
     return env.Undefined();
   }
 
-  const UINT32 targetW = info[1].As<Napi::Number>().Uint32Value();
-  const UINT32 targetH = info[2].As<Napi::Number>().Uint32Value();
+  const double width = info[1].As<Napi::Number>().DoubleValue();
+  const double height = info[2].As<Napi::Number>().DoubleValue();
   const double startFps = info[3].As<Napi::Number>().DoubleValue();
-  g_fps.store(startFps > 0 ? startFps : 30.0);
-  if (targetW < 2 || targetH < 2) {
-    Napi::Error::New(env, "targetWidth/targetHeight must be >= 2").ThrowAsJavaScriptException();
+  if (!capture_policy::ValidDimension(width) || !capture_policy::ValidDimension(height) || !capture_policy::Pacer::ValidFps(startFps)) {
+    Napi::RangeError::New(env, "capture requires integer dimensions 2..8192 and finite fps 1..120").ThrowAsJavaScriptException();
     return env.Undefined();
   }
-  g_targetW.store(targetW, std::memory_order_relaxed);
-  g_targetH.store(targetH, std::memory_order_relaxed);
+  g_fps.store(startFps);
+  g_targetSize.store((static_cast<uint64_t>(width) << 32) | static_cast<UINT32>(height));
 
   SetErrorText(std::string());
   g_srcW = g_srcH = g_outW = g_outH = 0;
   g_poolW = g_poolH = 0;
   g_lastTargetW = g_lastTargetH = 0;
-  g_stagingRingIndex = 0;
-  g_stagingRingFilled = 0;
+
   if (g_stopEvent) CloseHandle(g_stopEvent);
   g_stopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  g_configEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  if (!g_stopEvent || !g_configEvent) {
+    if (g_stopEvent) CloseHandle(g_stopEvent);
+    if (g_configEvent) CloseHandle(g_configEvent);
+    g_stopEvent = g_configEvent = nullptr;
+    Napi::Error::New(env, "could not create capture events").ThrowAsJavaScriptException();
+    return env.Undefined();
+  }
 
   // Queue depth is a jitter allowance, not a buffer. At 30fps a single slot
   // was fine -- the JS thread always drained inside the 33ms budget, and the
@@ -2171,6 +1721,9 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
   g_pacingSkips.store(0); g_processAttempts.store(0); g_processFailures.store(0);
   g_poolReadFailures.store(0); g_surfaceFailures.store(0); g_longLoopGaps.store(0);
   g_maxLoopGapUs.store(0); g_lastLoopAt100ns.store(QpcNow100ns());
+  g_submittedFrames.store(0); g_emittedFrames.store(0); g_readbackCoalesced.store(0); g_ringFull.store(0);
+  g_expiredReadbacks.store(0); g_maxFrameAgeUs.store(0);
+  g_submissionSequence = 0; g_lastEmittedTimestampUs = -1; g_ready.store(false);
   // Same reasoning: a later share should never look like it inherited an
   // earlier session's GPU-priority outcome before CaptureThread (below) has
   // had a chance to run its own attempt and overwrite this.
@@ -2227,6 +1780,7 @@ class StopWorker : public Napi::AsyncWorker {
       CloseHandle(g_stopEvent);
       g_stopEvent = nullptr;
     }
+    if (g_configEvent) { CloseHandle(g_configEvent); g_configEvent = nullptr; }
     g_stopping.store(false);
     deferred_.Resolve(Env().Undefined());
     // Any stop() calls that arrived while this join was still in flight
@@ -2307,8 +1861,9 @@ Napi::Value SetFps(const Napi::CallbackInfo& info) {
   if (!g_running.load()) return Napi::Boolean::New(env, false);
   if (info.Length() < 1 || !info[0].IsNumber()) return Napi::Boolean::New(env, false);
   const double fps = info[0].As<Napi::Number>().DoubleValue();
-  if (!(fps > 0) || fps > 240) return Napi::Boolean::New(env, false);
+  if (!capture_policy::Pacer::ValidFps(fps)) return Napi::Boolean::New(env, false);
   g_fps.store(fps, std::memory_order_relaxed);
+  if (g_configEvent) SetEvent(g_configEvent);
   return Napi::Boolean::New(env, true);
 }
 
@@ -2335,9 +1890,9 @@ Napi::Value SetTarget(const Napi::CallbackInfo& info) {
   // preset -- EnsurePipeline's own fit-inside clamp-to-1 is what actually
   // stops a source from being upscaled, this is only a sanity check against
   // a clearly-wrong value crossing IPC from a remote page.
-  if (!(w >= 2) || !(h >= 2) || w > 8192 || h > 8192) return Napi::Boolean::New(env, false);
-  g_targetW.store(static_cast<UINT32>(w), std::memory_order_relaxed);
-  g_targetH.store(static_cast<UINT32>(h), std::memory_order_relaxed);
+  if (!capture_policy::ValidDimension(w) || !capture_policy::ValidDimension(h)) return Napi::Boolean::New(env, false);
+  g_targetSize.store((static_cast<uint64_t>(w) << 32) | static_cast<UINT32>(h), std::memory_order_relaxed);
+  if (g_configEvent) SetEvent(g_configEvent);
   return Napi::Boolean::New(env, true);
 }
 
