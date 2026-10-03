@@ -106,6 +106,9 @@ Currently, this is required to build, any forks are expected to provide their ow
 
 ## Screen share diagnostics
 
+The [native capture plan](docs/native-capture-plan.md) records the tested WGC
+baseline, completed hardening and the remaining Duplication/AMD experiments.
+
 On Windows, native window and monitor shares write diagnostics to
 `%APPDATA%/stoat-desktop/logs/app-audio.log`. Rotation retains the current 2MiB
 file plus four numbered archives (`.1` is newest); preserve all five files
