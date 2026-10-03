@@ -24,12 +24,14 @@
 // system mix including the voice call. See window.ts's respondToDisplayMedia
 // and the `--allow-system-audio-mix` escape hatch that fallback now lives
 // behind.
-import { appendFileSync, mkdirSync, statSync, unlinkSync } from "node:fs";
+import { appendFileSync, mkdirSync } from "node:fs";
 import { appendFile } from "node:fs/promises";
 import { release } from "node:os";
 import { join } from "node:path";
 
 import { BrowserWindow, app, ipcMain, shell } from "electron";
+
+import { rotateDiagnosticLog } from "./diagnosticLog";
 
 export const APP_AUDIO_CHUNK = "appAudio:chunk";
 export const APP_AUDIO_STATE = "appAudio:state";
@@ -105,21 +107,12 @@ export function appAudioLogPath() {
 // {@link flushAppAudioLogSync}'s for what runs on `before-quit`.
 const LOG_FLUSH_INTERVAL_MS = 250;
 const LOG_FLUSH_BYTES = 64 * 1024;
-/** Keep it small; this is a diagnostic aid, not an audit trail. */
-const LOG_MAX_BYTES = 512 * 1024;
-/**
- * The statSync/truncate check used to run before every single line. Now it
- * runs every LOG_STAT_EVERY_N_WRITES lines instead -- the file can overshoot
- * LOG_MAX_BYTES by up to that many lines between checks, which is noise
- * against a 512KB budget, in exchange for one syscall per ~100 lines instead
- * of per line.
- */
-const LOG_STAT_EVERY_N_WRITES = 100;
+// Keep bounded history through serialized rotation: current 2MiB plus four archives.
 
 let logBuffer: string[] = [];
 let logBufferBytes = 0;
 let logFlushTimer: ReturnType<typeof setTimeout> | null = null;
-let logWriteCount = 0;
+
 /**
  * Every async flush chains onto this instead of firing its own fs.appendFile
  * call directly. Two independent appendFile calls to the same path can
@@ -132,30 +125,12 @@ let logWriteCount = 0;
  * so one failed write cannot poison every flush after it.
  */
 let logFlushChain: Promise<void> = Promise.resolve();
-/**
- * The exact bytes handed to the fs.appendFile call `logFlushChain` is
- * currently waiting on, or null when nothing is in flight. This is the other
- * half of the quit guarantee: `before-quit` cannot await `logFlushChain`
- * (see {@link flushAppAudioLogSync}'s doc comment for why), so instead of
- * hoping the in-flight async write lands before the process exits, the sync
- * flush re-sends this same data with appendFileSync. In the rare case both
- * end up landing, the cost is a duplicate line in a diagnostic log -- cheap
- * insurance against losing the line outright.
- */
-let logInFlightData: string | null = null;
-/**
- * Identifies which flush {@link logInFlightData} belongs to, so the
- * `.finally()` in {@link flushLogBuffer} that clears it can tell "my own
- * write landed" apart from "a later write's data happens to be
- * byte-identical to mine". Two batches CAN be byte-identical in principle --
- * e.g. two flush cycles that each contain exactly one repeated log line --
- * and `string === string` compares by value, so comparing against
- * `logInFlightData` directly would let an earlier write's completion clear a
- * later, still-in-flight write's marker out from under it. A monotonic
- * counter compared by identity has no such collision.
- */
+// Retain every queued batch until it settles. Quit can occur before the chain
+// starts any of them; retaining only the latest batch would lose earlier ones.
+// An already-started append may also land after the synchronous quit flush,
+// producing duplicate diagnostic lines rather than losing the tail.
+const pendingLogBatches = new Map<number, string>();
 let logFlushSeq = 0;
-let logInFlightSeq = 0;
 
 export function log(...parts: unknown[]) {
   const line =
@@ -165,15 +140,6 @@ export function log(...parts: unknown[]) {
   console.log("[appAudio]", line);
   const file = appAudioLogPath();
   if (!file) return;
-
-  logWriteCount++;
-  if (logWriteCount % LOG_STAT_EVERY_N_WRITES === 0) {
-    try {
-      if (statSync(file).size > LOG_MAX_BYTES) unlinkSync(file);
-    } catch {
-      /* first run, or file already gone -- fine either way */
-    }
-  }
 
   logBuffer.push(line);
   // +1 for the "\n" flushLogBuffer joins in; counted here rather than after
@@ -210,20 +176,24 @@ function flushLogBuffer() {
   if (!file) return;
 
   const seq = ++logFlushSeq;
-  logInFlightData = data;
-  logInFlightSeq = seq;
+  pendingLogBatches.set(seq, data);
   logFlushChain = logFlushChain
-    .then(() => appendFile(file, data, "utf8"))
+    .then(() => {
+      if (!pendingLogBatches.has(seq)) return; // already written at quit
+      // Rotation belongs on the same chain as appends; otherwise a pending
+      // write could race a rename and split one session across wrong files.
+      try {
+        rotateDiagnosticLog(file, Buffer.byteLength(data));
+      } catch {
+        /* preserve existing data on rotation failure */
+      }
+      return appendFile(file, data, "utf8");
+    })
     .catch(() => {
       /* logging must never break screen sharing */
     })
     .finally(() => {
-      // Only clear it if it's still THIS write's turn -- see logFlushSeq's
-      // doc comment for why identity (the sequence number), not the data
-      // itself, is what's compared. A sync quit flush (flushAppAudioLogSync)
-      // can also grab and null this out from under a still-pending promise,
-      // and a later write must not clobber that either.
-      if (logInFlightSeq === seq) logInFlightData = null;
+      pendingLogBatches.delete(seq);
     });
 }
 
@@ -238,8 +208,8 @@ function flushLogBuffer() {
  * and nothing here can assume the event loop survives long enough to let a
  * pending fs.appendFile finish once quit actually proceeds. So this bypasses
  * the buffer and the async chain entirely: it re-sends whatever write was in
- * flight (see {@link logInFlightData}'s doc comment for why that can produce
- * a harmless duplicate line rather than a lost one) and then appendFileSync's
+ * flight or queued (an active write can produce duplicate diagnostic lines)
+ * and then appendFileSync's
  * whatever is still sitting in the buffer, synchronously, on the main
  * thread -- exactly what every line paid before this change, just once at
  * quit instead of once per line.
@@ -257,15 +227,16 @@ export function flushAppAudioLogSync() {
   if (!file) {
     logBuffer = [];
     logBufferBytes = 0;
-    logInFlightData = null;
+    pendingLogBatches.clear();
     return;
   }
   try {
-    if (logInFlightData) appendFileSync(file, logInFlightData, "utf8");
+    for (const data of pendingLogBatches.values())
+      appendFileSync(file, data, "utf8");
   } catch {
     /* logging must never break screen sharing, not even at quit */
   } finally {
-    logInFlightData = null;
+    pendingLogBatches.clear();
   }
   if (logBuffer.length === 0) return;
   const data = logBuffer.join("\n") + "\n";
@@ -283,8 +254,8 @@ export function flushAppAudioLogSync() {
  * app-audio.log (plan PR A5 item 2) -- the injected patch's forwarded
  * console (`screenCapture:pageLog`) and the raw `console-message` event in
  * window.ts both read from a remote page we do not control, so a page bug
- * that logs in a tight loop must not get to flood a 512KB-capped file (see
- * LOG_MAX_BYTES) with nothing else ever making it in edgewise.
+ * that logs in a tight loop must not get to flood the bounded log history (see
+ * diagnosticLog.ts) with nothing else ever making it in edgewise.
  *
  * A plain drop would fix the flood but hide it -- the log would just go
  * quiet with no sign anything was suppressed. Instead this returns whether

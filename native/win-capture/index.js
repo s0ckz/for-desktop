@@ -23,7 +23,9 @@ const METHODS = [
   "stop",
   "setFps",
   "setTarget",
+  "configure",
   "lastError",
+  "diagnostics",
 ];
 
 const unavailable = {};
@@ -37,6 +39,8 @@ unavailable.stop = () => Promise.resolve();
 unavailable.lastError = () =>
   loadError ? String(loadError.message || loadError) : "not loaded";
 
+unavailable.diagnostics = () => null;
+
 const api = native || unavailable;
 
 // This object must mirror index.d.ts exactly: every method declared there
@@ -47,6 +51,12 @@ const api = native || unavailable;
 // assume the harness exercises a method just because it goes through this
 // wrapper; check test-capture.js's own call list, or check-exports.js.
 module.exports = {
+  // Null identifies an older binary so main can use its guarded legacy setters.
+  configure: (width, height, fps) =>
+    typeof api.configure === "function"
+      ? api.configure(width, height, fps)
+      : null,
+  diagnostics: () => api.diagnostics?.() ?? null,
   /** True when the running OS/GPU can do Windows Graphics Capture with a video processor. */
   isSupported: () => {
     try {
@@ -56,13 +66,29 @@ module.exports = {
     }
   },
   /**
-   * Begin capture of a top-level window. Frames are delivered fit-inside
+   * Begin capture of a top-level window or the monitor containing monitorOrigin. Frames are delivered fit-inside
    * targetWidth x targetHeight (aspect preserved, never stretched -- see
    * index.d.ts), at up to `fps` times per second. Frames produced faster than
    * that are dropped on the native side, never queued.
    */
-  start: (hwnd, targetWidth, targetHeight, fps, onFrame) =>
-    api.start(hwnd, targetWidth, targetHeight, fps, onFrame),
+  start: (
+    hwnd,
+    targetWidth,
+    targetHeight,
+    fps,
+    onFrame,
+    monitorOrigin,
+    backend = "wgc",
+  ) =>
+    api.start(
+      hwnd,
+      targetWidth,
+      targetHeight,
+      fps,
+      onFrame,
+      monitorOrigin,
+      backend,
+    ),
   /**
    * Resolves once the capture thread has actually joined (see index.d.ts).
    * screenCapture.ts's stopNative() awaits this specifically to know when

@@ -14,10 +14,17 @@ import { version } from "../../package.json";
 // is not touched by this item), so frames fan out to a small local listener
 // set instead of binding the caller's handler straight to the port.
 const FRAME_PORT_CHANNEL = "screenCapture:framePort";
-type FrameMeta = { width: number; height: number; timestampUs: number };
+type FrameMeta = {
+  width: number;
+  height: number;
+  timestampUs: number;
+  sessionId: number;
+  frameId: number;
+};
 type FrameHandler = (frame: Uint8Array, meta: FrameMeta) => void;
 let framePort: MessagePort | null = null;
-const frameHandlers = new Set<FrameHandler>();
+const frameHandlers = new Map<FrameHandler, number>();
+let receivingSession = 0;
 
 ipcRenderer.on(FRAME_PORT_CHANNEL, (event: IpcRendererEvent) => {
   // Old port first: a reload means the previous port's other end (the main
@@ -37,12 +44,20 @@ ipcRenderer.on(FRAME_PORT_CHANNEL, (event: IpcRendererEvent) => {
   if (!framePort) return;
   framePort.onmessage = (e: MessageEvent) => {
     const { frame, meta } = e.data as { frame: Uint8Array; meta: FrameMeta };
-    for (const handler of frameHandlers) handler(frame, meta);
+    try {
+      for (const [handler, sessionId] of frameHandlers)
+        if (sessionId === meta.sessionId) handler(frame, meta);
+    } finally {
+      framePort?.postMessage({
+        kind: "ack",
+        sessionId: meta.sessionId,
+        frameId: meta.frameId,
+      });
+    }
   };
-  // Only needed for the *receiving* end of a MessagePort -- this port is
-  // otherwise idle (native capture pushes; nothing here replies), but
-  // messages queue until start() is called regardless, per the MessagePort
-  // spec.
+  if (receivingSession)
+    framePort.postMessage({ kind: "ready", sessionId: receivingSession });
+  // Begin pixel reception; ready/ACK messages grant bounded delivery credit.
   framePort.start();
 });
 
@@ -123,7 +138,18 @@ contextBridge.exposeInMainWorld("native", {
   // MediaStreamTrack, in place of Chromium's own (slower) capture.
   screenCapture: {
     getState: () => ipcRenderer.invoke("screenCapture:getState"),
-    stop: () => ipcRenderer.send("screenCapture:stop"),
+    reportFailure: (sessionId: number, reason: string) =>
+      ipcRenderer.send("screenCapture:rendererFailure", sessionId, reason),
+    /** Acknowledges accepted limits; frame metadata supplies delivered dimensions. */
+    configure: (request: {
+      sessionId: number;
+      requestId: number;
+      width: number;
+      height: number;
+      fps: number;
+    }) => ipcRenderer.invoke("screenCapture:configure", request),
+    stop: (sessionId?: number) =>
+      ipcRenderer.send("screenCapture:stop", sessionId),
     // One-shot announcement of the framerate the page just asked
     // getDisplayMedia for, sent immediately before the call that triggers
     // the actual display-media request -- see takeNextRequestedFps's doc
@@ -132,12 +158,13 @@ contextBridge.exposeInMainWorld("native", {
     setNextFps: (fps: number) =>
       ipcRenderer.send("screenCapture:setNextFps", fps),
     /** Change the rate of a share already running (a mid-share quality change). */
-    setFps: (fps: number) => ipcRenderer.send("screenCapture:setFps", fps),
+    setFps: (fps: number, sessionId?: number) =>
+      ipcRenderer.send("screenCapture:setFps", fps, sessionId),
     /** Change the target bounding box of a share already running (a
      *  mid-share quality change) -- see setLiveTarget's doc comment in
      *  native/screenCapture.ts. */
-    setTarget: (width: number, height: number) =>
-      ipcRenderer.send("screenCapture:setTarget", width, height),
+    setTarget: (width: number, height: number, sessionId?: number) =>
+      ipcRenderer.send("screenCapture:setTarget", width, height, sessionId),
     // The page's console is filtered below error level (see window.ts's
     // console-message listener), so the injected patch reports which video
     // path a share took -- and, on fallback, why -- through here instead,
@@ -151,16 +178,31 @@ contextBridge.exposeInMainWorld("native", {
     // for this window instead of only a one-shot log line. `stage` names
     // which drop this was; screenCapture.ts validates it, the same distrust
     // as every other value crossing this bridge from a remote page.
+    reportStats: (sessionId: number, counters: Record<string, number>) =>
+      ipcRenderer.send("screenCapture:rendererStats", sessionId, counters),
     reportDrop: (stage: string) =>
       ipcRenderer.send("screenCapture:pageDrop", stage),
     // Delivered over the dedicated port wired above, not a plain
     // `ipcRenderer` channel -- see `FRAME_PORT_CHANNEL`'s doc comment. The
-    // shape of this call is unchanged (register a handler, get an
-    // unsubscribe function back) so appAudioPatch.ts, which calls this, did
-    // not need to change for the port swap.
-    onFrame: (handler: FrameHandler) => {
-      frameHandlers.add(handler);
-      return () => frameHandlers.delete(handler);
+    // The session ID binds this listener and its delivery credit to one share.
+    onFrame: (handler: FrameHandler, sessionId: number) => {
+      if (!Number.isSafeInteger(sessionId) || sessionId <= 0)
+        return (): void => {
+          /* No listener was registered. */
+        };
+      frameHandlers.set(handler, sessionId);
+      receivingSession = sessionId;
+      framePort?.postMessage({ kind: "ready", sessionId });
+      return () => {
+        frameHandlers.delete(handler);
+        if (
+          receivingSession === sessionId &&
+          ![...frameHandlers.values()].includes(sessionId)
+        ) {
+          receivingSession = 0;
+          framePort?.postMessage({ kind: "pause", sessionId });
+        }
+      };
     },
     // Pushed whenever capture starts, stops, or the main process detects the
     // captured window went away -- see the long comment on the watchdogs in
@@ -168,6 +210,7 @@ contextBridge.exposeInMainWorld("native", {
     // something the native module itself reports.
     onState: (
       handler: (state: {
+        sessionId: number;
         active: boolean;
         sourceId: string | null;
         width: number;
@@ -179,6 +222,7 @@ contextBridge.exposeInMainWorld("native", {
       const listener = (
         _: unknown,
         state: {
+          sessionId: number;
           active: boolean;
           sourceId: string | null;
           width: number;

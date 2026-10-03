@@ -106,6 +106,10 @@ const testStart = Date.now();
 
 try {
   capture.start(hwnd, TARGET_W, TARGET_H, TARGET_FPS, (buf, meta) => {
+    if (!buf) {
+      console.log("capture exited:", meta.reason || "ordinary stop");
+      return;
+    }
     const now = Date.now();
     frames++;
     bytes += buf.length;

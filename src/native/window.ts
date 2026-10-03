@@ -29,6 +29,7 @@ import { APP_AUDIO_PATCH } from "./appAudioPatch";
 import { config, getPersistedServer } from "./config";
 import {
   SCREEN_CAPTURE_FRAME_PORT,
+  isCurrentScreenCaptureSession,
   resetNativeFailures,
   setFramePort,
   setLiveFps as setScreenCaptureFps,
@@ -414,17 +415,9 @@ async function respondToDisplayMedia(
     }
   }
 
-  // Native GPU-downscaled capture: Windows + window sources only (the agreed
-  // scope boundary -- screen sources and every other platform keep today's
-  // Chromium path untouched). `videoSource` may have been swapped to a screen
-  // above by --window-shares-as-screen, which must NOT go through here: that
-  // flag exists specifically to route a window off WGC, and this module's
-  // whole point is capturing a *window* through WGC, just more cheaply.
-  if (
-    process.platform === "win32" &&
-    isWindow &&
-    videoSource.id === source.id
-  ) {
+  // Native WGC capture for both windows and monitors. Preserve the explicit
+  // --window-shares-as-screen escape hatch to Chromium.
+  if (process.platform === "win32" && videoSource.id === source.id) {
     // The page announced what it asked getDisplayMedia for (see
     // appAudioPatch.ts and takeNextRequestedFps's doc comment); 30 is what we
     // fell back to before that handoff existed, so it stays the default when
@@ -440,7 +433,9 @@ async function respondToDisplayMedia(
     // `if` would test a Promise object, which is always truthy, and this
     // branch would report "native GPU capture" even when start ultimately
     // failed or fell back.
-    if (await startScreenCapture(source.id, fps, sessionId)) {
+    if (
+      await startScreenCapture(source.id, fps, sessionId, source.display_id)
+    ) {
       appAudioLog(
         "video path: native GPU capture (WGC + VideoProcessorBlt) for",
         source.id,
@@ -642,14 +637,19 @@ async function primaryScreenSource(): Promise<Electron.DesktopCapturerSource | n
  * Lives here rather than in screenCapture.ts so `--capture-fps` still wins,
  * exactly as it does for the initial rate in respondToDisplayMedia.
  */
-ipcMain.on("screenCapture:setFps", (_event, fps: unknown) => {
-  if (typeof fps !== "number" || !Number.isFinite(fps)) {
-    appAudioLog("screen capture: ignoring invalid setFps value:", fps);
-    return;
-  }
-  const cap = captureFpsCap();
-  setScreenCaptureFps(cap !== null ? Math.min(fps, cap) : fps);
-});
+ipcMain.on(
+  "screenCapture:setFps",
+  (_event, fps: unknown, sessionId?: number) => {
+    if (sessionId !== undefined && !isCurrentScreenCaptureSession(sessionId))
+      return;
+    if (typeof fps !== "number" || !Number.isFinite(fps)) {
+      appAudioLog("screen capture: ignoring invalid setFps value:", fps);
+      return;
+    }
+    const cap = captureFpsCap();
+    setScreenCaptureFps(cap !== null ? Math.min(fps, cap) : fps);
+  },
+);
 
 /**
  * The renderer's own record of whether a voice call is live -- see

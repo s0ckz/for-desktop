@@ -10,6 +10,7 @@
           "defines": ["UNICODE", "_UNICODE", "NOMINMAX", "WIN32_LEAN_AND_MEAN"],
           "libraries": [
             "-ld3d11.lib",
+            "-ld3dcompiler.lib",
             "-ldxgi.lib",
             "-ldxguid.lib",
             "-lwindowsapp.lib",

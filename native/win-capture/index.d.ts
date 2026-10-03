@@ -1,15 +1,102 @@
 declare const winCapture: {
   isSupported(): boolean;
+  /** Accepts a validated preset together; null means an older binary. The GPU
+   * pipeline applies it asynchronously, while frame metadata reports pixels. */
+  configure(width: number, height: number, fps: number): boolean | null;
+  /** Cumulative session counters; callable without waiting for a video frame. */
+  diagnostics(): {
+    arrivalEvents: number;
+    incomingFrames: number;
+    drainedFrames: number;
+    pacingSkips: number;
+    processAttempts: number;
+    processFailures: number;
+    poolReadFailures: number;
+    surfaceFailures: number;
+    longLoopGaps: number;
+    /** Heartbeat polls where no pending copy was ready. Frames remain pending. */
+    stillDrawing: number;
+    /** Legacy aggregate: TSFN frame rejection plus payload-pressure polls. Not a frame-drop count. */
+    refused: number;
+    maxLoopGapMs: number;
+    loopIdleMs: number;
+    submittedFrames: number;
+    /** Frames packed for attempted delivery, before TSFN acceptance. */
+    emittedFrames: number;
+    tsfnQueuedFrames: number;
+    tsfnRejectedFrames: number;
+    payloadPoolPressurePolls: number;
+    pipelineRebuildDiscards: number;
+    deathNotificationFailures: number;
+    sourceBackwards: number;
+    /** Signed local QPC minus raw source time (ms). Negative samples expose
+     * future source timestamps/clock mismatch. Stages have different populations;
+     * these means must not be subtracted to estimate GPU time. */
+    sourceTimestampOffsets: Record<
+      string,
+      {
+        count: number;
+        negativeSamples: number;
+        meanMs: number | null;
+        minMs: number | null;
+        maxMs: number | null;
+      }
+    >;
+    readbackCoalesced: number;
+    ringFull: number;
+    /** Completed copies discarded after 250ms when a newer submission exists. */
+    expiredReadbacks: number;
+    maxFrameAgeMs: number;
+    ready: boolean;
+    /** Accepted bounds; current output dimensions can lag until a new image. */
+    targetWidth: number;
+    targetHeight: number;
+    targetFps: number;
+    sourceWidth: number;
+    sourceHeight: number;
+    nativeBuild: string;
+    acquireTimeouts: number;
+    pointerOnlyFrames: number;
+    accumulatedDesktopFrames: number;
+    accessLosses: number;
+    recoveryAttempts: number;
+    identity: {
+      backend: string;
+      requestedBackend: string;
+      fallbackReason: string;
+      adapter: string;
+      adapterLuid: string;
+      adapterMatchesMonitor: boolean;
+      monitor: string;
+      refreshHz: number;
+      sourceConversion: string;
+    };
+    /** Cumulative snapshots, quantiles are bucket upper bounds. Readback wait
+     * includes GPU queue/execution, OS scheduling and polling observation delay. */
+    timings: Record<
+      string,
+      {
+        count: number;
+        meanMs: number | null;
+        maxMs: number | null;
+        p50UpperMs: number | null;
+        p95UpperMs: number | null;
+        p99UpperMs: number | null;
+      }
+    >;
+    running: boolean;
+    lastError: string;
+  } | null;
   /**
    * Start capturing `hwnd` (a desktopCapturer window handle, decimal or
-   * string). Frames are delivered as NV12 buffers fit inside
+   * string), or the monitor containing monitorOrigin when supplied. Frames are delivered as NV12 buffers fit inside
    * targetWidth x targetHeight -- the source aspect ratio is preserved (not
-   * stretched, and never upscaled) and both dimensions are rounded to even,
+   * stretched, and never upscaled) and both dimensions are rounded down to even,
    * so the delivered frame may be smaller than the requested box on either
    * axis, or both (a source smaller than the box on both axes is captured at
-   * its own size). `fps` bounds how often onFrame fires; frames arriving
-   * faster are dropped, not queued. Returns true if the native capture
-   * session was started.
+   * its own size). `fps` bounds submission rate with at most two frames of
+   * bounded jitter credit. Returns true when the worker was launched;
+   * diagnostics().ready confirms successful asynchronous capture setup.
    *
    * onFrame also fires exactly once more when the capture thread exits, for
    * whatever reason (window gone, an unrecoverable capture error, or an
@@ -35,7 +122,9 @@ declare const winCapture: {
         meta: {
           width: number;
           height: number;
+          /** CPU time submitting the blit/copy; not GPU execution time. */
           bltMs: number;
+          /** CPU time for a successful nonblocking Map and NV12 packing. */
           grabMs: number;
           /** Frames the JS side refused because it wasn't ready in time (see
            *  screenCapture.ts's ThreadSafeFunction queue). Cumulative for this
@@ -46,12 +135,8 @@ declare const winCapture: {
            *  with this climbing was mid-resize; one that dies at zero hit a
            *  genuine capture failure. Cumulative for this capture session. */
           poolResizes: number;
-          /** Times the staging-texture readback (D3D11_MAP_FLAG_DO_NOT_WAIT)
-           *  returned DXGI_ERROR_WAS_STILL_DRAWING and the frame was skipped
-           *  -- an ordinary pacing drop, not a failure, but one worth seeing
-           *  climb: a session stuck at this incrementing on every frame is
-           *  delivering nothing and this is why. Cumulative for this capture
-           *  session. */
+          /** Readback polls where pending copies were not ready yet.
+           *  These copies remain pending; this is not a dropped-frame count. */
           stillDrawing: number;
           /** Times frame->get_SystemRelativeTime() failed, or returned
            *  Duration == 0, and pacing fell back to a QueryPerformanceCounter
@@ -113,6 +198,10 @@ declare const winCapture: {
         },
       ): void;
     },
+    /** Physical-pixel point inside the selected monitor; replaces hwnd. */
+    monitorOrigin?: { x: number; y: number },
+    /** Opt-in monitor prototype; unsupported setup falls back to WGC. */
+    backend?: "wgc" | "duplication",
   ): boolean;
   /**
    * Requests capture to stop and resolves once the capture thread has
