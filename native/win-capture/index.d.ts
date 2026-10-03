@@ -1,5 +1,8 @@
 declare const winCapture: {
   isSupported(): boolean;
+  /** Accepts a validated preset together; null means an older binary. The GPU
+   * pipeline applies it asynchronously, while frame metadata reports pixels. */
+  configure(width: number, height: number, fps: number): boolean | null;
   /** Cumulative session counters; callable without waiting for a video frame. */
   diagnostics(): {
     arrivalEvents: number;
@@ -45,6 +48,10 @@ declare const winCapture: {
     expiredReadbacks: number;
     maxFrameAgeMs: number;
     ready: boolean;
+    /** Accepted bounds; current output dimensions can lag until a new image. */
+    targetWidth: number;
+    targetHeight: number;
+    targetFps: number;
     sourceWidth: number;
     sourceHeight: number;
     nativeBuild: string;

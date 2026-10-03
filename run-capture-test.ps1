@@ -1,5 +1,5 @@
 param(
-  [string]$AppPath = "$PSScriptRoot\out-capture-health\Stoat-win32-x64\stoat-desktop.exe",
+  [string]$AppPath = "$PSScriptRoot\out-capture-hardening\Stoat-win32-x64\stoat-desktop.exe",
   [string]$WebRoot = "$PSScriptRoot\..\for-web\packages\client",
   [switch]$CheckOnly,
   [ValidateSet('wgc', 'duplication')][string]$Backend = 'wgc'

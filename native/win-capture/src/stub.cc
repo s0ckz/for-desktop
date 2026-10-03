@@ -46,6 +46,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   // real addon.cc's versions take.
   exports.Set("setFps", Napi::Function::New(env, FalseNoop));
   exports.Set("setTarget", Napi::Function::New(env, FalseNoop));
+  exports.Set("configure", Napi::Function::New(env, FalseNoop));
   exports.Set("lastError", Napi::Function::New(env, EmptyString));
   return exports;
 }

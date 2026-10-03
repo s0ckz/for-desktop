@@ -38,6 +38,8 @@
 #include "capture_policy.h"
 #include "capture_metrics.h"
 #include "duplication_bridge.h"
+#include "capture_lifetime.h"
+#include "capture_failure.h"
 
 using Microsoft::WRL::ComPtr;
 namespace WG = ABI::Windows::Graphics;
@@ -728,9 +730,13 @@ Napi::Value Diagnostics(const Napi::CallbackInfo& info) {
   const double lastLoop = g_lastLoopAt100ns.load(std::memory_order_relaxed);
   result.Set("loopIdleMs", Napi::Number::New(info.Env(), lastLoop > 0 ? (QpcNow100ns() - lastLoop) / 10000.0 : 0));
   result.Set("ready", Napi::Boolean::New(info.Env(), g_ready.load()));
+  const uint64_t target = g_targetSize.load(std::memory_order_relaxed);
+  result.Set("targetWidth", Napi::Number::New(info.Env(), static_cast<UINT32>(target >> 32)));
+  result.Set("targetHeight", Napi::Number::New(info.Env(), static_cast<UINT32>(target)));
+  result.Set("targetFps", Napi::Number::New(info.Env(), g_fps.load(std::memory_order_relaxed)));
   result.Set("running", Napi::Boolean::New(info.Env(), g_running.load()));
   result.Set("lastError", Napi::String::New(info.Env(), GetErrorText()));
-  result.Set("nativeBuild", "capture-health-v1 " __DATE__ " " __TIME__);
+  result.Set("nativeBuild", "capture-hardening-v1 " __DATE__ " " __TIME__);
   auto timings = Napi::Object::New(info.Env());
   timings.Set("sourceGap", DistributionToJs(info.Env(), g_sourceGap));
   timings.Set("acquisitionAge", DistributionToJs(info.Env(), g_acquireAge));
@@ -1044,26 +1050,11 @@ bool DrainReadback() {
 // capture thread, via Emit()) ever calls NonBlockingCall and matches it with
 // the one Release() in CaptureThread's own teardown -- see the comment on
 // that New() call for what breaks if a second thread ever reaches g_tsfn.
-// SetEvent on a HANDLE is the one operation that's safe to do here from any
-// thread: no COM re-entrancy, and nothing shared with the capture thread
-// except the HANDLE value itself, which the capture thread guarantees stays
-// valid for as long as this handler could still be invoked (see
-// CaptureThread's teardown: remove_FrameArrived happens, and is given the
-// chance to finish any in-flight Invoke, before the event handle is ever
-// closed).
-//
-// Belt and braces on top of that: remove_FrameArrived is the standard WinRT
-// event-source contract for "no Invoke is still in flight once this
-// returns", but nothing here depends on that guarantee being ironclad across
-// every WinRT implementation. If a straggler Invoke ever did land after
-// CaptureThread closed frameEvent, SetEvent on a stale HANDLE value is not
-// just wrong, it is dangerous: Windows recycles HANDLE values, so it could
-// signal a completely unrelated kernel object created after this one closed.
-// ClearEvent() (called from CaptureThread's teardown, strictly before the
-// close) makes that provably harmless instead: frameEvent_ is an atomic, so
-// a straggler reads nullptr and calls SetEvent(nullptr), which fails benignly
-// (returns 0, GetLastError() ERROR_INVALID_HANDLE) rather than touching
-// anything real.
+// SetEvent and retirement share a handler-owned mutex. Asynchronous event
+// revocation may leave callbacks in flight; retirement waits for a signal
+// already inside the guard and prevents later ones from using the handle or
+// incrementing a replacement session's arrival count. WinRT calls and handle
+// closure happen outside that mutex, avoiding callback/revocation deadlocks.
 // ---------------------------------------------------------------------------
 
 // This handler MUST be agile. The frame pool it subscribes to (created above
@@ -1092,29 +1083,23 @@ class FrameArrivedHandler
           Microsoft::WRL::FtmBase> {
  public:
   HRESULT RuntimeClassInitialize(HANDLE frameEvent) {
-    frameEvent_.store(frameEvent, std::memory_order_release);
+    frameEvent_.Set(frameEvent);
     return S_OK;
   }
 
   IFACEMETHODIMP Invoke(WGC::IDirect3D11CaptureFramePool*, IInspectable*) override {
-    g_arrivalEvents.fetch_add(1, std::memory_order_relaxed);
-    // Load once rather than SetEvent(frameEvent_.load()) inline -- not for
-    // correctness (both read it exactly once either way), just so the value
-    // actually being signalled is visible in a debugger/crash dump.
-    HANDLE h = frameEvent_.load(std::memory_order_acquire);
-    if (h) SetEvent(h);  // null after ClearEvent() -- see the class comment above
+    frameEvent_.With([](HANDLE handle) {
+      g_arrivalEvents.fetch_add(1, std::memory_order_relaxed);
+      SetEvent(handle);
+    });
     return S_OK;
   }
 
-  // Called by CaptureThread's teardown, after remove_FrameArrived and before
-  // frameEvent is closed -- see the class comment above for why this exists
-  // as a second line of defence rather than trusting remove_FrameArrived
-  // alone. Atomic: written from the capture thread, read from whatever
-  // thread WinRT happens to run Invoke() on.
-  void ClearEvent() { frameEvent_.store(nullptr, std::memory_order_release); }
+  // Waits for an in-flight signal, then disables every later callback.
+  void ClearEvent() { frameEvent_.Retire(); }
 
  private:
-  std::atomic<HANDLE> frameEvent_{nullptr};  // not owned; CaptureThread owns and closes it
+  capture_lifetime::SignalGuard<HANDLE> frameEvent_;  // CaptureThread owns/closes the handle
 };
 
 // WGC SystemRelativeTime and this fallback are QPC time in 100ns units.
@@ -1566,6 +1551,22 @@ void CaptureThread(HWND hwnd, HMONITOR monitor, bool requestDuplication) {
     capture_policy::Pacer pacer;
     double previousSource = 0;
 
+    capture_failure::SurfaceFailures surfaceFailures;
+    auto surfaceFailed = [&](const char* operation, HRESULT failure) {
+      g_surfaceFailures.fetch_add(1, std::memory_order_relaxed);
+      const HRESULT deviceReason = g_device->GetDeviceRemovedReason();
+      const auto action = surfaceFailures.Failed(failure, deviceReason);
+      std::string context(operation);
+      if (action == capture_failure::Action::DeviceFailure) {
+        context += " (device failure)";
+        SetError(context.c_str(), FAILED(deviceReason) ? deviceReason : failure);
+      } else {
+        context += " (consecutive surface failures=" + std::to_string(surfaceFailures.Consecutive()) + ")";
+        SetError(context.c_str(), failure);
+      }
+      return action != capture_failure::Action::Retry;
+    };
+
     auto previousLoopWake = std::chrono::steady_clock::now();
     while (g_running.load()) {
       const double fps = g_fps.load(std::memory_order_relaxed);
@@ -1651,17 +1652,18 @@ void CaptureThread(HWND hwnd, HMONITOR monitor, bool requestDuplication) {
 
       WG::SizeInt32 contentSize{};
       hr = frame->get_ContentSize(&contentSize);
-      if (FAILED(hr) || contentSize.Width <= 0 || contentSize.Height <= 0) {
-        g_surfaceFailures.fetch_add(1, std::memory_order_relaxed);
-        if (FAILED(hr)) SetError("IDirect3D11CaptureFrame::get_ContentSize", hr);
+      if (FAILED(hr)) {
+        if (surfaceFailed("IDirect3D11CaptureFrame::get_ContentSize", hr)) break;
         continue;
       }
+      // Empty/minimized content is not a failed operation and does not spend
+      // or reset the retry budget. Silence alone must preserve a live share.
+      if (contentSize.Width <= 0 || contentSize.Height <= 0) continue;
 
       ComPtr<WGDD::IDirect3DSurface> surface;
       hr = frame->get_Surface(&surface);
-      if (FAILED(hr)) {
-        g_surfaceFailures.fetch_add(1, std::memory_order_relaxed);
-        SetError("IDirect3D11CaptureFrame::get_Surface", hr);
+      if (FAILED(hr) || !surface) {
+        if (surfaceFailed("IDirect3D11CaptureFrame::get_Surface", FAILED(hr) ? hr : E_POINTER)) break;
         continue;
       }
       // Note: unlike the other WinRT types in this file, this interop
@@ -1670,16 +1672,14 @@ void CaptureThread(HWND hwnd, HMONITOR monitor, bool requestDuplication) {
       // the generated ABI metadata header.
       ComPtr<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess> access;
       hr = surface.As(&access);
-      if (FAILED(hr)) {
-        g_surfaceFailures.fetch_add(1, std::memory_order_relaxed);
-        SetError("QueryInterface(IDirect3DDxgiInterfaceAccess)", hr);
+      if (FAILED(hr) || !access) {
+        if (surfaceFailed("QueryInterface(IDirect3DDxgiInterfaceAccess)", FAILED(hr) ? hr : E_POINTER)) break;
         continue;
       }
       ComPtr<ID3D11Texture2D> srcTex;
       hr = access->GetInterface(IID_PPV_ARGS(&srcTex));
-      if (FAILED(hr)) {
-        g_surfaceFailures.fetch_add(1, std::memory_order_relaxed);
-        SetError("IDirect3DDxgiInterfaceAccess::GetInterface", hr);
+      if (FAILED(hr) || !srcTex) {
+        if (surfaceFailed("IDirect3DDxgiInterfaceAccess::GetInterface", FAILED(hr) ? hr : E_POINTER)) break;
         continue;
       }
 
@@ -1696,6 +1696,7 @@ void CaptureThread(HWND hwnd, HMONITOR monitor, bool requestDuplication) {
         g_processFailures.fetch_add(1, std::memory_order_relaxed);
         break;
       }
+      surfaceFailures.Processed();
 
       // Recreate the pool for the window's current content size if it has
       // drifted from what the pool was last built for. Deliberately after
@@ -1736,27 +1737,13 @@ void CaptureThread(HWND hwnd, HMONITOR monitor, bool requestDuplication) {
     Emit(death);
   }
 
-  // Revoke the FrameArrived subscription before closing the frame pool --
-  // required ordering, not just tidiness: Close() below tells WGC to stop
-  // capturing immediately, and revoking first guarantees no Invoke can land
-  // on a handler this thread is about to outlive. remove_FrameArrived is the
-  // standard WinRT event-source contract for this: it does not return until
-  // any in-flight Invoke on another thread has finished, and guarantees no
-  // future one is dispatched -- which is exactly what makes it safe to close
-  // frameEvent, below, once teardown reaches it. See FrameArrivedHandler's
-  // own comment for the other half of this guarantee.
+  // Retire signaling before revocation/close. Revocation need not drain an
+  // asynchronous callback; the handler-owned guard makes stragglers harmless.
+  if (frameArrivedHandler) frameArrivedHandler->ClearEvent();
   if (frameArrivedRegistered && g_framePool) {
     g_framePool->remove_FrameArrived(frameArrivedToken);
     frameArrivedRegistered = false;
   }
-  // Second line of defence, ordered strictly after remove_FrameArrived and
-  // strictly before CloseHandle(frameEvent) below -- see ClearEvent()'s own
-  // comment on the FrameArrivedHandler class for why this exists even though
-  // remove_FrameArrived already claims to guarantee the same thing. Guarded,
-  // not unconditional: frameArrivedHandler is still null if
-  // MakeAndInitialize itself never succeeded (an early break above), in
-  // which case there was never a subscription for a straggler to invoke.
-  if (frameArrivedHandler) frameArrivedHandler->ClearEvent();
 
   // Teardown, in reverse order of acquisition. Closing the session/pool
   // (rather than only Releasing them) tells WGC to stop capturing
@@ -1789,18 +1776,7 @@ void CaptureThread(HWND hwnd, HMONITOR monitor, bool requestDuplication) {
   g_lastTargetW = g_lastTargetH = 0;
 
 
-  // frameEvent is safe to close now regardless of how CaptureThread got here
-  // (a clean stop, a mid-setup failure, an unrecoverable per-frame error) --
-  // remove_FrameArrived above already guarantees the one other thread that
-  // could ever touch it (FrameArrivedHandler::Invoke) can no longer be
-  // invoked, and ClearEvent() just above means even a straggler that beat
-  // that guarantee reads nullptr instead of this about-to-be-closed value.
-  // frameArrivedHandler itself is still alive here too (it does not go out
-  // of scope until this function returns), so there is no window where the
-  // handler object exists with a dangling frameEvent_ pointing at a closed
-  // handle. If a break happened before frameEvent was even created (an
-  // early device/session setup failure), it is still nullptr here and this
-  // is a no-op.
+  // Signal retirement has completed; no callback can still use this handle.
   if (frameEvent) {
     CloseHandle(frameEvent);
     frameEvent = nullptr;
@@ -2164,6 +2140,23 @@ Napi::Value LastError(const Napi::CallbackInfo& info) {
  * capturing or the value is not usable, so the caller can log rather than
  * assume it took.
  */
+Napi::Value Configure(const Napi::CallbackInfo& info) {
+  Napi::Env env = info.Env();
+  if (!g_running.load() || info.Length() < 3 || !info[0].IsNumber() ||
+      !info[1].IsNumber() || !info[2].IsNumber()) return Napi::Boolean::New(env, false);
+  const double width = info[0].As<Napi::Number>().DoubleValue();
+  const double height = info[1].As<Napi::Number>().DoubleValue();
+  const double fps = info[2].As<Napi::Number>().DoubleValue();
+  // Validate the entire request before changing any accepted value. The
+  // worker rebuilds asynchronously; acceptance does not promise new pixels.
+  if (!capture_policy::ValidDimension(width) || !capture_policy::ValidDimension(height) ||
+      !capture_policy::Pacer::ValidFps(fps)) return Napi::Boolean::New(env, false);
+  g_targetSize.store((static_cast<uint64_t>(width) << 32) | static_cast<UINT32>(height), std::memory_order_relaxed);
+  g_fps.store(fps, std::memory_order_relaxed);
+  if (g_configEvent) SetEvent(g_configEvent);
+  return Napi::Boolean::New(env, true);
+}
+
 Napi::Value SetFps(const Napi::CallbackInfo& info) {
   Napi::Env env = info.Env();
   if (!g_running.load()) return Napi::Boolean::New(env, false);
@@ -2210,6 +2203,7 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
   exports.Set("stop", Napi::Function::New(env, Stop));
   exports.Set("setFps", Napi::Function::New(env, SetFps));
   exports.Set("setTarget", Napi::Function::New(env, SetTarget));
+  exports.Set("configure", Napi::Function::New(env, Configure));
   exports.Set("lastError", Napi::Function::New(env, LastError));
   exports.Set("diagnostics", Napi::Function::New(env, Diagnostics));
 

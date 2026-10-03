@@ -138,6 +138,16 @@ contextBridge.exposeInMainWorld("native", {
   // MediaStreamTrack, in place of Chromium's own (slower) capture.
   screenCapture: {
     getState: () => ipcRenderer.invoke("screenCapture:getState"),
+    reportFailure: (sessionId: number, reason: string) =>
+      ipcRenderer.send("screenCapture:rendererFailure", sessionId, reason),
+    /** Acknowledges accepted limits; frame metadata supplies delivered dimensions. */
+    configure: (request: {
+      sessionId: number;
+      requestId: number;
+      width: number;
+      height: number;
+      fps: number;
+    }) => ipcRenderer.invoke("screenCapture:configure", request),
     stop: (sessionId?: number) =>
       ipcRenderer.send("screenCapture:stop", sessionId),
     // One-shot announcement of the framerate the page just asked

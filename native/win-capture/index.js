@@ -23,6 +23,7 @@ const METHODS = [
   "stop",
   "setFps",
   "setTarget",
+  "configure",
   "lastError",
   "diagnostics",
 ];
@@ -50,6 +51,11 @@ const api = native || unavailable;
 // assume the harness exercises a method just because it goes through this
 // wrapper; check test-capture.js's own call list, or check-exports.js.
 module.exports = {
+  // Null identifies an older binary so main can use its guarded legacy setters.
+  configure: (width, height, fps) =>
+    typeof api.configure === "function"
+      ? api.configure(width, height, fps)
+      : null,
   diagnostics: () => api.diagnostics?.() ?? null,
   /** True when the running OS/GPU can do Windows Graphics Capture with a video processor. */
   isSupported: () => {

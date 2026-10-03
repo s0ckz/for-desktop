@@ -382,6 +382,8 @@ let active: {
    */
   sessionId: number;
   ready: boolean;
+  configurationVersion: number;
+  lastConfigurationRequest: number;
   /**
    * Rolling-summary accumulators for {@link onFrame}'s live branch (plan PR
    * C4 item 2) -- grouped here, not module-level, specifically so a fresh
@@ -687,6 +689,8 @@ export async function startForSource(
     gpuPriorityLogged: false,
     sessionId,
     ready: false,
+    configurationVersion: 1,
+    lastConfigurationRequest: 0,
     summary: {
       windowStartMs: performance.now(),
       frames: 0,
@@ -700,17 +704,24 @@ export async function startForSource(
     },
   };
   delivery.start(sessionId);
-  // Setup is asynchronous in the addon. Do not replace Chromium's track until
-  // device/pool/session initialization succeeds. Older binaries keep working.
+  // Setup alone is insufficient: wait for one usable native payload. Delivery
+  // retains that real static image until the renderer listener grants credit.
+  // Older binaries can prove readiness through their frame callback too.
   const deadline = performance.now() + 3000;
   while (active?.sessionId === sessionId && sessionId === newestRequestId) {
-    const status = mod.diagnostics?.();
-    if (!status || status.ready === undefined || status.ready) break;
-    if (!status.running || performance.now() >= deadline) {
-      const reason = status.lastError || "native capture setup timed out";
+    let status: ReturnType<NativeModule["diagnostics"]> = null;
+    try {
+      status = mod.diagnostics?.() ?? null;
+    } catch {
+      /* callback still proves readiness */
+    }
+    if (status?.running === false || performance.now() >= deadline) {
+      const reason =
+        status?.lastError || "native capture first frame timed out";
       await stop("capture-error", sessionId, reason);
       return false;
     }
+    if (active.jsDeliveredFrames > 0 && status?.ready !== false) break;
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   if (
@@ -837,6 +848,22 @@ function onFrame(
   }
   // Same reasoning as the death branch above, mirrored for the live case.
   const live = meta as LiveFrameMeta;
+  if (
+    !Buffer.isBuffer(frame) ||
+    !Number.isInteger(live.width) ||
+    !Number.isInteger(live.height) ||
+    live.width < 2 ||
+    live.height < 2 ||
+    live.width > MAX_TARGET_DIMENSION ||
+    live.height > MAX_TARGET_DIMENSION ||
+    live.width % 2 !== 0 ||
+    live.height % 2 !== 0 ||
+    !Number.isFinite(live.timestampUs) ||
+    frame.length < live.width * live.height * 1.5
+  ) {
+    active.summary.videoFrameFailures++;
+    return;
+  }
   active.jsDeliveredFrames++;
   const now = performance.now();
   const wasPaused = active.paused;
@@ -1301,6 +1328,7 @@ export function setLiveFps(fps: number): boolean {
     `screen capture: rate changed ${active.fps}fps -> ${wanted}fps for ${active.sourceId}`,
   );
   active.fps = wanted;
+  active.configurationVersion++;
   broadcastState();
   return true;
 }
@@ -1357,6 +1385,7 @@ export function setLiveTarget(width: number, height: number): boolean {
   );
   active.targetWidth = w;
   active.targetHeight = h;
+  active.configurationVersion++;
   broadcastState();
   return true;
 }
@@ -1562,6 +1591,12 @@ function broadcastState() {
 }
 
 function buildState() {
+  let diagnostics: ReturnType<NativeModule["diagnostics"]> = null;
+  try {
+    diagnostics = native?.diagnostics?.() ?? null;
+  } catch {
+    /* optional */
+  }
   return {
     active: active?.ready === true,
     sourceId: active?.sourceId ?? null,
@@ -1570,6 +1605,12 @@ function buildState() {
     width: active?.width ?? CAPTURE_TARGET_WIDTH,
     height: active?.height ?? CAPTURE_TARGET_HEIGHT,
     fps: active?.fps ?? 30,
+    targetWidth: active?.targetWidth ?? CAPTURE_TARGET_WIDTH,
+    targetHeight: active?.targetHeight ?? CAPTURE_TARGET_HEIGHT,
+    configurationVersion: active?.configurationVersion ?? 0,
+    pixelsReady: Boolean(active?.jsDeliveredFrames),
+    sourceWidth: diagnostics?.sourceWidth || active?.width || 0,
+    sourceHeight: diagnostics?.sourceHeight || active?.height || 0,
     supported: isScreenCaptureSupported(),
     // Why native capture is not engaged for the share the page is asking
     // about right now, if it isn't -- see lastFallbackReason's doc comment.
@@ -1628,6 +1669,92 @@ export function initScreenCapture() {
   // decide whether to swap in the generated track -- same pattern as
   // appAudio:getState.
   ipcMain.handle("screenCapture:getState", () => buildState());
+  ipcMain.on(
+    "screenCapture:rendererFailure",
+    (_event, sessionId: unknown, reason: unknown) => {
+      if (
+        !active ||
+        sessionId !== active.sessionId ||
+        typeof reason !== "string"
+      )
+        return;
+      const detail = reason.replace(/[\r\n]/g, " ").slice(0, 160);
+      if (!detail) return;
+      void stop("capture-error", active.sessionId, "renderer: " + detail);
+    },
+  );
+  ipcMain.handle("screenCapture:configure", (_event, request: unknown) => {
+    const reject = (reason: string) => ({
+      accepted: false,
+      reason,
+      state: buildState(),
+    });
+    if (!request || typeof request !== "object")
+      return reject("invalid configuration");
+    const value = request as Record<string, unknown>;
+    if (!active?.ready || value.sessionId !== active.sessionId)
+      return reject("stale capture session");
+    if (
+      typeof value.requestId !== "number" ||
+      !Number.isSafeInteger(value.requestId) ||
+      value.requestId <= active.lastConfigurationRequest
+    )
+      return reject("stale configuration request");
+    const { width, height, fps } = value;
+    if (
+      typeof width !== "number" ||
+      typeof height !== "number" ||
+      typeof fps !== "number" ||
+      !Number.isInteger(width) ||
+      !Number.isInteger(height) ||
+      width < MIN_TARGET_DIMENSION ||
+      height < MIN_TARGET_DIMENSION ||
+      width > MAX_TARGET_DIMENSION ||
+      height > MAX_TARGET_DIMENSION ||
+      !Number.isFinite(fps) ||
+      fps < MIN_REQUESTABLE_FPS ||
+      fps > MAX_REQUESTABLE_FPS
+    )
+      return reject("invalid configuration bounds");
+    const rawCap = Number(app?.commandLine?.getSwitchValue("capture-fps"));
+    const wantedFps =
+      Number.isFinite(rawCap) && rawCap > 0
+        ? Math.min(fps, Math.round(rawCap))
+        : fps;
+    active.lastConfigurationRequest = value.requestId;
+    const mod = loadNative();
+    let accepted: boolean | null = null;
+    try {
+      accepted = mod?.configure?.(width, height, wantedFps) ?? null;
+    } catch {
+      return reject("native configuration failed");
+    }
+    if (accepted === null) {
+      // An older binary accepts separate setters. Report its actual accepted
+      // state even on partial refusal; never claim a rollback we cannot prove.
+      if (!setLiveTarget(width, height) || !setLiveFps(wantedFps))
+        return reject("legacy native configuration refused");
+    } else if (!accepted) return reject("native configuration refused");
+    else {
+      active.targetWidth = width;
+      active.targetHeight = height;
+      active.fps = wantedFps;
+      active.configurationVersion++;
+      broadcastState();
+    }
+    const state = buildState();
+    appAudioLog(
+      "screen capture: configuration accepted " +
+        JSON.stringify({
+          sessionId: state.sessionId,
+          requestId: value.requestId,
+          version: state.configurationVersion,
+          target: [state.targetWidth, state.targetHeight, state.fps],
+          delivered: [state.width, state.height],
+        }),
+    );
+    return { accepted: true, requestId: value.requestId, state };
+  });
   // Sync ipcMain handler -- same "fire and let stop() settle its own
   // bookkeeping synchronously" reasoning as this file's other stop() call
   // sites.

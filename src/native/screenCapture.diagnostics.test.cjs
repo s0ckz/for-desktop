@@ -24,7 +24,25 @@ const counters = {
 };
 const native = {
   isSupported: () => true,
-  start: () => true,
+  start: (...args) => {
+    queueMicrotask(() =>
+      args[4](Buffer.alloc(6), {
+        width: 2,
+        height: 2,
+        timestampUs: 1,
+        refused: 0,
+        poolResizes: 0,
+        stillDrawing: 0,
+        timestampFallbacks: 0,
+        timestampDiscontinuities: 0,
+        bltMs: 0,
+        grabMs: 0,
+        gpuThreadPriority: "test",
+        schedulingPriority: "test",
+      }),
+    );
+    return true;
+  },
   stop: () => Promise.resolve(),
   lastError: () => "",
   diagnostics: () => ({ ...counters }),

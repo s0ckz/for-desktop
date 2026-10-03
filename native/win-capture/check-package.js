@@ -5,7 +5,8 @@ const crypto = require("node:crypto");
 const asar = require("@electron/asar");
 const root = path.resolve(__dirname, "../..");
 const packaged = path.resolve(
-  process.argv[2] || path.join(root, "out-capture-health", "Stoat-win32-x64"),
+  process.argv[2] ||
+    path.join(root, "out-capture-hardening", "Stoat-win32-x64"),
 );
 const resources = path.join(packaged, "resources");
 const archive = path.join(resources, "app.asar");
@@ -25,11 +26,19 @@ for (const marker of [
   "native liveness failure",
   "sourceTimestampOffsets",
   "tsfnQueuedFrames",
+  "first renderer frame timed out",
+  "screenCapture:configure",
+  "configuration accepted",
   "app-audio.log",
 ]) {
   assert(main.includes(marker), "Packaged main missing: " + marker);
 }
-for (const marker of ["frameId", "sessionId", '"ack"']) {
+for (const marker of [
+  "screenCapture:configure",
+  "frameId",
+  "sessionId",
+  '"ack"',
+]) {
   assert(preload.includes(marker), "Packaged preload missing: " + marker);
 }
 const relative = "node_modules/win-capture/build/Release/win_capture.node";
@@ -37,7 +46,8 @@ const nativeBinary = fs.readFileSync(
   path.join(resources, "app.asar.unpacked", relative),
 );
 for (const marker of [
-  "capture-health-v1",
+  "capture-hardening-v1",
+  "consecutive surface failures=",
   "sourceTimestampOffsets",
   "payloadPoolPressurePolls",
   "readbackWait",

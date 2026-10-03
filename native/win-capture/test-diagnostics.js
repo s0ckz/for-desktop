@@ -48,7 +48,7 @@ app
         assert.equal(first.identity.requestedBackend, backend);
         assert(first.timings.readbackWait.count > 0);
         assert(first.timings.frameAge.count > 0);
-        assert(first.nativeBuild.startsWith("capture-health-v1"));
+        assert(first.nativeBuild.startsWith("capture-hardening-v1"));
         assert(first.tsfnQueuedFrames > 0);
         for (const stage of ["acquisition", "submission", "readback"]) {
           const offset = first.sourceTimestampOffsets[stage];
@@ -65,6 +65,18 @@ app
           );
           assert.equal(first.identity.adapterMatchesMonitor, true);
         }
+        const targetBefore = capture.diagnostics();
+        assert.equal(capture.configure(640, 360, NaN), false);
+        const targetAfterRefusal = capture.diagnostics();
+        assert.equal(targetAfterRefusal.targetWidth, targetBefore.targetWidth);
+        assert.equal(
+          targetAfterRefusal.targetHeight,
+          targetBefore.targetHeight,
+        );
+        assert.equal(targetAfterRefusal.targetFps, targetBefore.targetFps);
+        assert(capture.configure(640, 360, 60));
+        assert.equal(capture.diagnostics().targetWidth, 640);
+        assert.equal(capture.diagnostics().targetFps, 60);
         assert(capture.setTarget(640, 360));
         assert(capture.setFps(60));
         await new Promise((r) => setTimeout(r, 1000));
@@ -85,7 +97,10 @@ app
         const stopped = capture.diagnostics();
         assert.equal(stopped.running, false);
         // Joined worker: packing attempts partition into accepted/rejected frames.
-        assert.equal(stopped.emittedFrames, stopped.tsfnQueuedFrames + stopped.tsfnRejectedFrames);
+        assert.equal(
+          stopped.emittedFrames,
+          stopped.tsfnQueuedFrames + stopped.tsfnRejectedFrames,
+        );
       }
     }
     assert.throws(() =>

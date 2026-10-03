@@ -16,6 +16,7 @@ function load(file, dependencies = {}) {
   new Function("require", "module", "exports", code)(
     (name) => {
       if (name in dependencies) return dependencies[name];
+      if (name === "./screenCapturePatch") return load("screenCapturePatch.ts");
       throw Error("unexpected dependency " + name);
     },
     m,
@@ -78,6 +79,22 @@ async function lifecycleTests() {
     start: (...args) => {
       startArgs.push(args);
       callbacks.push(args[4]);
+      setImmediate(() =>
+        args[4](Buffer.alloc(6), {
+          width: 2,
+          height: 2,
+          timestampUs: 1,
+          refused: 0,
+          poolResizes: 0,
+          stillDrawing: 0,
+          timestampFallbacks: 0,
+          timestampDiscontinuities: 0,
+          bltMs: 0,
+          grabMs: 0,
+          gpuThreadPriority: "test",
+          schedulingPriority: "test",
+        }),
+      );
       return true;
     },
     stop: () => Promise.resolve(),
@@ -142,7 +159,7 @@ async function lifecycleTests() {
     callbacks[0](Buffer.alloc(6), oldMeta);
     callbacks[0](null, { ...oldMeta, reason: "old death" });
     assert.equal(handlers["screenCapture:getState"]().sessionId, 2);
-    assert.equal(handlers["screenCapture:getState"]().width, 1920);
+    assert.equal(handlers["screenCapture:getState"]().width, 2);
     assert(!logs.some((x) => x.includes("OLD") || x.includes("old death")));
     handlers["screenCapture:stop"]({}, 1);
     assert.equal(api.isScreenCaptureActive(), true);
@@ -204,6 +221,8 @@ async function patchTests({
     frameHandler,
     reads = 0,
     release;
+  let writes = 0,
+    acceptedFps = 30;
   const constraints = [],
     stats = [];
   class Frame {
@@ -229,11 +248,13 @@ async function patchTests({
         getWriter: () => ({
           desiredSize: 1,
           write: () =>
-            rejects
-              ? Promise.reject(Error("writer failed"))
-              : new Promise((r) => {
-                  release = r;
-                }),
+            writes++ === 0
+              ? Promise.resolve()
+              : rejects
+                ? Promise.reject(Error("writer failed"))
+                : new Promise((r) => {
+                    release = r;
+                  }),
           close: () => Promise.resolve(),
         }),
       };
@@ -254,7 +275,10 @@ async function patchTests({
   };
   const bridge = {
     setNextFps: () => undefined,
-    setFps: (...x) => constraints.push(x),
+    setFps: (...x) => {
+      constraints.push(x);
+      acceptedFps = x[0];
+    },
     setTarget: () => undefined,
     stop: () => undefined,
     reportStats: (...x) => stats.push(x),
@@ -267,12 +291,20 @@ async function patchTests({
         sessionId: 1,
         width: 1280,
         height: 720,
-        fps: 30,
+        fps: acceptedFps,
       };
     },
     onFrame: (fn, sessionId) => {
       assert.equal(sessionId, 1);
       frameHandler = fn;
+      queueMicrotask(() =>
+        fn(new Uint8Array(6), {
+          width: 2,
+          height: 2,
+          timestampUs: 0,
+          sessionId: 1,
+        }),
+      );
       return () => undefined;
     },
     onState: () => () => undefined,
@@ -315,10 +347,10 @@ async function patchTests({
         sessionId: 1,
       });
     if (canvas) {
-      assert.equal(requested, 100);
-      assert.equal(constructed, 100);
+      assert.equal(requested, 101);
+      assert.equal(constructed, 101);
     } else {
-      assert.equal(constructed, 1);
+      assert.equal(constructed, 2);
       release?.();
       await new Promise((r) => setImmediate(r));
       if (rejects) assert.equal(track.readyState, "ended");
