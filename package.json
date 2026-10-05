@@ -5,6 +5,7 @@
   "main": ".vite/build/main.js",
   "repository": "s0ckz/for-desktop",
   "scripts": {
+    "diagnostic:screen-share": "node tools/screen-share-diagnostic/run.cjs",
     "start": "electron-forge start -- --no-sandbox",
     "package": "electron-forge package",
     "make": "electron-forge make",
