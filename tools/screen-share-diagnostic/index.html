@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <meta charset="utf-8" />
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'none'; script-src 'self'; media-src blob:; style-src 'unsafe-inline'"
+  />
+  <title>Local screen share diagnostic</title>
+  <body>
+    <video
+      id="receiver"
+      autoplay
+      muted
+      playsinline
+      style="width: 640px; height: 360px"
+    ></video>
+    <script src="metrics.js"></script>
+    <script src="renderer.js"></script>
+  </body>
+</html>
