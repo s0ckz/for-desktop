@@ -20,6 +20,7 @@ const {
 } = require("./metrics.js");
 const {
   nativeOptions,
+  deliverySummary,
   distribution,
   decodeMarker,
   markerTracker,
@@ -138,6 +139,24 @@ test("HEVC renderer fails explicitly without a Main capability and closes both p
 test("native diagnostic only accepts bounded own-source WGC measurements", () => {
   assert.equal(nativeOptions(["--fps=30"]).sourceFps, 60);
   assert.equal(nativeOptions([]).backend, "wgc");
+  assert.equal(nativeOptions([]).stage, "production");
+  assert.equal(nativeOptions(["--stage=acquire"]).stage, "acquire");
+  assert.throws(() => nativeOptions(["--stage=full", "--stage=acquire"]));
+  assert.equal(
+    nativeOptions(["--stage=acquire", "--min-interval=zero"]).minInterval,
+    "zero",
+  );
+  assert.throws(() => nativeOptions(["--min-interval=zero"]));
+  assert.throws(() =>
+    nativeOptions(["--stage=reference", "--min-interval=zero"]),
+  );
+  assert.throws(() =>
+    nativeOptions([
+      "--stage=full",
+      "--min-interval=default",
+      "--min-interval=zero",
+    ]),
+  );
   for (const arg of [
     "--hwnd=42",
     "--mode=monitor",
@@ -145,6 +164,8 @@ test("native diagnostic only accepts bounded own-source WGC measurements", () =>
     "--codec=h265",
     "--fps=120",
     "--seconds=61",
+    "--stage=unknown",
+    "--min-interval=-1",
   ])
     assert.throws(() => nativeOptions([arg]));
   assert.equal(
@@ -165,6 +186,21 @@ test("native diagnostic only accepts bounded own-source WGC measurements", () =>
   );
   assert.equal(distribution([]).p95Ms, null);
   assert.equal(distribution([1, 2, NaN, -1, 10]).p95Ms, 10);
+});
+
+test("metadata-only acquisition never claims delivered or distinct pixel FPS", () => {
+  const values = {
+    deliveredFps: 0,
+    distinctMarkerFps: 0,
+    markers: { validFrames: 0 },
+  };
+  assert.deepEqual(deliverySummary("acquire", values), {
+    deliveredFps: null,
+    distinctMarkerFps: null,
+    markers: null,
+  });
+  assert.deepEqual(deliverySummary("full", values), values);
+  assert.deepEqual(deliverySummary("production", values), values);
 });
 
 test("native markers distinguish repeated pixels, missed source draws and modulo wrap", () => {

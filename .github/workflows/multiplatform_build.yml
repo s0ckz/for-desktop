@@ -50,3 +50,10 @@ jobs:
 
       - name: Build
         run: pnpm package
+
+      - name: Compile private WGC probe and verify default export isolation
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./tools/screen-share-diagnostic/build-wgc-probe.ps1
+          node tools/screen-share-diagnostic/check-wgc-probe.cjs

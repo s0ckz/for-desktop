@@ -6,11 +6,32 @@ function nativeOptions(args) {
     if (
       arg !== "--help" &&
       arg !== "--trace" &&
-      !/^--(fps|seconds|warmup|output)=/.test(arg)
+      !/^--(stage|min-interval|fps|seconds|warmup|output)=/.test(arg)
     )
       throw new Error("Unknown native diagnostic option: " + arg);
-  const parsed = options(args);
+  const stage = args.filter((arg) => arg.startsWith("--stage="));
+  if (stage.length > 1) throw new Error("Only one diagnostic stage is allowed");
+  const selected = stage[0]?.slice("--stage=".length) ?? "production";
+  if (!["production", "reference", "full", "acquire"].includes(selected))
+    throw new Error("stage must be production, reference, full or acquire");
+  const intervals = args.filter((arg) => arg.startsWith("--min-interval="));
+  if (intervals.length > 1)
+    throw new Error("Only one minimum interval is allowed");
+  const minInterval =
+    intervals[0]?.slice("--min-interval=".length) ?? "default";
+  if (
+    !["default", "zero"].includes(minInterval) ||
+    (minInterval === "zero" && !["full", "acquire"].includes(selected))
+  )
+    throw new Error(
+      "minimum interval must be default, or zero in private full/acquire stages",
+    );
+  const parsed = options(
+    args.filter((arg) => !/^--(stage|min-interval)=/.test(arg)),
+  );
   return {
+    stage: selected,
+    minInterval,
     fps: parsed.fps,
     sourceFps: 60,
     width: parsed.width,
@@ -22,6 +43,12 @@ function nativeOptions(args) {
     backend: "wgc",
     trace: parsed.trace,
   };
+}
+
+function deliverySummary(stage, values) {
+  if (stage === "acquire")
+    return Object.fromEntries(Object.keys(values).map((key) => [key, null]));
+  return values;
 }
 
 function distribution(values) {
@@ -128,6 +155,7 @@ function compositorTraceSummary(trace) {
 
 module.exports = {
   nativeOptions,
+  deliverySummary,
   distribution,
   decodeMarker,
   markerTracker,

@@ -7,6 +7,7 @@ const { performance } = require("node:perf_hooks");
 const { app, BrowserWindow, screen, contentTracing } = require("electron");
 const {
   nativeOptions,
+  deliverySummary,
   distribution,
   decodeMarker,
   markerTracker,
@@ -52,7 +53,7 @@ const report = {
       )
       .digest("hex"),
   },
-  note: "Own visible moving window only, native WGC-to-NV12 delivery to Electron main; excludes app IPC/track ingestion/encoder/SFU/internet. Does not launch/control a game; ambient device load must be measured separately. Canvas draws are not physical presentation counts.",
+  note: "Own visible moving window only; excludes app IPC/track ingestion/encoder/SFU/internet. Acquire stage skips conversion/readback/pixels; incoming FPS counts acquired frames, not distinct/presented content. Does not launch/control a game; ambient device load must be measured separately. Canvas draws are not physical presentation counts.",
 };
 let capture,
   window,
@@ -145,13 +146,40 @@ app
     );
     if (process.platform !== "win32")
       throw new Error("Native WGC diagnostic requires Windows");
-    capture = require("win-capture");
-    if (!capture.isSupported())
-      throw new Error("Native capture unavailable: " + capture.lastError());
-    const binary = path.join(
+    const productionBinary = path.join(
       path.dirname(require.resolve("win-capture")),
       "build/Release/win_capture.node",
     );
+    const binary =
+      config.stage === "production"
+        ? productionBinary
+        : path.join(
+            __dirname,
+            "wgc-probe/build/Release",
+            config.stage === "reference"
+              ? "wgc_production_reference.node"
+              : "wgc_acquisition_probe.node",
+          );
+    capture = require(binary);
+    if (["acquire", "full"].includes(config.stage)) {
+      if (
+        typeof capture.setDiagnosticStage !== "function" ||
+        !capture.setDiagnosticStage(config.stage)
+      )
+        throw new Error("Private probe rejected diagnostic stage");
+      if (
+        typeof capture.setDiagnosticMinInterval !== "function" ||
+        !capture.setDiagnosticMinInterval(config.minInterval)
+      )
+        throw new Error("Private probe rejected minimum interval");
+    } else if (typeof capture.setDiagnosticStage === "function") {
+      throw new Error(
+        "Default addon unexpectedly exposes diagnostic stage control",
+      );
+    }
+    if (!capture.isSupported())
+      throw new Error("Native capture unavailable: " + capture.lastError());
+    report.runtime.nativeTarget = config.stage;
     report.runtime.nativeBinarySha256 = createHash("sha256")
       .update(fs.readFileSync(binary))
       .digest("hex");
@@ -264,6 +292,31 @@ app
     if (finishing) return;
     if (death || !capture.diagnostics()?.ready)
       throw new Error(death || "Native capture did not become ready");
+    if (["acquire", "full"].includes(config.stage)) {
+      if (capture.diagnostics()?.diagnosticStage !== config.stage)
+        throw new Error("Private probe stage does not match request");
+      if (
+        config.minInterval === "zero" &&
+        capture.diagnostics()?.wgcMinUpdateIntervalMs !== 0
+      )
+        throw new Error(
+          "Private probe did not observe the requested zero interval",
+        );
+      if (
+        capture.setDiagnosticStage(
+          config.stage === "acquire" ? "full" : "acquire",
+        )
+      )
+        throw new Error("Private probe allowed stage change during capture");
+      report.runtime.activeStageChangeRejected = true;
+      if (
+        capture.setDiagnosticMinInterval(
+          config.minInterval === "zero" ? "default" : "zero",
+        )
+      )
+        throw new Error("Private probe allowed interval change during capture");
+      report.runtime.activeIntervalChangeRejected = true;
+    }
     const sourceStart = await window.webContents.executeJavaScript(
       "performance.mark('stoat-native-measurement-start'); window.readMovingSource()",
     );
@@ -309,28 +362,39 @@ app
         counters.incomingFrames === null
           ? null
           : counters.incomingFrames / elapsedSeconds,
-      submittedFps:
-        counters.submittedFrames === null
+      ...deliverySummary(config.stage, {
+        submittedFps:
+          counters.submittedFrames === null
+            ? null
+            : counters.submittedFrames / elapsedSeconds,
+        deliveredFps: frames / elapsedSeconds,
+        distinctMarkerFps: markers.result.discontinuities
           ? null
-          : counters.submittedFrames / elapsedSeconds,
-      deliveredFps: frames / elapsedSeconds,
-      distinctMarkerFps: markers.result.discontinuities
-        ? null
-        : markers.result.distinctFrames / elapsedSeconds,
-      resolutions: [...resolutions],
-      invalidPayloads,
-      markers: markers.result,
+          : markers.result.distinctFrames / elapsedSeconds,
+        resolutions: [...resolutions],
+        invalidPayloads,
+        markers: markers.result,
+        callbackGap: distribution(callbackGaps),
+        sourceTimestampGap: distribution(timestampGaps),
+        submissionCpu: distribution(submissionCpu),
+        nonblockingMapPackCpu: distribution(mapPackCpu),
+      }),
       counters,
-      callbackGap: distribution(callbackGaps),
-      sourceTimestampGap: distribution(timestampGaps),
-      submissionCpu: distribution(submissionCpu),
-      nonblockingMapPackCpu: distribution(mapPackCpu),
       note: "Rates use independent native/main/source sample clocks. Marker skips can be expected at a 30 FPS capture cap. Native timings below are cumulative including warm-up; readback residence is overlapped, not a serial GPU execution time.",
     };
     report.source = { start: sourceStart, end: sourceEnd };
     report.nativeDiagnostics = { start: nativeStart, end: nativeEnd };
     if (death) throw new Error(death);
-    if (!frames || invalidPayloads || !markers.result.validFrames)
+    if (config.stage === "acquire") {
+      if (
+        !(counters.incomingFrames > 0) ||
+        frames ||
+        ["processAttempts", "submittedFrames", "emittedFrames"].some(
+          (key) => counters[key] !== 0,
+        )
+      )
+        throw new Error("Acquisition-only stage did not stay pixel-free");
+    } else if (!frames || invalidPayloads || !markers.result.validFrames)
       throw new Error("No valid moving native NV12 source was measured");
     await finish();
   })

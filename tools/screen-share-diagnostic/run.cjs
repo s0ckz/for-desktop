@@ -18,7 +18,7 @@ try {
 if (config.help) {
   console.log(
     nativeCapture
-      ? "pnpm diagnostic:native-capture --fps=30|60 --seconds=12 --warmup=3 --output=<report.json> [--trace]"
+      ? "pnpm diagnostic:native-capture --stage=production|reference|full|acquire --fps=30|60 --seconds=12 --warmup=3 --output=<report.json> [--trace] [--min-interval=default|zero (private stages only)]"
       : "pnpm diagnostic:screen-share --codec=h264|h265 --bitrate=6000000|8000000 --fps=30|60 --mode=generator|canvas --seconds=12 --warmup=3 --output=<report.json> [--trace] [--software]",
   );
   process.exit(0);
