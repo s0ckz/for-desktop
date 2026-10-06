@@ -65,10 +65,126 @@ and corroborating device activity. Nonexistent log/identity fields stay unknown.
 The JSON omits SDP, candidate addresses and media pixels. Raw traces/logs are
 local investigation artifacts; keep them out of committed or public reports.
 
-This synthetic loopback excludes native Windows capture, LiveKit, internet and
-a GPU-saturated game. Hidden-renderer presentation does not measure a viewer's
+This synthetic loopback excludes native Windows capture, LiveKit and internet.
+It does not launch or control games; existing device load still affects it.
+Hidden-renderer presentation does not measure a viewer's
 physical screen. A 60 FPS result at 480x270 is not stable 720p60. Native arrival
 timing and live viewer/game performance still require separate measurements.
+
+## H.265 and bitrate comparisons
+
+H.265 Main and the reviewed 6/8 Mbps comparison are available in the local
+loopback. These use actual RTP capabilities and normal acceleration policy;
+the helper does not force extra HEVC feature switches or silently fall back to
+H.264. A missing Main capability or nonmatching negotiated codec/profile fails
+explicitly. Main profile/space/tier defaults follow
+[RFC 7798](https://www.rfc-editor.org/rfc/rfc7798.html#section-7.1). Offered and
+negotiated levels are reported separately, without bitstream conformance
+validation. Constraint/compatibility parameters must match.
+
+```powershell
+pnpm diagnostic:screen-share --codec=h265 --bitrate=6000000 --fps=60 --seconds=20 --trace --output=C:/Temp/hevc-6mbps.json
+pnpm diagnostic:screen-share --codec=h265 --bitrate=8000000 --fps=60 --seconds=20 --trace --output=C:/Temp/hevc-8mbps.json
+```
+
+Only 6,000,000 or 8,000,000 bits/s can be selected. H.264/Constrained Baseline
+at 6 Mbps remains the diagnostic default. Codec/bitrate choices do not alter any
+production preset or receiver policy.
+
+Startup stats are sampled every 250 ms during warm-up and then every second.
+First sampled full-resolution time is relative to the first stats read after
+sender configuration. Zero means it was already full resolution at that read;
+it is not exact connection/first-pixel latency. `fullResolutionSampleFraction`
+counts interval-end observations, not exact time spent at quality. Limitation
+totals use valid monotonic counter deltas; missing evidence stays unknown.
+
+## Native moving-window measurement (Windows)
+
+```powershell
+pnpm diagnostic:native-capture --fps=60 --seconds=12 --warmup=3 --output=C:/Temp/native60.json
+pnpm diagnostic:native-capture --fps=30 --seconds=12 --warmup=3 --output=C:/Temp/native30.json
+pnpm diagnostic:native-capture --fps=60 --seconds=12 --warmup=3 --trace --output=C:/Temp/native60-trace.json
+```
+
+This command briefly shows its own borderless animated 1280x720 window, without
+taking focus, and closes it automatically. The source requests 60 draws/s even
+when capture is capped at 30. It captures only that window's handle through the
+installed `win-capture` WGC addon. There is no arbitrary window/monitor selector,
+account, Stoat startup, permission prompt, encoder, network or game control.
+The renderer denies remote requests/navigation and uses a separate temporary
+profile. The parent removes that profile after Electron exits.
+
+Actual canvas draws, native arrivals/submissions and JS deliveries are measured
+separately. A 16-bit luma marker verifies distinct source images and distinguishes
+repeated pixels from callbacks; sentinel checks reject an incorrect crop or
+unsupported luma reading. Marker skips can be expected at the 30 FPS cap. Raw
+media is never saved. Native snapshots include backend/adapter/build identity,
+queue/failure counters and cumulative timing distributions including warm-up.
+Readback residence includes scheduling/polling and overlaps across slots; it is
+not a serial GPU execution time or a basis for a fixed FPS ceiling.
+
+Canvas draws are not physical presentation counts. Optional compositor tracing
+records source-renderer identity and measurement marks; its sanitized event
+counts alone must not be called presented FPS. Keep adjacent raw traces outside
+Git and consider tracing overhead when comparing runs.
+
+The test excludes application IPC/track ingestion and downstream encode. It
+does not change games, GPU routing, OS preferences or normal app settings.
+Existing game/device load can affect either diagnostic; record it separately
+and do not describe such a run as an idle-device benchmark. Success means valid
+moving pixels and cleanup, not that requested 720p60 was sustained.
+
+Source APIs: [Electron BrowserWindow](https://www.electronjs.org/docs/latest/api/browser-window)
+(`showInactive`, `getNativeWindowHandle`, `backgroundThrottling`, `thickFrame`)
+and [Chromium compositor terminology](https://github.com/chromium/chromium/blob/main/cc/README.md).
+
+## Acquisition versus conversion/readback (private Windows probe)
+
+Build a separate addon from the same capture source, without replacing the
+installed `win_capture.node`:
+
+```powershell
+./tools/screen-share-diagnostic/build-wgc-probe.ps1
+node tools/screen-share-diagnostic/check-wgc-probe.cjs
+pnpm diagnostic:native-capture --stage=reference --fps=60 --seconds=20 --output=C:/Temp/reference.json
+pnpm diagnostic:native-capture --stage=full --fps=60 --seconds=20 --output=C:/Temp/full.json
+pnpm diagnostic:native-capture --stage=acquire --fps=60 --seconds=20 --output=C:/Temp/acquire.json
+```
+
+`production` remains the default stage and loads the installed addon. `reference`
+compiles the current source with normal production definitions. `full` and
+`acquire` use the same private binary; only `acquire` omits pipeline initialization,
+conversion/readback/NV12 packing and per-frame callbacks. The frame pool, event
+wait/heartbeat, timestamp pacer, extent checks and resource teardown remain the
+same. Its incoming rate measures acquired frames; delivered/distinct FPS, pixel
+markers and delivery timings remain unknown (`null`). Zero processing/submission/
+delivery counters establish that acquisition stayed isolated. Source drawing
+still runs through Chromium, so these runs do not independently prove physical
+presentation cadence or a game/device ceiling.
+
+The private binary reads back Windows' `MinUpdateInterval` where supported. An
+explicit `--min-interval=zero` in `full`/`acquire` requests zero before session
+startup and verifies its actual value, while retaining the native FPS pacer:
+
+```powershell
+pnpm diagnostic:native-capture --stage=full --min-interval=zero --fps=60 --seconds=20 --output=C:/Temp/full-zero.json
+pnpm diagnostic:native-capture --stage=acquire --min-interval=zero --fps=60 --seconds=20 --output=C:/Temp/acquire-zero.json
+```
+
+This experiment requires the SDK/runtime `IGraphicsCaptureSession5` interface.
+An unsupported setter fails explicitly; a getter unavailable in a default run
+reports `null`. The documented API exposes the property but does not guarantee a
+particular default/cadence; report observed values rather than inferring an FPS
+limit from milliseconds. See [Microsoft's property reference](https://learn.microsoft.com/en-us/uwp/api/windows.graphics.capture.graphicscapturesession.minupdateinterval?view=winrt-26100).
+
+Stage/interval changes are rejected while capture is running or stopping. Those
+controls exist only when the private probe definition is compiled; the default
+addon exports, app IPC, presets and normal session defaults are unchanged. No
+environment variable or renderer preference enables the probe. Its generated
+build directory is ignored, and Forge's Vite packaging excludes the tools tree.
+Windows CI compiles both targets and verifies default export isolation. Compare
+adjacent runs in both orders under measured ambient load; keep reports outside
+Git and rerun without tracing before attributing a timing difference.
 
 ## Regression checks
 

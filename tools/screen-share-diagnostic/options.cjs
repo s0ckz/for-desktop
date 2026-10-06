@@ -3,6 +3,7 @@ const path = require("node:path");
 function options(args) {
   const result = {
     mode: "generator",
+    codec: "h264",
     profile: "cbp",
     fps: 60,
     seconds: 12,
@@ -18,17 +19,31 @@ function options(args) {
       result[arg.slice(2)] = true;
       continue;
     }
-    const match = /^--(mode|profile|fps|seconds|warmup|output)=(.+)$/.exec(arg);
+    const match =
+      /^--(mode|codec|profile|bitrate|fps|seconds|warmup|output)=(.+)$/.exec(
+        arg,
+      );
     if (!match) throw new Error("Unknown diagnostic option: " + arg);
     const [, key, value] = match;
-    result[key] = ["fps", "seconds", "warmup"].includes(key)
+    result[key] = ["fps", "seconds", "warmup", "bitrate"].includes(key)
       ? Number(value)
       : value;
   }
   if (!["generator", "canvas"].includes(result.mode))
     throw new Error("mode must be generator or canvas");
+  if (!["h264", "h265"].includes(result.codec))
+    throw new Error("codec must be h264 or h265");
+  if (
+    result.codec === "h265" &&
+    !args.some((arg) => arg.startsWith("--profile="))
+  )
+    result.profile = "main";
+  if (result.codec === "h265" && result.profile !== "main")
+    throw new Error("H.265 diagnostic supports only the Main profile");
   if (!["cbp", "baseline", "main", "high"].includes(result.profile))
     throw new Error("profile must be cbp, baseline, main or high");
+  if (![6_000_000, 8_000_000].includes(result.bitrate))
+    throw new Error("bitrate must be 6000000 or 8000000");
   if (![30, 60].includes(result.fps)) throw new Error("fps must be 30 or 60");
   if (
     !Number.isInteger(result.seconds) ||

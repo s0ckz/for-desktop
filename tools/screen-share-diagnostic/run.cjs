@@ -4,17 +4,22 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { options } = require("./options.cjs");
+const { nativeOptions } = require("./native-metrics.cjs");
+const nativeCapture = process.argv[2] === "--native";
+const args = process.argv.slice(nativeCapture ? 3 : 2);
 
 let config;
 try {
-  config = options(process.argv.slice(2));
+  config = (nativeCapture ? nativeOptions : options)(args);
 } catch (error) {
   console.error(error.message);
   process.exit(1);
 }
 if (config.help) {
   console.log(
-    "pnpm diagnostic:screen-share --fps=30|60 --mode=generator|canvas --seconds=12 --warmup=3 --output=<report.json> [--trace] [--software]",
+    nativeCapture
+      ? "pnpm diagnostic:native-capture --stage=production|reference|full|acquire --fps=30|60 --seconds=12 --warmup=3 --output=<report.json> [--trace] [--min-interval=default|zero (private stages only)]"
+      : "pnpm diagnostic:screen-share --codec=h264|h265 --bitrate=6000000|8000000 --fps=30|60 --mode=generator|canvas --seconds=12 --warmup=3 --output=<report.json> [--trace] [--software]",
   );
   process.exit(0);
 }
@@ -25,14 +30,17 @@ const profile = fs.mkdtempSync(
 );
 const output =
   config.output ??
-  path.join(os.tmpdir(), `stoat-encode-report-${process.pid}.json`);
+  path.join(
+    os.tmpdir(),
+    `stoat-${nativeCapture ? "native" : "encode"}-report-${process.pid}.json`,
+  );
 const environment = { ...process.env, STOAT_SHARE_DIAGNOSTIC_PROFILE: profile };
 delete environment.ELECTRON_RUN_AS_NODE;
 const child = spawn(
   electronBinary,
   [
-    path.join(__dirname, "main.cjs"),
-    ...process.argv.slice(2),
+    path.join(__dirname, nativeCapture ? "native-main.cjs" : "main.cjs"),
+    ...args,
     `--output=${output}`,
   ],
   {

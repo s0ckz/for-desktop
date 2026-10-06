@@ -85,6 +85,13 @@ std::atomic<bool> g_running{false};
 // the one thing Start() can check to refuse "previous capture still
 // shutting down" for the whole window the async join is in flight.
 std::atomic<bool> g_stopping{false};
+#if defined(STOAT_CAPTURE_ACQUISITION_PROBE)
+// Compiled only by the isolated tools/wgc-probe target. Production cannot
+// select this mode: no build define, export, environment switch or IPC control.
+std::atomic<bool> g_probeAcquisitionOnly{false};
+std::atomic<int64_t> g_probeMinInterval100ns{-1};
+std::atomic<bool> g_probeZeroInterval{false};
+#endif
 HANDLE g_stopEvent = nullptr;
 HANDLE g_configEvent = nullptr;
 std::atomic<bool> g_ready{false};
@@ -737,6 +744,13 @@ Napi::Value Diagnostics(const Napi::CallbackInfo& info) {
   result.Set("running", Napi::Boolean::New(info.Env(), g_running.load()));
   result.Set("lastError", Napi::String::New(info.Env(), GetErrorText()));
   result.Set("nativeBuild", "capture-hardening-v1 " __DATE__ " " __TIME__);
+#if defined(STOAT_CAPTURE_ACQUISITION_PROBE)
+  result.Set("diagnosticStage", g_probeAcquisitionOnly.load() ? "acquire" : "full");
+  const auto minInterval = g_probeMinInterval100ns.load();
+  result.Set("wgcMinUpdateIntervalMs", minInterval < 0
+      ? static_cast<Napi::Value>(info.Env().Null())
+      : static_cast<Napi::Value>(Napi::Number::New(info.Env(), minInterval / 10000.0)));
+#endif
   auto timings = Napi::Object::New(info.Env());
   timings.Set("sourceGap", DistributionToJs(info.Env(), g_sourceGap));
   timings.Set("acquisitionAge", DistributionToJs(info.Env(), g_acquireAge));
@@ -1509,6 +1523,9 @@ void CaptureThread(HWND hwnd, HMONITOR monitor, bool requestDuplication) {
     }
 
     if (!EnsurePool(static_cast<UINT32>(itemSize.Width), static_cast<UINT32>(itemSize.Height))) break;
+#if defined(STOAT_CAPTURE_ACQUISITION_PROBE)
+    if (!g_probeAcquisitionOnly.load())
+#endif
     if (!EnsurePipeline(static_cast<UINT32>(itemSize.Width), static_cast<UINT32>(itemSize.Height))) break;
 
     // Subscribe before StartCapture() below so no frame can arrive
@@ -1541,11 +1558,43 @@ void CaptureThread(HWND hwnd, HMONITOR monitor, bool requestDuplication) {
       SetError("CreateCaptureSession", hr);
       break;
     }
+#if defined(STOAT_CAPTURE_ACQUISITION_PROBE)
+    if (g_probeZeroInterval.load()) {
+#if defined(____x_ABI_CWindows_CGraphics_CCapture_CIGraphicsCaptureSession5_INTERFACE_DEFINED__)
+      ComPtr<WGC::IGraphicsCaptureSession5> session5;
+      hr = g_session.As(&session5);
+      if (SUCCEEDED(hr)) {
+        const ABI::Windows::Foundation::TimeSpan interval{0};
+        hr = session5->put_MinUpdateInterval(interval);
+      }
+#else
+      hr = E_NOINTERFACE;
+#endif
+      if (FAILED(hr)) {
+        SetError("diagnostic MinUpdateInterval=0", hr);
+        break;
+      }
+    }
+#endif
     hr = g_session->StartCapture();
     if (FAILED(hr)) {
       SetError("StartCapture", hr);
       break;
     }
+
+#if defined(STOAT_CAPTURE_ACQUISITION_PROBE)
+    // Read back the actual session value. Only the private zero-interval
+    // experiment above can change it; the default comparison preserves it.
+    g_probeMinInterval100ns.store(-1);
+#if defined(____x_ABI_CWindows_CGraphics_CCapture_CIGraphicsCaptureSession5_INTERFACE_DEFINED__)
+    ComPtr<WGC::IGraphicsCaptureSession5> session5;
+    ABI::Windows::Foundation::TimeSpan interval{};
+    if (SUCCEEDED(g_session.As(&session5)) &&
+        SUCCEEDED(session5->get_MinUpdateInterval(&interval))) {
+      g_probeMinInterval100ns.store(interval.Duration);
+    }
+#endif
+#endif
 
     g_ready.store(true);
     capture_policy::Pacer pacer;
@@ -1614,6 +1663,9 @@ void CaptureThread(HWND hwnd, HMONITOR monitor, bool requestDuplication) {
         break;
       }
 
+#if defined(STOAT_CAPTURE_ACQUISITION_PROBE)
+      if (!g_probeAcquisitionOnly.load())
+#endif
       if (!DrainReadback()) { g_processFailures.fetch_add(1); break; }
 
       // Drain the pool, keeping only the newest frame -- under load WGC can
@@ -1688,13 +1740,26 @@ void CaptureThread(HWND hwnd, HMONITOR monitor, bool requestDuplication) {
       // recreate the pool for subsequent frames.
       D3D11_TEXTURE2D_DESC srcDesc{};
       srcTex->GetDesc(&srcDesc);
+#if defined(STOAT_CAPTURE_ACQUISITION_PROBE)
+      if (!g_probeAcquisitionOnly.load())
+#endif
       g_processAttempts.fetch_add(1, std::memory_order_relaxed);
       const UINT32 validW = (std::min)(srcDesc.Width, static_cast<UINT32>(contentSize.Width));
       const UINT32 validH = (std::min)(srcDesc.Height, static_cast<UINT32>(contentSize.Height));
       if (validW < 2 || validH < 2) continue;
-      if (!ProcessFrame(srcTex.Get(), validW, validH, ts / 10.0)) {
-        g_processFailures.fetch_add(1, std::memory_order_relaxed);
-        break;
+#if defined(STOAT_CAPTURE_ACQUISITION_PROBE)
+      if (g_probeAcquisitionOnly.load()) {
+        // Same pool/event/heartbeat/pacer/surface checks, without VP submission,
+        // GPU copy/readback, NV12 packing or per-frame JS delivery. Metadata-only
+        // acquisition counts must never be reported as distinct/presented FPS.
+        g_sourceExtent.store((static_cast<uint64_t>(validW) << 32) | validH);
+      } else
+#endif
+      {
+        if (!ProcessFrame(srcTex.Get(), validW, validH, ts / 10.0)) {
+          g_processFailures.fetch_add(1, std::memory_order_relaxed);
+          break;
+        }
       }
       surfaceFailures.Processed();
 
@@ -2255,4 +2320,28 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
 
 }  // namespace
 
+#if defined(STOAT_CAPTURE_ACQUISITION_PROBE)
+Napi::Object InitAcquisitionProbe(Napi::Env env, Napi::Object exports) {
+  Init(env, exports);
+  exports.Set("setDiagnosticStage", Napi::Function::New(env, [](const Napi::CallbackInfo& info) {
+    if (g_running.load() || g_stopping.load() || info.Length() != 1 || !info[0].IsString())
+      return Napi::Boolean::New(info.Env(), false);
+    const auto stage = info[0].As<Napi::String>().Utf8Value();
+    if (stage != "full" && stage != "acquire") return Napi::Boolean::New(info.Env(), false);
+    g_probeAcquisitionOnly.store(stage == "acquire");
+    return Napi::Boolean::New(info.Env(), true);
+  }));
+  exports.Set("setDiagnosticMinInterval", Napi::Function::New(env, [](const Napi::CallbackInfo& info) {
+    if (info.Length() != 1 || !info[0].IsString() || g_running.load() || g_stopping.load())
+      return Napi::Boolean::New(info.Env(), false);
+    const std::string interval = info[0].As<Napi::String>().Utf8Value();
+    if (interval != "default" && interval != "zero") return Napi::Boolean::New(info.Env(), false);
+    g_probeZeroInterval.store(interval == "zero");
+    return Napi::Boolean::New(info.Env(), true);
+  }));
+  return exports;
+}
+NODE_API_MODULE(wgc_acquisition_probe, InitAcquisitionProbe)
+#else
 NODE_API_MODULE(win_capture, Init)
+#endif

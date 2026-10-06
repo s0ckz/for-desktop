@@ -31,6 +31,7 @@ coverage
 
 # Compiled binary addons (https://nodejs.org/api/addons.html)
 build/Release
+tools/screen-share-diagnostic/wgc-probe/build/
 
 # Dependency directories
 node_modules/

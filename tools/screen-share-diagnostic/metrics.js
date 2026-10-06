@@ -12,12 +12,23 @@
       "profile-level-id",
       "packetization-mode",
       "level-asymmetry-allowed",
+      "profile-id",
+      "profile-space",
+      "tier-flag",
+      "level-id",
+      "interop-constraints",
+      "profile-compatibility-indicator",
     ]);
     return Object.fromEntries(
       fmtp.split(";").flatMap((part) => {
         const [key, value] = part.trim().split("=");
-        return allowed.has(key) && /^[a-zA-Z0-9-]{1,16}$/.test(value ?? "")
-          ? [[key, value]]
+        return allowed.has(key)
+          ? [
+              [
+                key,
+                /^[a-zA-Z0-9-]{1,16}$/.test(value ?? "") ? value : "invalid",
+              ],
+            ]
           : [];
       }),
     );
@@ -35,6 +46,26 @@
       wanted.slice(0, 4) === actual.slice(0, 4) &&
       requested["packetization-mode"] === "1" &&
       negotiated["packetization-mode"] === "1"
+    );
+  }
+  function h265Main(parameters) {
+    const value = (key, fallback) => parameters?.[key] ?? fallback;
+    // RFC 7798 defaults: Main profile, profile space 0, Main tier.
+    // Reject malformed values rather than turning a parse failure into a default.
+    return (
+      value("profile-id", "1") === "1" &&
+      value("profile-space", "0") === "0" &&
+      value("tier-flag", "0") === "0"
+    );
+  }
+  function sameH265Profile(requested, negotiated) {
+    return (
+      h265Main(requested) &&
+      h265Main(negotiated) &&
+      ["interop-constraints", "profile-compatibility-indicator"].every(
+        (key) =>
+          requested?.[key]?.toLowerCase() === negotiated?.[key]?.toLowerCase(),
+      )
     );
   }
   function interval(now, before) {
@@ -115,7 +146,7 @@
       limitedSeconds: durations,
     };
   }
-  function aggregate(samples) {
+  function aggregate(samples, width = 1280, height = 720) {
     const weighted = (field) => {
       const rows = samples.filter(
         (row) => finite(row[field]) && row.intervalSeconds > 0,
@@ -130,6 +161,7 @@
       (row) => finite(row.encodedFrames) && finite(row.encodeSeconds),
     );
     const frames = encoded.reduce((sum, row) => sum + row.encodedFrames, 0);
+    const resolutions = samples.filter((row) => row.resolution);
     return {
       intervals: samples.length,
       encodedFps: weighted("encodedFps"),
@@ -137,6 +169,26 @@
       decodedFps: weighted("decodedFps"),
       receivedFps: weighted("receivedFps"),
       bitrateBps: weighted("bitrateBps"),
+      fullResolutionSampleFraction: resolutions.length
+        ? resolutions.filter(
+            (row) =>
+              row.resolution[0] === width && row.resolution[1] === height,
+          ).length / resolutions.length
+        : null,
+      limitationDurationSeconds: Object.fromEntries(
+        ["cpu", "bandwidth", "none", "other"].map((key) => {
+          const rows = samples.filter(
+            (row) =>
+              row.intervalSeconds > 0 && finite(row.limitedSeconds?.[key]),
+          );
+          return [
+            key,
+            rows.length
+              ? rows.reduce((sum, row) => sum + row.limitedSeconds[key], 0)
+              : null,
+          ];
+        }),
+      ),
       meanEncodeMs: frames
         ? (encoded.reduce((sum, row) => sum + row.encodeSeconds, 0) * 1000) /
           frames
@@ -166,7 +218,14 @@
       ],
     };
   }
-  const api = { interval, aggregate, profile, sameProfile };
+  const api = {
+    interval,
+    aggregate,
+    profile,
+    sameProfile,
+    h265Main,
+    sameH265Profile,
+  };
   if (typeof module === "object" && module.exports) module.exports = api;
   else globalThis.ScreenShareDiagnosticMetrics = api;
 })();

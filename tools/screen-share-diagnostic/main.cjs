@@ -20,7 +20,7 @@ try {
 }
 if (config?.help) {
   console.log(
-    "pnpm diagnostic:screen-share --mode=generator|canvas --profile=cbp|baseline|main|high --fps=30|60 --seconds=12 --warmup=3 --output=<report.json> [--trace] [--software]",
+    "pnpm diagnostic:screen-share --codec=h264|h265 --bitrate=6000000|8000000 --mode=generator|canvas --profile=cbp|baseline|main|high --fps=30|60 --seconds=12 --warmup=3 --output=<report.json> [--trace] [--software]",
   );
   app.exit(0);
 }
@@ -195,7 +195,7 @@ app
     if (finishing) return;
     if (!report.measurement.validCodec)
       throw new Error(
-        "Negotiated codec/profile did not match the requested H.264 profile",
+        "Negotiated codec/profile did not match the requested diagnostic codec/profile",
       );
     if (
       !(report.measurement.summary.sentFps > 0) ||
