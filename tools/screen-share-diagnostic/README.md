@@ -65,10 +65,78 @@ and corroborating device activity. Nonexistent log/identity fields stay unknown.
 The JSON omits SDP, candidate addresses and media pixels. Raw traces/logs are
 local investigation artifacts; keep them out of committed or public reports.
 
-This synthetic loopback excludes native Windows capture, LiveKit, internet and
-a GPU-saturated game. Hidden-renderer presentation does not measure a viewer's
+This synthetic loopback excludes native Windows capture, LiveKit and internet.
+It does not launch or control games; existing device load still affects it.
+Hidden-renderer presentation does not measure a viewer's
 physical screen. A 60 FPS result at 480x270 is not stable 720p60. Native arrival
 timing and live viewer/game performance still require separate measurements.
+
+## H.265 and bitrate comparisons
+
+H.265 Main and the reviewed 6/8 Mbps comparison are available in the local
+loopback. These use actual RTP capabilities and normal acceleration policy;
+the helper does not force extra HEVC feature switches or silently fall back to
+H.264. A missing Main capability or nonmatching negotiated codec/profile fails
+explicitly. Main profile/space/tier defaults follow
+[RFC 7798](https://www.rfc-editor.org/rfc/rfc7798.html#section-7.1). Offered and
+negotiated levels are reported separately, without bitstream conformance
+validation. Constraint/compatibility parameters must match.
+
+```powershell
+pnpm diagnostic:screen-share --codec=h265 --bitrate=6000000 --fps=60 --seconds=20 --trace --output=C:/Temp/hevc-6mbps.json
+pnpm diagnostic:screen-share --codec=h265 --bitrate=8000000 --fps=60 --seconds=20 --trace --output=C:/Temp/hevc-8mbps.json
+```
+
+Only 6,000,000 or 8,000,000 bits/s can be selected. H.264/Constrained Baseline
+at 6 Mbps remains the diagnostic default. Codec/bitrate choices do not alter any
+production preset or receiver policy.
+
+Startup stats are sampled every 250 ms during warm-up and then every second.
+First sampled full-resolution time is relative to the first stats read after
+sender configuration. Zero means it was already full resolution at that read;
+it is not exact connection/first-pixel latency. `fullResolutionSampleFraction`
+counts interval-end observations, not exact time spent at quality. Limitation
+totals use valid monotonic counter deltas; missing evidence stays unknown.
+
+## Native moving-window measurement (Windows)
+
+```powershell
+pnpm diagnostic:native-capture --fps=60 --seconds=12 --warmup=3 --output=C:/Temp/native60.json
+pnpm diagnostic:native-capture --fps=30 --seconds=12 --warmup=3 --output=C:/Temp/native30.json
+pnpm diagnostic:native-capture --fps=60 --seconds=12 --warmup=3 --trace --output=C:/Temp/native60-trace.json
+```
+
+This command briefly shows its own borderless animated 1280x720 window, without
+taking focus, and closes it automatically. The source requests 60 draws/s even
+when capture is capped at 30. It captures only that window's handle through the
+installed `win-capture` WGC addon. There is no arbitrary window/monitor selector,
+account, Stoat startup, permission prompt, encoder, network or game control.
+The renderer denies remote requests/navigation and uses a separate temporary
+profile. The parent removes that profile after Electron exits.
+
+Actual canvas draws, native arrivals/submissions and JS deliveries are measured
+separately. A 16-bit luma marker verifies distinct source images and distinguishes
+repeated pixels from callbacks; sentinel checks reject an incorrect crop or
+unsupported luma reading. Marker skips can be expected at the 30 FPS cap. Raw
+media is never saved. Native snapshots include backend/adapter/build identity,
+queue/failure counters and cumulative timing distributions including warm-up.
+Readback residence includes scheduling/polling and overlaps across slots; it is
+not a serial GPU execution time or a basis for a fixed FPS ceiling.
+
+Canvas draws are not physical presentation counts. Optional compositor tracing
+records source-renderer identity and measurement marks; its sanitized event
+counts alone must not be called presented FPS. Keep adjacent raw traces outside
+Git and consider tracing overhead when comparing runs.
+
+The test excludes application IPC/track ingestion and downstream encode. It
+does not change games, GPU routing, OS preferences or normal app settings.
+Existing game/device load can affect either diagnostic; record it separately
+and do not describe such a run as an idle-device benchmark. Success means valid
+moving pixels and cleanup, not that requested 720p60 was sustained.
+
+Source APIs: [Electron BrowserWindow](https://www.electronjs.org/docs/latest/api/browser-window)
+(`showInactive`, `getNativeWindowHandle`, `backgroundThrottling`, `thickFrame`)
+and [Chromium compositor terminology](https://github.com/chromium/chromium/blob/main/cc/README.md).
 
 ## Regression checks
 

@@ -31,8 +31,14 @@ window.runScreenShareDiagnostic = async function (config) {
       high: ["6400", "640c"],
     };
     const capabilities = RTCRtpSender.getCapabilities("video")?.codecs ?? [];
+    const requestedCodec = config.codec ?? "h264";
     const codec = capabilities.find((value) => {
       const parameters = metrics.profile(value.sdpFmtpLine);
+      if (requestedCodec === "h265")
+        return (
+          value.mimeType.toLowerCase() === "video/h265" &&
+          metrics.h265Main(parameters)
+        );
       return (
         value.mimeType.toLowerCase() === "video/h264" &&
         profiles[config.profile].some((prefix) =>
@@ -43,7 +49,7 @@ window.runScreenShareDiagnostic = async function (config) {
     });
     if (!codec)
       throw new Error(
-        "Requested H.264 profile RTP capability is unavailable: " +
+        `Requested ${requestedCodec.toUpperCase()} profile RTP capability is unavailable: ` +
           config.profile,
       );
     source = makeSource(config);
@@ -101,7 +107,6 @@ window.runScreenShareDiagnostic = async function (config) {
     });
     parameters.degradationPreference = "maintain-framerate";
     await transceiver.sender.setParameters(parameters);
-    await sleep(config.warmup * 1000);
     const read = async () => {
       const [outbound, inbound] = await Promise.all([
         send.getStats(),
@@ -127,12 +132,48 @@ window.runScreenShareDiagnostic = async function (config) {
       };
     };
     let previous = await read();
+    const startupStart = previous.at;
+    const startup = [];
+    let firstFullResolutionSeconds = null;
+    const observeStartup = (row) => {
+      const atSeconds = (row.at - startupStart) / 1000;
+      const dimensions =
+        Number.isInteger(row.sender.frameWidth) &&
+        Number.isInteger(row.sender.frameHeight)
+          ? [row.sender.frameWidth, row.sender.frameHeight]
+          : null;
+      if (
+        firstFullResolutionSeconds === null &&
+        dimensions?.[0] === config.width &&
+        dimensions?.[1] === config.height
+      )
+        firstFullResolutionSeconds = atSeconds;
+      return {
+        atSeconds,
+        resolution: dimensions,
+        codec: row.sender.codec?.mimeType ?? null,
+        limitedBy: row.sender.qualityLimitationReason ?? null,
+      };
+    };
+    startup.push(observeStartup(previous));
+    while (previous.at - startupStart < config.warmup * 1000) {
+      await sleep(
+        Math.min(
+          250,
+          Math.max(0, config.warmup * 1000 - (previous.at - startupStart)),
+        ),
+      );
+      previous = await read();
+      startup.push(observeStartup(previous));
+      if (source.error) throw source.error;
+    }
     const initial = previous;
     const samples = [];
     const end = previous.at + config.seconds * 1000;
     while (performance.now() < end) {
       await sleep(Math.min(1000, Math.max(0, end - performance.now())));
       const current = await read();
+      observeStartup(current);
       const sender = metrics.interval(current.sender, previous.sender);
       const receiver = metrics.interval(current.receiver, previous.receiver);
       const seconds = (current.at - previous.at) / 1000;
@@ -159,7 +200,9 @@ window.runScreenShareDiagnostic = async function (config) {
       if (source.error) throw source.error;
     }
     const elapsed = (previous.at - initial.at) / 1000;
-    const summary = metrics.aggregate(samples);
+    const summary = metrics.aggregate(samples, config.width, config.height);
+    summary.firstFullResolutionSecondsFromConfiguredSender =
+      firstFullResolutionSeconds;
     summary.suppliedFps =
       (previous.source.accepted - initial.source.accepted) / elapsed;
     summary.writtenFps =
@@ -173,20 +216,30 @@ window.runScreenShareDiagnostic = async function (config) {
         samples.length > 0 &&
         samples.every(
           (value) =>
-            value.codec?.toLowerCase() === "video/h264" &&
-            metrics.sameProfile(
+            value.codec?.toLowerCase() === `video/${requestedCodec}` &&
+            (requestedCodec === "h265"
+              ? metrics.sameH265Profile
+              : metrics.sameProfile)(
               metrics.profile(codec.sdpFmtpLine),
               value.profile,
             ),
         ),
       mode: config.mode,
       codecPreference: {
+        codec: requestedCodec,
         profile: config.profile,
         parameters: metrics.profile(codec.sdpFmtpLine),
       },
       availableH264Profiles: capabilities
         .filter((value) => value.mimeType.toLowerCase() === "video/h264")
         .map((value) => metrics.profile(value.sdpFmtpLine)),
+      availableH265Profiles: capabilities
+        .filter((value) => value.mimeType.toLowerCase() === "video/h265")
+        .map((value) => metrics.profile(value.sdpFmtpLine)),
+      startup: {
+        note: "Sampled from the first stats read after sender configuration; not exact connection/first-pixel timing.",
+        samples: startup,
+      },
       summary,
       samples,
       source: {
