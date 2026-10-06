@@ -37,6 +37,11 @@ jobs:
       - name: Lint
         run: mise lint
 
+      - name: Native session interval policy contracts
+        run: |
+          c++ -std=c++17 -Wall -Wextra -pedantic native/win-capture/test-session-interval.cc -o "$RUNNER_TEMP/session-interval-test"
+          "$RUNNER_TEMP/session-interval-test"
+
       - name: Local screen share diagnostic contracts
         run: mise exec -- node --test tools/screen-share-diagnostic/diagnostic.test.cjs
 

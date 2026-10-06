@@ -40,6 +40,7 @@
 #include "duplication_bridge.h"
 #include "capture_lifetime.h"
 #include "capture_failure.h"
+#include "wgc_session_interval.h"
 
 using Microsoft::WRL::ComPtr;
 namespace WG = ABI::Windows::Graphics;
@@ -652,6 +653,12 @@ std::atomic<uint64_t> g_sourceExtent{0};
 std::atomic<uint64_t> g_acquireTimeouts{0}, g_pointerOnlyFrames{0}, g_accumulatedDesktopFrames{0};
 std::atomic<uint64_t> g_accessLosses{0}, g_recoveryAttempts{0};
 std::mutex g_identityMutex;
+std::mutex g_intervalMutex;
+capture_session::IntervalSnapshot g_intervalSnapshot{};
+void PublishInterval(const capture_session::IntervalSnapshot& snapshot) {
+  std::lock_guard<std::mutex> lock(g_intervalMutex);
+  g_intervalSnapshot = snapshot;
+}
 struct CaptureIdentity {
   std::string backend = "wgc", requestedBackend = "wgc", fallbackReason;
   std::string adapter, adapterLuid, monitor, sourceConversion = "none";
@@ -736,7 +743,24 @@ Napi::Value Diagnostics(const Napi::CallbackInfo& info) {
   result.Set("targetFps", Napi::Number::New(info.Env(), g_fps.load(std::memory_order_relaxed)));
   result.Set("running", Napi::Boolean::New(info.Env(), g_running.load()));
   result.Set("lastError", Napi::String::New(info.Env(), GetErrorText()));
-  result.Set("nativeBuild", "capture-hardening-v1 " __DATE__ " " __TIME__);
+  result.Set("nativeBuild", "capture-hardening-v1 interval-policy-v1 " __DATE__ " " __TIME__);
+  {
+    std::lock_guard<std::mutex> lock(g_intervalMutex);
+    auto interval = Napi::Object::New(info.Env());
+    interval.Set("status", capture_session::StateName(g_intervalSnapshot.state));
+    interval.Set("supported", g_intervalSnapshot.supported);
+    interval.Set("disabled", g_intervalSnapshot.disabled);
+    auto milliseconds = [&](const char* name, int64_t value) {
+      interval.Set(name, value < 0 ? static_cast<Napi::Value>(info.Env().Null())
+          : static_cast<Napi::Value>(Napi::Number::New(info.Env(), value / 10000.0)));
+    };
+    milliseconds("defaultMs", g_intervalSnapshot.original100ns);
+    milliseconds("requestedMs", g_intervalSnapshot.desired100ns);
+    milliseconds("observedMs", g_intervalSnapshot.current100ns);
+    interval.Set("setterAttempts", g_intervalSnapshot.setterAttempts);
+    interval.Set("errorHresult", Napi::Number::New(info.Env(), g_intervalSnapshot.error));
+    result.Set("wgcInterval", interval);
+  }
   auto timings = Napi::Object::New(info.Env());
   timings.Set("sourceGap", DistributionToJs(info.Env(), g_sourceGap));
   timings.Set("acquisitionAge", DistributionToJs(info.Env(), g_acquireAge));
@@ -1541,6 +1565,13 @@ void CaptureThread(HWND hwnd, HMONITOR monitor, bool requestDuplication) {
       SetError("CreateCaptureSession", hr);
       break;
     }
+    // Optional cadence policy. Preserve the original interval at <=30 FPS;
+    // let the native pacer own higher rates. Unsupported/failed property calls
+    // remain diagnostic and cannot turn an otherwise healthy capture fatal.
+    capture_session::WgcIntervalApi intervalApi(g_session.Get());
+    capture_session::IntervalPolicy intervalPolicy;
+    if (intervalPolicy.Update(g_fps.load(std::memory_order_relaxed), intervalApi))
+      PublishInterval(intervalPolicy.Read());
     hr = g_session->StartCapture();
     if (FAILED(hr)) {
       SetError("StartCapture", hr);
@@ -1570,6 +1601,7 @@ void CaptureThread(HWND hwnd, HMONITOR monitor, bool requestDuplication) {
     auto previousLoopWake = std::chrono::steady_clock::now();
     while (g_running.load()) {
       const double fps = g_fps.load(std::memory_order_relaxed);
+      if (intervalPolicy.Update(fps, intervalApi)) PublishInterval(intervalPolicy.Read());
       const LONGLONG heartbeat100ns = static_cast<LONGLONG>(capture_policy::Heartbeat100ns(fps));
       DWORD waitResult;
       if (haveHighResTimer) {
@@ -2006,6 +2038,11 @@ Napi::Value Start(const Napi::CallbackInfo& info) {
   g_sourceGap.Reset(); g_acquireAge.Reset(); g_readbackWait.Reset(); g_frameAge.Reset(); g_acquireCpu.Reset(); g_pipelineCpu.Reset(); g_bridgeCpu.Reset();
   g_sourceExtent.store(0); g_acquireTimeouts.store(0); g_pointerOnlyFrames.store(0); g_accumulatedDesktopFrames.store(0);
   g_accessLosses.store(0); g_recoveryAttempts.store(0);
+  {
+    capture_session::IntervalSnapshot interval{};
+    if (backend == "duplication") interval.state = capture_session::IntervalState::NotApplicable;
+    PublishInterval(interval);
+  }
   { std::lock_guard<std::mutex> lock(g_identityMutex); g_identity = CaptureIdentity{}; g_identity.requestedBackend = backend; }
   g_submissionSequence = 0; g_lastEmittedTimestampUs = -1; g_ready.store(false);
   // Same reasoning: a later share should never look like it inherited an

@@ -28,6 +28,7 @@ for (const marker of [
   "tsfnQueuedFrames",
   "first renderer frame timed out",
   "screenCapture:configure",
+  "wgcInterval",
   "configuration accepted",
   "app-audio.log",
 ]) {
@@ -47,6 +48,8 @@ const nativeBinary = fs.readFileSync(
 );
 for (const marker of [
   "capture-hardening-v1",
+  "interval-policy-v1",
+  "verification_failed",
   "consecutive surface failures=",
   "sourceTimestampOffsets",
   "payloadPoolPressurePolls",

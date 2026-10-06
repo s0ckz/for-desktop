@@ -4,7 +4,13 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const ts = require("typescript");
-const { app, BrowserWindow, MessageChannelMain, screen } = require("electron");
+const {
+  app,
+  BrowserWindow,
+  MessageChannelMain,
+  screen,
+  ipcMain,
+} = require("electron");
 const root = path.resolve(__dirname, "../..");
 const logs = [];
 const server = require("node:http").createServer((_request, response) => {
@@ -44,6 +50,26 @@ app
   .whenReady()
   .then(async () => {
     capture.initScreenCapture();
+    // Test-only readback: observe the worker's applied policy after each real
+    // track/IPC preset acknowledgement, including compatibility fallback.
+    ipcMain.handle("capture-test:interval", async (_event, fps) => {
+      for (let attempt = 0; attempt < 120; ++attempt) {
+        const diagnostics = require("win-capture").diagnostics();
+        const interval = diagnostics.wgcInterval;
+        assert.equal(diagnostics.running, true);
+        if (
+          interval?.disabled ||
+          (interval?.status ===
+            (fps > 30 ? "unthrottled" : "session_default") &&
+            interval.observedMs === (fps > 30 ? 0 : interval.defaultMs))
+        )
+          return interval;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      throw new Error(
+        "Worker did not apply the interval policy after preset acknowledgement",
+      );
+    });
     const win = new BrowserWindow({
       show: false,
       webPreferences: {
@@ -117,8 +143,12 @@ app
         await track.applyConstraints({ width: 1280, height: 720, frameRate: 60 });
         const state = await window.native.screenCapture.getState();
         const after = track.getSettings();
+        const policy60 = await ipcRenderer.invoke('capture-test:interval', 60);
+        await track.applyConstraints({ width: 1280, height: 720, frameRate: 30 });
+        const restored = track.getSettings();
+        const policy30 = await ipcRenderer.invoke('capture-test:interval', 30);
         track.stop();
-        return { fallbackEnded, before, after, state };
+        return { fallbackEnded, before, after, state, restored, policy60, policy30 };
       })()`);
         assert.equal(
           result.fallbackEnded,
@@ -127,6 +157,14 @@ app
         );
         assert.equal(result.before.frameRate, 30);
         assert.equal(result.after.frameRate, 60);
+        assert.equal(result.restored.frameRate, 30);
+        if (!result.policy60.disabled) {
+          assert.equal(result.policy60.observedMs, 0);
+          assert.equal(result.policy30.observedMs, result.policy60.defaultMs);
+          assert(
+            result.policy30.setterAttempts >= result.policy60.setterAttempts,
+          );
+        }
         assert.equal(result.state.targetWidth, 1280);
         assert.equal(result.state.targetHeight, 720);
         assert.equal(result.state.pixelsReady, true);
@@ -152,6 +190,8 @@ app
               result.after.frameRate,
             ],
             nativeBuild: diagnostics.nativeBuild,
+            interval60: result.policy60,
+            interval30: result.policy30,
           }),
         );
       }
