@@ -144,11 +144,19 @@ app
         const state = await window.native.screenCapture.getState();
         const after = track.getSettings();
         const policy60 = await ipcRenderer.invoke('capture-test:interval', 60);
+        const peer = new RTCPeerConnection();
+        const sender = peer.addTrack(track, stream);
+        if (sender.track !== track) throw Error('Sender must retain the native diagnostic hook');
+        const flowBefore = await sender.track.getCaptureDiagnostics();
+        await new Promise(resolve => setTimeout(resolve, 250));
+        const flowAfter = await sender.track.getCaptureDiagnostics();
+        peer.close();
         await track.applyConstraints({ width: 1280, height: 720, frameRate: 30 });
         const restored = track.getSettings();
         const policy30 = await ipcRenderer.invoke('capture-test:interval', 30);
         track.stop();
-        return { fallbackEnded, before, after, state, restored, policy60, policy30 };
+        const flowEnded = await track.getCaptureDiagnostics();
+        return { fallbackEnded, before, after, state, restored, policy60, policy30, flowBefore, flowAfter, flowEnded };
       })()`);
         assert.equal(
           result.fallbackEnded,
@@ -158,6 +166,26 @@ app
         assert.equal(result.before.frameRate, 30);
         assert.equal(result.after.frameRate, 60);
         assert.equal(result.restored.frameRate, 30);
+        assert.equal(result.flowEnded, null);
+        assert.equal(result.flowAfter.sessionId, sessionId);
+        assert.equal(
+          result.flowAfter.path,
+          canvas ? "canvas.captureStream" : "MediaStreamTrackGenerator",
+        );
+        assert(
+          result.flowAfter.native.native.emittedFrames >
+            result.flowBefore.native.native.emittedFrames,
+        );
+        assert(
+          result.flowAfter.native.native.jsDeliveredFrames >
+            result.flowBefore.native.native.jsDeliveredFrames,
+        );
+        assert(
+          result.flowAfter.renderer.received >
+            result.flowBefore.renderer.received,
+        );
+        assert(result.flowAfter.timings.arrivalGap.count > 0);
+        if (!canvas) assert(result.flowAfter.timings.write.count > 0);
         if (!result.policy60.disabled) {
           assert.equal(result.policy60.observedMs, 0);
           assert.equal(result.policy30.observedMs, result.policy60.defaultMs);
@@ -192,6 +220,7 @@ app
             nativeBuild: diagnostics.nativeBuild,
             interval60: result.policy60,
             interval30: result.policy30,
+            flow: result.flowAfter,
           }),
         );
       }

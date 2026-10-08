@@ -49,6 +49,23 @@ export const NATIVE_VIDEO_PATCH = String.raw`
     const subscriptions = [];
     const counters = { received: 0, constructed: 0, accepted: 0, written: 0, backpressure: 0, writeFailures: 0, canvasDrawn: 0, drawFailures: 0 };
     const flushCounters = () => { try { screenCaptureBridge.reportStats(builtForSessionId, counters); } catch (e) { /* older bridge */ } };
+    // Timing costs are paid only while a local diagnostic reader is polling.
+    // The lease expires if the reader stops, even when its page-side cleanup fails.
+    let tracing = false, traceLease = null, traceArrivalAt = null, traceTimestampUs = null;
+    const traceTimings = {};
+    const traceGapUpperMs = [8, 12, 16, 20, 25, 33, 50, 100];
+    const observeTrace = (name, ms) => {
+      if (!Number.isFinite(ms) || ms < 0) return;
+      const value = traceTimings[name] || (traceTimings[name] = { count: 0, totalMs: 0, maxMs: 0, minMs: ms });
+      value.count++; value.totalMs += ms; value.maxMs = Math.max(value.maxMs, ms); value.minMs = Math.min(value.minMs, ms);
+      // Fixed numeric buckets expose bursts/jitter without storing individual
+      // timestamps or frame data. Only the two frame-gap timings use them.
+      if (name === 'arrivalGap' || name === 'captureTimestampGap') {
+        const buckets = value.buckets || (value.buckets = new Array(traceGapUpperMs.length + 1).fill(0));
+        const bucket = traceGapUpperMs.findIndex(upper => ms <= upper);
+        buckets[bucket < 0 ? traceGapUpperMs.length : bucket]++;
+      }
+    };
     if (typeof MediaStreamTrackGenerator === 'function') {
       try { track = new MediaStreamTrackGenerator({ kind: 'video' }); writer = track.writable.getWriter(); kind = 'MediaStreamTrackGenerator'; }
       catch (e) { try { if (track) track.stop(); } catch (e2) {} track = writer = null; }
@@ -71,6 +88,7 @@ export const NATIVE_VIDEO_PATCH = String.raw`
     const retire = () => {
       if (closed) return false;
       closed = true; finishFirst(false); clearInterval(statsTimer); flushCounters();
+      tracing = false; clearTimeout(traceLease);
       for (const unsubscribe of subscriptions.splice(0)) { try { unsubscribe(); } catch (e) {} }
       try { if (writer) Promise.resolve(writer.abort ? writer.abort() : writer.close()).catch(() => {}); } catch (e) {}
       return true;
@@ -91,6 +109,25 @@ export const NATIVE_VIDEO_PATCH = String.raw`
     };
     const originalGetSettings = track.getSettings.bind(track);
     track.getSettings = () => Object.assign({}, originalGetSettings(), { width: lastWidth, height: lastHeight, frameRate: effectiveFps });
+    // Acknowledged target is distinct from last delivered pixels. This lets
+    // the encoder avoid applying a second resize while the surface is static.
+    track.getCaptureTarget = () => closed || owner !== currentGeneration || track.readyState === 'ended'
+      ? null : { width: targetWidth, height: targetHeight };
+    // Track-owned diagnostic hook. Old/non-native tracks simply do not have it.
+    track.getCaptureDiagnostics = async () => {
+      if (closed || owner !== currentGeneration || track.readyState === 'ended') return null;
+      let live;
+      try { live = await boundedCaptureCall(screenCaptureBridge.getState()); } catch (e) { return null; }
+      if (closed || owner !== currentGeneration || !live || !live.active || live.sessionId !== builtForSessionId) return null;
+      tracing = true; clearTimeout(traceLease);
+      traceLease = setTimeout(() => { tracing = false; traceArrivalAt = traceTimestampUs = null; }, 2500);
+      return {
+        sessionId: builtForSessionId, configurationVersion: live.configurationVersion || 0,
+        path: kind, sampledAtMs: performance.timeOrigin + performance.now(),
+        renderer: Object.assign({}, counters), native: live.flow || null,
+        timings: Object.fromEntries(Object.entries(traceTimings).map(([name, value]) => [name, Object.assign({}, value, value.buckets ? { buckets: value.buckets.slice() } : {})])),
+      };
+    };
     let configurationQueue = Promise.resolve();
     const applyConfiguration = async constraints => {
       if (closed || owner !== currentGeneration || track.readyState === 'ended') throw new DOMException('Capture session ended', 'AbortError');
@@ -133,6 +170,12 @@ export const NATIVE_VIDEO_PATCH = String.raw`
       subscribe(screenCaptureBridge.onFrame((buf, meta) => {
         if (closed || owner !== currentGeneration || (meta.sessionId !== undefined && meta.sessionId !== builtForSessionId)) return;
         counters.received++;
+        const traceAt = tracing ? performance.now() : null;
+        if (traceAt !== null) {
+          if (traceArrivalAt !== null) observeTrace('arrivalGap', traceAt - traceArrivalAt);
+          if (traceTimestampUs !== null) observeTrace('captureTimestampGap', (meta.timestampUs - traceTimestampUs) / 1000);
+          traceArrivalAt = traceAt; traceTimestampUs = meta.timestampUs;
+        }
         if (writer && writer.desiredSize === null) { fail('writer closed'); return; }
         if (writer && (writer.desiredSize <= 0 || pending > 0)) { counters.backpressure++; return; }
         const init = { format: 'NV12', codedWidth: meta.width, codedHeight: meta.height, timestamp: meta.timestampUs };
@@ -146,13 +189,15 @@ export const NATIVE_VIDEO_PATCH = String.raw`
           return;
         }
         constructionFailures = 0; counters.constructed++;
+        if (traceAt !== null) observeTrace('construction', performance.now() - traceAt);
         lastWidth = meta.width; lastHeight = meta.height; lastTimestampUs = meta.timestampUs;
         if (writer) {
           pending++; counters.accepted++;
           let write;
+          const writeAt = tracing ? performance.now() : null;
           try { write = writer.write(vf); }
           catch (e) { pending--; counters.writeFailures++; try { vf.close(); } catch (e2) {} fail('writer threw'); return; }
-          Promise.resolve(write).then(() => { counters.written++; if (!closed) finishFirst(true); }, () => { counters.writeFailures++; fail('writer rejected frame'); }).finally(() => { pending--; try { vf.close(); } catch (e) {} });
+          Promise.resolve(write).then(() => { counters.written++; if (!closed) { if (tracing && writeAt !== null) observeTrace('write', performance.now() - writeAt); finishFirst(true); } }, () => { counters.writeFailures++; fail('writer rejected frame'); }).finally(() => { pending--; try { vf.close(); } catch (e) {} });
         } else {
           try {
             if (canvas.width !== meta.width || canvas.height !== meta.height) { canvas.width = meta.width; canvas.height = meta.height; }
