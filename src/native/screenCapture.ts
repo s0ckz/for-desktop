@@ -1120,6 +1120,7 @@ function startWatchdogs() {
               sessionMaxFrameAgeMs: current.maxFrameAgeMs ?? null,
               ringFull: delta("ringFull"),
               identity: current.identity ?? null,
+              wgcInterval: current.wgcInterval ?? null,
               source: [
                 current.sourceWidth ?? null,
                 current.sourceHeight ?? null,

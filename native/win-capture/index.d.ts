@@ -55,6 +55,18 @@ declare const winCapture: {
     sourceWidth: number;
     sourceHeight: number;
     nativeBuild: string;
+    /** Optional WGC-only cadence policy; older binaries omit it. Failures here
+     * do not mean capture failed. Null intervals mean not observed. */
+    wgcInterval?: {
+      status: string;
+      supported: boolean;
+      disabled: boolean;
+      defaultMs: number | null;
+      requestedMs: number | null;
+      observedMs: number | null;
+      setterAttempts: number;
+      errorHresult: number;
+    };
     acquireTimeouts: number;
     pointerOnlyFrames: number;
     accumulatedDesktopFrames: number;
