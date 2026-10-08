@@ -54,6 +54,7 @@ function renderer({
   drawFails = false,
   write,
   configure,
+  readState,
 } = {}) {
   const frames = new Set(),
     states = new Set(),
@@ -64,6 +65,8 @@ function renderer({
     stops = [],
     counters = [];
   let clockId = 0,
+    now = 0,
+    timingCalls = 0,
     generated,
     requested = 0,
     closedFrames = 0;
@@ -126,7 +129,8 @@ function renderer({
       states.add(fn);
       return () => states.delete(fn);
     },
-    getState: async () => ({ ...state }),
+    getState: () =>
+      readState ? readState({ ...state }) : Promise.resolve({ ...state }),
     stop: (id) => stops.push(id),
     reportStats: (id, value) => counters.push({ id, ...value }),
     configure: async (request) => {
@@ -159,6 +163,7 @@ function renderer({
     "clearTimeout",
     "setInterval",
     "clearInterval",
+    "performance",
     "let currentGeneration = 1;\n" +
       NATIVE_VIDEO_PATCH +
       "\nreturn { buildVideoTrack, generation: value => { currentGeneration = value; } };",
@@ -182,6 +187,13 @@ function renderer({
       return id;
     },
     (id) => intervals.delete(id),
+    {
+      timeOrigin: 100000,
+      now: () => {
+        timingCalls++;
+        return now;
+      },
+    },
   );
   return {
     build: () => api.buildVideoTrack({ ...state }, 30, 1),
@@ -195,13 +207,18 @@ function renderer({
     states,
     logs,
     generation: api.generation,
-    emit: () => {
+    advance: (ms) => {
+      now += ms;
+    },
+    timingCalls: () => timingCalls,
+    emit: (meta = {}) => {
       for (const fn of [...frames])
         fn(new Uint8Array(6), {
           width: 1280,
           height: 720,
           timestampUs: 100,
           sessionId: 1,
+          ...meta,
         });
     },
     dead: () => {
@@ -217,6 +234,56 @@ function renderer({
     closedFrames: () => closedFrames,
   };
 }
+
+test("flow timing is dormant by default, leased, and observes deferred generator writes", async () => {
+  let write = deferred();
+  const h = renderer({ write: () => write.promise }),
+    built = h.build();
+  h.emit();
+  assert.equal(h.timingCalls(), 0);
+  write.resolve();
+  await tick();
+  const first = await built.track.getCaptureDiagnostics();
+  assert.equal(first.path, "MediaStreamTrackGenerator");
+  assert.equal(first.renderer.written, 1);
+  write = deferred();
+  h.emit({ timestampUs: 1000 });
+  h.advance(8);
+  write.resolve();
+  await tick();
+  h.advance(9);
+  h.emit({ timestampUs: 18000 });
+  await tick();
+  const observed = await built.track.getCaptureDiagnostics();
+  assert.equal(observed.timings.arrivalGap.totalMs, 17);
+  assert.equal(observed.timings.captureTimestampGap.totalMs, 17);
+  assert.equal(observed.timings.write.count, 2);
+  assert.equal(observed.timings.write.totalMs, 8);
+  assert.equal(observed.timings.write.maxMs, 8);
+  h.expire();
+  const calls = h.timingCalls();
+  h.emit();
+  await tick();
+  assert.equal(h.timingCalls(), calls);
+  built.cleanup();
+  assert.equal(await built.track.getCaptureDiagnostics(), null);
+  assert.equal(h.timers.size + h.intervals.size, 0);
+});
+
+test("late flow snapshots cannot start a lease on retired or replaced capture", async () => {
+  for (const retired of [true, false]) {
+    const state = deferred(),
+      h = renderer({ readState: () => state.promise }),
+      built = h.build();
+    const snapshot = built.track.getCaptureDiagnostics();
+    if (retired) built.cleanup();
+    else h.generation(2);
+    state.resolve(h.state());
+    assert.equal(await snapshot, null);
+    built.cleanup();
+    assert.equal(h.timers.size + h.intervals.size, 0);
+  }
+});
 test("first successful generator write gates readiness, including a single static image", async () => {
   const write = deferred(),
     h = renderer({ write: () => write.promise }),
