@@ -257,6 +257,21 @@ test("flow timing is dormant by default, leased, and observes deferred generator
   const observed = await built.track.getCaptureDiagnostics();
   assert.equal(observed.timings.arrivalGap.totalMs, 17);
   assert.equal(observed.timings.captureTimestampGap.totalMs, 17);
+  assert.equal(observed.timings.arrivalGap.minMs, 17);
+  assert.deepEqual(
+    Array.from(observed.timings.arrivalGap.buckets),
+    [0, 0, 0, 1, 0, 0, 0, 0, 0],
+  );
+  assert.deepEqual(
+    Array.from(observed.timings.captureTimestampGap.buckets),
+    [0, 0, 0, 1, 0, 0, 0, 0, 0],
+  );
+  observed.timings.arrivalGap.buckets[3] = 99;
+  assert.equal(
+    (await built.track.getCaptureDiagnostics()).timings.arrivalGap.buckets[3],
+    1,
+    "Snapshot buckets must not alias internal counters",
+  );
   assert.equal(observed.timings.write.count, 2);
   assert.equal(observed.timings.write.totalMs, 8);
   assert.equal(observed.timings.write.maxMs, 8);

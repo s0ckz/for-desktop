@@ -53,10 +53,18 @@ export const NATIVE_VIDEO_PATCH = String.raw`
     // The lease expires if the reader stops, even when its page-side cleanup fails.
     let tracing = false, traceLease = null, traceArrivalAt = null, traceTimestampUs = null;
     const traceTimings = {};
+    const traceGapUpperMs = [8, 12, 16, 20, 25, 33, 50, 100];
     const observeTrace = (name, ms) => {
       if (!Number.isFinite(ms) || ms < 0) return;
-      const value = traceTimings[name] || (traceTimings[name] = { count: 0, totalMs: 0, maxMs: 0 });
-      value.count++; value.totalMs += ms; value.maxMs = Math.max(value.maxMs, ms);
+      const value = traceTimings[name] || (traceTimings[name] = { count: 0, totalMs: 0, maxMs: 0, minMs: ms });
+      value.count++; value.totalMs += ms; value.maxMs = Math.max(value.maxMs, ms); value.minMs = Math.min(value.minMs, ms);
+      // Fixed numeric buckets expose bursts/jitter without storing individual
+      // timestamps or frame data. Only the two frame-gap timings use them.
+      if (name === 'arrivalGap' || name === 'captureTimestampGap') {
+        const buckets = value.buckets || (value.buckets = new Array(traceGapUpperMs.length + 1).fill(0));
+        const bucket = traceGapUpperMs.findIndex(upper => ms <= upper);
+        buckets[bucket < 0 ? traceGapUpperMs.length : bucket]++;
+      }
     };
     if (typeof MediaStreamTrackGenerator === 'function') {
       try { track = new MediaStreamTrackGenerator({ kind: 'video' }); writer = track.writable.getWriter(); kind = 'MediaStreamTrackGenerator'; }
@@ -113,7 +121,7 @@ export const NATIVE_VIDEO_PATCH = String.raw`
         sessionId: builtForSessionId, configurationVersion: live.configurationVersion || 0,
         path: kind, sampledAtMs: performance.timeOrigin + performance.now(),
         renderer: Object.assign({}, counters), native: live.flow || null,
-        timings: Object.fromEntries(Object.entries(traceTimings).map(([name, value]) => [name, Object.assign({}, value)])),
+        timings: Object.fromEntries(Object.entries(traceTimings).map(([name, value]) => [name, Object.assign({}, value, value.buckets ? { buckets: value.buckets.slice() } : {})])),
       };
     };
     let configurationQueue = Promise.resolve();
