@@ -109,6 +109,10 @@ export const NATIVE_VIDEO_PATCH = String.raw`
     };
     const originalGetSettings = track.getSettings.bind(track);
     track.getSettings = () => Object.assign({}, originalGetSettings(), { width: lastWidth, height: lastHeight, frameRate: effectiveFps });
+    // Acknowledged target is distinct from last delivered pixels. This lets
+    // the encoder avoid applying a second resize while the surface is static.
+    track.getCaptureTarget = () => closed || owner !== currentGeneration || track.readyState === 'ended'
+      ? null : { width: targetWidth, height: targetHeight };
     // Track-owned diagnostic hook. Old/non-native tracks simply do not have it.
     track.getCaptureDiagnostics = async () => {
       if (closed || owner !== currentGeneration || track.readyState === 'ended') return null;

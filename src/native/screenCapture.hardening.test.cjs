@@ -244,6 +244,10 @@ test("flow timing is dormant by default, leased, and observes deferred generator
   write.resolve();
   await tick();
   const first = await built.track.getCaptureDiagnostics();
+  assert(built.track.getCaptureTarget().width > 0);
+  const target = built.track.getCaptureTarget();
+  target.width = -1;
+  assert(built.track.getCaptureTarget().width > 0);
   assert.equal(first.path, "MediaStreamTrackGenerator");
   assert.equal(first.renderer.written, 1);
   write = deferred();
@@ -282,6 +286,7 @@ test("flow timing is dormant by default, leased, and observes deferred generator
   assert.equal(h.timingCalls(), calls);
   built.cleanup();
   assert.equal(await built.track.getCaptureDiagnostics(), null);
+  assert.equal(built.track.getCaptureTarget(), null);
   assert.equal(h.timers.size + h.intervals.size, 0);
 });
 
