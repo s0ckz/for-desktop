@@ -558,7 +558,10 @@ function mainHarness({
       },
     },
     {
-      performance: { now: () => now },
+      // The native implementation is Windows-only; this harness uses a fake
+      // Windows module on every CI host without changing the host process.
+      process: { platform: "win32", versions: { electron: "test" } },
+      performance: { timeOrigin: 100000, now: () => now },
       setTimeout: (fn, delay) =>
         setTimeout(() => {
           now += delay;
