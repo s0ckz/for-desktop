@@ -45,6 +45,9 @@ jobs:
       - name: Local screen share diagnostic contracts
         run: mise exec -- node --test tools/screen-share-diagnostic/diagnostic.test.cjs
 
+      - name: Native renderer lifecycle and flow trace contracts
+        run: mise exec -- node --test src/native/screenCapture.hardening.test.cjs
+
       - name: Format local diagnostic
         run: mise exec -- pnpm exec prettier --check tools/screen-share-diagnostic/
 

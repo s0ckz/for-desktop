@@ -1625,6 +1625,19 @@ function buildState() {
     stopReason: active ? null : stopReason,
     // Diagnostic only -- see active's doc comment (item 4).
     sessionId: active?.sessionId ?? lastStoppedSessionId,
+    // Aggregate, read-only counters for the local bounded flow trace. Reuse
+    // the existing state snapshot; never expose pixels or native device handles.
+    flow: active?.ready
+      ? {
+          sampledAtMs: performance.timeOrigin + performance.now(),
+          native: {
+            incomingFrames: diagnostics?.incomingFrames ?? null,
+            emittedFrames: diagnostics?.emittedFrames ?? null,
+            jsDeliveredFrames: active.jsDeliveredFrames,
+          },
+          delivery: delivery.snapshot(),
+        }
+      : null,
   };
 }
 

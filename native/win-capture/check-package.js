@@ -31,6 +31,9 @@ for (const marker of [
   "wgcInterval",
   "configuration accepted",
   "app-audio.log",
+  "getCaptureDiagnostics",
+  "traceLease",
+  "captureTimestampGap",
 ]) {
   assert(main.includes(marker), "Packaged main missing: " + marker);
 }
