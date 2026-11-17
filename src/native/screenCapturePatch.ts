@@ -178,7 +178,9 @@ export const NATIVE_VIDEO_PATCH = String.raw`
         }
         if (writer && writer.desiredSize === null) { fail('writer closed'); return; }
         if (writer && (writer.desiredSize <= 0 || pending > 0)) { counters.backpressure++; return; }
-        const init = { format: 'NV12', codedWidth: meta.width, codedHeight: meta.height, timestamp: meta.timestampUs };
+        // Must match capture_color.h: limited-range BT.709, after SDR conversion.
+        const init = { format: 'NV12', codedWidth: meta.width, codedHeight: meta.height, timestamp: meta.timestampUs,
+          colorSpace: { primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: false } };
         if (lastTimestampUs !== null) init.duration = Math.max(0, meta.timestampUs - lastTimestampUs);
         let vf;
         try { vf = new VideoFrame(buf, init); }
