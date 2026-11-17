@@ -61,6 +61,7 @@ function renderer({
     timers = new Map(),
     intervals = new Map();
   const logs = [],
+    frameInits = [],
     requests = [],
     stops = [],
     counters = [];
@@ -96,8 +97,9 @@ function renderer({
     }
   }
   class Frame {
-    constructor() {
+    constructor(_buffer, init) {
       if (constructionFails) throw Error("Injected constructor failure");
+      frameInits.push(init);
     }
     close() {
       closedFrames++;
@@ -206,6 +208,7 @@ function renderer({
     frames,
     states,
     logs,
+    frameInits,
     generation: api.generation,
     advance: (ms) => {
       now += ms;
@@ -233,6 +236,23 @@ function renderer({
     requested: () => requested,
     closedFrames: () => closedFrames,
   };
+}
+
+for (const canvas of [false, true]) {
+  test(`native ${canvas ? "canvas" : "generator"} frames declare limited BT.709`, async () => {
+    const h = renderer({ canvas });
+    const built = h.build();
+    h.emit();
+    await tick();
+    const track = await built;
+    assert.deepEqual(h.frameInits[0].colorSpace, {
+      primaries: "bt709",
+      transfer: "bt709",
+      matrix: "bt709",
+      fullRange: false,
+    });
+    track.cleanup();
+  });
 }
 
 test("flow timing is dormant by default, leased, and observes deferred generator writes", async () => {

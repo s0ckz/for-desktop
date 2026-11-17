@@ -36,6 +36,7 @@
 #include <thread>
 #include <vector>
 #include "capture_policy.h"
+#include "capture_color.h"
 #include "capture_metrics.h"
 #include "duplication_bridge.h"
 #include "capture_lifetime.h"
@@ -413,6 +414,8 @@ bool EnsurePipeline(UINT32 srcW, UINT32 srcH) {
     SetError("CreateVideoProcessor", hr);
     return false;
   }
+
+  ConfigureCaptureColor(g_videoContext.Get(), vp.Get());
 
   D3D11_TEXTURE2D_DESC outDesc{};
   outDesc.Width = outW;
