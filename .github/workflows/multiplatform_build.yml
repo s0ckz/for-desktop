@@ -42,7 +42,9 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 26
+          # Match the release job. Node 26's PGO-enabled Windows headers
+          # make dependency installs require an unavailable node.profdata.
+          node-version: 22
           cache: "pnpm"
 
       - name: Install dependencies
