@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer } from "electron";
 import type { IpcRendererEvent } from "electron";
 
 import { version } from "../../package.json";
+import type { DesktopUpdateState } from "../native/update";
 
 // Dedicated frame-delivery port (plan PR A4 item 2), replacing a plain
 // `ipcRenderer.on("screenCapture:frame", ...)` listener bound to a channel
@@ -72,6 +73,20 @@ contextBridge.exposeInMainWorld("native", {
   minimise: () => ipcRenderer.send("minimise"),
   maximise: () => ipcRenderer.send("maximise"),
   close: () => ipcRenderer.send("close"),
+
+  updater: {
+    getState: (): Promise<DesktopUpdateState> =>
+      ipcRenderer.invoke("updater:getState"),
+    install: (): Promise<boolean> => ipcRenderer.invoke("updater:install"),
+    onState: (handler: (state: DesktopUpdateState) => void) => {
+      const listener = (_: IpcRendererEvent, state: DesktopUpdateState) =>
+        handler(state);
+      ipcRenderer.on("updater:state", listener);
+      return () => {
+        ipcRenderer.removeListener("updater:state", listener);
+      };
+    },
+  },
 
   setBadgeCount: (count: number) => ipcRenderer.send("setBadgeCount", count),
 

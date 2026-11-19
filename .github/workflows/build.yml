@@ -48,6 +48,9 @@ jobs:
       - name: Native renderer lifecycle and flow trace contracts
         run: mise exec -- node --test src/native/screenCapture.hardening.test.cjs
 
+      - name: Desktop update state and preload bridge
+        run: mise exec -- node --test src/native/update.test.cjs
+
       - name: Format local diagnostic
         run: mise exec -- pnpm exec prettier --check tools/screen-share-diagnostic/
 

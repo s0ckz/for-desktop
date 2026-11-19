@@ -4,10 +4,41 @@ import {
   updateElectronApp,
 } from "update-electron-app";
 
-import { Notification, app, autoUpdater } from "electron";
+import { Notification, app, autoUpdater, ipcMain } from "electron";
 
 import { log as appAudioLog } from "./appAudio";
 import { updateTrayMenu } from "./tray";
+import { mainWindow } from "./window";
+
+export type DesktopUpdateState = {
+  status: "idle" | "downloading" | "ready" | "installing";
+  version: string | null;
+};
+
+let updateState: DesktopUpdateState = { status: "idle", version: null };
+
+export function getUpdateState(): DesktopUpdateState {
+  return { ...updateState };
+}
+
+function publishUpdateState(
+  status: DesktopUpdateState["status"],
+  version = updateState.version,
+) {
+  updateState = { status, version };
+  if (
+    mainWindow &&
+    !mainWindow.isDestroyed() &&
+    !mainWindow.webContents.isDestroyed()
+  ) {
+    try {
+      mainWindow.webContents.send("updater:state", getUpdateState());
+    } catch (error) {
+      // A renderer closing must not prevent the toast/tray notification.
+      appAudioLog("update: could not notify renderer:", String(error));
+    }
+  }
+}
 
 /**
  * Whether Squirrel has already staged a newer version on disk and is just
@@ -58,9 +89,12 @@ let activeNotification: Notification | null = null;
  * applies.)
  */
 export function applyStagedUpdate(source: string) {
+  if (!updateStaged || updateState.status === "installing") return false;
+  publishUpdateState("installing");
   appAudioLog(`update: quitAndInstall() called (from ${source})`);
   try {
     autoUpdater.quitAndInstall();
+    return true;
   } catch (err) {
     // Windows autoUpdater failures during quitAndInstall tend to surface as
     // an `error` event rather than a thrown exception (see the listener
@@ -69,6 +103,8 @@ export function applyStagedUpdate(source: string) {
     // now actually written down instead of going to a console nobody has
     // attached to a packaged GUI app.
     appAudioLog("update: quitAndInstall() threw:", String(err));
+    publishUpdateState("ready");
+    return false;
   }
 }
 
@@ -167,6 +203,21 @@ export function initUpdater() {
   }
   updaterInitialised = true;
 
+  // Snapshot restores the indicator after a renderer reload. Subsequent
+  // changes are pushed locally; the renderer never polls an update server.
+  ipcMain.handle("updater:getState", () => getUpdateState());
+  ipcMain.handle("updater:install", (event) => {
+    if (
+      !mainWindow ||
+      mainWindow.isDestroyed() ||
+      mainWindow.webContents.isDestroyed() ||
+      event.sender !== mainWindow.webContents ||
+      event.senderFrame !== mainWindow.webContents.mainFrame
+    )
+      return false;
+    return applyStagedUpdate("in-app update button");
+  });
+
   // Logged once at startup rather than per-toast: if notifications are
   // unsupported on this machine at all, every "showing toast for version X"
   // line for the rest of the session is a known dead end rather than a
@@ -185,10 +236,15 @@ export function initUpdater() {
   // event, so both fire.
   autoUpdater.on("error", (err) => {
     appAudioLog("update: autoUpdater error:", String(err));
+    publishUpdateState(
+      updateStaged ? "ready" : "idle",
+      updateStaged ? updateState.version : null,
+    );
   });
 
   autoUpdater.on("update-available", () => {
     appAudioLog("update: update available, downloading...");
+    if (!updateStaged) publishUpdateState("downloading", null);
   });
 
   // `quitAndInstall()` is `squirrelUpdate.processStart(); app.quit();` on
@@ -208,12 +264,16 @@ export function initUpdater() {
   });
 
   updateElectronApp({
+    // Use the existing scheduler's minimum interval. All checks go to the
+    // cached public update service, not the hosted Stoat web/API server.
+    updateInterval: "5 minutes",
     updateSource: {
       type: UpdateSourceType.ElectronPublicUpdateService,
       repo: "s0ckz/for-desktop",
     },
     onNotifyUser: (info) => {
       updateStaged = true;
+      publishUpdateState("ready", info.releaseName || null);
       appAudioLog(
         "update: update downloaded, version",
         info.releaseName || "(unknown)",
